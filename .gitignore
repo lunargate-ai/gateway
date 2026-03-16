@@ -1,0 +1,14 @@
+.DS_Store
+.env
+*.log
+bin/
+dist/
+config.yaml
+dump.rdb
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.out

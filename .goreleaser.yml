@@ -1,0 +1,58 @@
+version: 2
+
+project_name: gateway
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: gateway
+    main: ./cmd/gateway
+    binary: lunargate
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - format: tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - configs/config.example.yaml
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ .Tag }}-snapshot"
+
+brews:
+  - name: gateway
+    directory: Formula
+    repository:
+      owner: lunargate-ai
+      name: homebrew-tap
+      branch: main
+    homepage: https://github.com/lunargate-ai/gateway
+    description: High-performance self-hosted AI gateway (OpenAI-compatible) with routing, retries, and streaming
+    license: MIT
+    install: |
+      bin.install "lunargate"
+    test: |
+      system "#{bin}/lunargate", "--help"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'

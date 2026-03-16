@@ -1,0 +1,127 @@
+---
+kind: pipeline
+type: docker
+name: gateway
+
+platform:
+  os: linux
+  arch: arm64
+
+clone:
+  depth: 0
+
+steps:
+  - name: test-vet
+    image: golang:1.22-alpine
+    pull: if-not-exists
+    commands:
+      - go mod download
+      - go test ./...
+      - go vet ./...
+
+  - name: build-and-push-staging
+    image: plugins/docker
+    pull: if-not-exists
+    environment:
+      PLUGIN_BUILDX_OPTIONS_SEMICOLON: "--platform=linux/amd64,linux/arm64;--provenance=false"
+    settings:
+      registry: ghcr.io
+      base_image_registry: https://index.docker.io/v1/
+      repo: ghcr.io/lunargate-ai/gateway
+      context: .
+      dockerfile: Dockerfile
+      tags:
+        - '${DRONE_COMMIT_SHA}'
+        - 'staging'
+      base_image_username:
+        from_secret: dockerhub_username
+      base_image_password:
+        from_secret: dockerhub_password
+      username:
+        from_secret: ghcr_username
+      password:
+        from_secret: ghcr_token
+    when:
+      branch:
+        - staging
+    depends_on:
+      - test-vet
+
+  - name: build-and-push-prod
+    image: plugins/docker
+    pull: if-not-exists
+    environment:
+      PLUGIN_BUILDX_OPTIONS_SEMICOLON: "--platform=linux/amd64,linux/arm64;--provenance=false"
+    settings:
+      registry: ghcr.io
+      base_image_registry: https://index.docker.io/v1/
+      repo: ghcr.io/lunargate-ai/gateway
+      context: .
+      dockerfile: Dockerfile
+      tags:
+        - '${DRONE_COMMIT_SHA}'
+        - 'latest'
+      base_image_username:
+        from_secret: dockerhub_username
+      base_image_password:
+        from_secret: dockerhub_password
+      username:
+        from_secret: ghcr_username
+      password:
+        from_secret: ghcr_token
+    when:
+      branch:
+        - main
+    depends_on:
+      - test-vet
+
+  - name: build-and-push-tag
+    image: plugins/docker
+    pull: if-not-exists
+    environment:
+      PLUGIN_BUILDX_OPTIONS_SEMICOLON: "--platform=linux/amd64,linux/arm64;--provenance=false"
+    settings:
+      registry: ghcr.io
+      base_image_registry: https://index.docker.io/v1/
+      repo: ghcr.io/lunargate-ai/gateway
+      context: .
+      dockerfile: Dockerfile
+      tags:
+        - '${DRONE_TAG}'
+      base_image_username:
+        from_secret: dockerhub_username
+      base_image_password:
+        from_secret: dockerhub_password
+      username:
+        from_secret: ghcr_username
+      password:
+        from_secret: ghcr_token
+    when:
+      event:
+        - tag
+    depends_on:
+      - test-vet
+
+  - name: goreleaser
+    image: goreleaser/goreleaser:v2.5.1
+    pull: if-not-exists
+    environment:
+      GITHUB_TOKEN:
+        from_secret: github_token
+    commands:
+      - git fetch --tags --force
+      - goreleaser release --clean
+    when:
+      event:
+        - tag
+    depends_on:
+      - test-vet
+
+trigger:
+  ref:
+    - refs/heads/main
+    - refs/heads/staging
+    - refs/tags/**
+  event:
+    - push
+    - tag

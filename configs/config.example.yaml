@@ -1,0 +1,165 @@
+# LunarGate Gateway - Example Configuration
+# Copy this file to config.yaml and adjust as needed.
+# Environment variables can be referenced as ${VAR_NAME}.
+
+server:
+  host: "0.0.0.0"
+  port: 8080
+  read_timeout: 30s
+  write_timeout: 0s
+  idle_timeout: 60s
+
+# LLM Provider Configuration
+providers:
+  openai:
+    api_key: "${OPENAI_API_KEY}"
+    default_model: "gpt-4-turbo"
+    organization: "${OPENAI_ORG_ID}"
+
+  openai-second-account:
+    type: "openai"
+    api_key: "${OPENAI_API_KEY2}"
+
+  anthropic:
+    api_key: "${ANTHROPIC_API_KEY}"
+    default_model: "claude-3-sonnet-20240229"
+
+  abacus:
+    type: "openai"
+    api_key: "${ABACUS_API_KEY}"
+    base_url: "https://routellm.abacus.ai/v1"
+    default_model: "claude-sonnet-4-5"
+
+# Routing Configuration
+routing:
+  default_strategy: "weighted"
+
+  routes:
+    - name: "complexity-tier-0-1"
+      match:
+        path: "/v1/chat/completions"
+        headers:
+          x-lunargate-complexity: "0-1"
+      targets:
+        - provider: openai
+          model: gpt-4o-mini
+          weight: 100
+
+    - name: "complexity-tier-2-3"
+      match:
+        path: "/v1/chat/completions"
+        headers:
+          x-lunargate-complexity: "2-3"
+      targets:
+        - provider: openai
+          model: gpt-4-turbo
+          weight: 100
+
+    - name: "complexity-tier-4-5"
+      match:
+        path: "/v1/chat/completions"
+        headers:
+          x-lunargate-complexity: "4-5"
+      targets:
+        - provider: anthropic
+          model: claude-3-sonnet-20240229
+          weight: 100
+
+    - name: "complexity-tier-6plus"
+      match:
+        path: "/v1/chat/completions"
+        headers:
+          x-lunargate-complexity: "6+"
+      targets:
+        - provider: abacus
+          model: claude-sonnet-4-5
+          weight: 100
+
+    - name: "default"
+      match:
+        path: "*"
+      targets:
+        - provider: openai
+          model: gpt-4-turbo
+          weight: 70
+        - provider: openai-second-account
+          model: gpt-4-turbo
+          weight: 10
+        - provider: anthropic
+          model: claude-3-sonnet-20240229
+          weight: 30
+      fallback:
+        - provider: anthropic
+          model: claude-3-sonnet-20240229
+
+model_selection:
+  enabled: true
+  override_user_model: false
+  output_headers:
+    complexity: "x-lunargate-complexity"
+    score: "x-lunargate-complexity-score"
+    skill: "x-lunargate-skill"
+  complexity_scoring:
+    input_tokens_threshold: 2000
+    weight_input_tokens: 2
+    weight_contains_code: 2
+    weight_math_reasoning: 2
+    weight_analysis_synthesis: 1
+    weight_safety_sensitive: 2
+    weight_tools: 2
+  complexity_tiers:
+    tier_01_max: 1
+    tier_23_max: 3
+    tier_45_max: 5
+  skills:
+    - name: "coding"
+      regex_any:
+        - '(?i)\b(code|bug|golang|go|python|typescript|javascript|sql)\b'
+    - name: "math"
+      regex_any:
+        - '(?i)\b(derive|prove|integral|derivative|matrix|vector|equation)\b'
+
+# Rate Limiting (in-memory for POC)
+rate_limiting:
+  enabled: true
+  requests_per_minute: 60
+  burst_size: 10
+
+# Caching (in-memory exact-match for POC)
+caching:
+  enabled: true
+  ttl: 1h
+  max_size: 1000
+
+# Retry Configuration
+retry:
+  enabled: true
+  max_attempts: 3
+  initial_delay: 1s
+  max_delay: 30s
+  multiplier: 2.0
+  jitter_factor: 0.2
+  retryable_errors: [429, 500, 502, 503, 504]
+
+# Logging
+logging:
+  level: "info"    # debug, info, warn, error
+  format: "console"   # json or console
+
+# Security
+security:
+  api_keys_enabled: false
+  api_keys: []
+
+# Data Sharing - Controls what data the gateway sends to the SaaS backend.
+# By default, ONLY metrics are sent (zero data leakage mode).
+# Enable to forward prompts/responses for log inspection in the dashboard.
+# WARNING: Enabling this means prompt/response content leaves your infrastructure.
+data_sharing:
+  enabled: false              # Master switch - must be true for any sharing
+  share_prompts: false        # Forward user prompts to SaaS backend
+  share_responses: false      # Forward LLM responses to SaaS backend
+  backend_url: "${LUNARGATE_BACKEND_URL}"
+  gateway_id: "${LUNARGATE_GATEWAY_ID}"
+  api_key: "${LUNARGATE_GATEWAY_API_KEY}"
+  remote_control: false
