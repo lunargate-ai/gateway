@@ -21,7 +21,6 @@ COPY --from=builder /lunargate /lunargate
 COPY --from=busybox /bin/busybox /bin/wget
 COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY configs/config.example.yaml /etc/lunargate/config.yaml
-COPY configs/config.docker.yaml /etc/lunargate/config.docker.yaml
 
 EXPOSE 8080
 
