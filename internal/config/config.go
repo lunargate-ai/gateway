@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -289,13 +290,7 @@ func (m *Manager) load() error {
 		return fmt.Errorf("failed to unmarshal config: %w", err)
 	}
 
-	// Expand environment variables in provider API keys
-	for name, p := range cfg.Providers {
-		p.APIKey = expandEnv(p.APIKey)
-		p.BaseURL = expandEnv(p.BaseURL)
-		p.Organization = expandEnv(p.Organization)
-		cfg.Providers[name] = p
-	}
+	expandConfigEnv(cfg)
 
 	cfg.DataSharing.BackendURL = expandEnv(cfg.DataSharing.BackendURL)
 	cfg.DataSharing.BackendURL = strings.TrimRight(strings.TrimSpace(cfg.DataSharing.BackendURL), "/")
@@ -318,6 +313,69 @@ func expandEnv(s string) string {
 		return os.ExpandEnv(s)
 	}
 	return s
+}
+
+func expandConfigEnv(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+
+	reflect.ValueOf(cfg).Elem().Set(expandEnvValue(reflect.ValueOf(*cfg)))
+}
+
+func expandEnvValue(v reflect.Value) reflect.Value {
+	if !v.IsValid() {
+		return v
+	}
+
+	switch v.Kind() {
+	case reflect.Pointer:
+		if v.IsNil() {
+			return v
+		}
+		out := reflect.New(v.Type().Elem())
+		out.Elem().Set(expandEnvValue(v.Elem()))
+		return out
+	case reflect.Struct:
+		out := reflect.New(v.Type()).Elem()
+		out.Set(v)
+		for i := 0; i < out.NumField(); i++ {
+			field := out.Field(i)
+			if field.CanSet() {
+				field.Set(expandEnvValue(field))
+			}
+		}
+		return out
+	case reflect.Slice:
+		if v.IsNil() {
+			return v
+		}
+		out := reflect.MakeSlice(v.Type(), v.Len(), v.Len())
+		for i := 0; i < v.Len(); i++ {
+			out.Index(i).Set(expandEnvValue(v.Index(i)))
+		}
+		return out
+	case reflect.Array:
+		out := reflect.New(v.Type()).Elem()
+		for i := 0; i < v.Len(); i++ {
+			out.Index(i).Set(expandEnvValue(v.Index(i)))
+		}
+		return out
+	case reflect.Map:
+		if v.IsNil() {
+			return v
+		}
+		out := reflect.MakeMapWithSize(v.Type(), v.Len())
+		iter := v.MapRange()
+		for iter.Next() {
+			out.SetMapIndex(iter.Key(), expandEnvValue(iter.Value()))
+		}
+		return out
+	case reflect.String:
+		return reflect.ValueOf(expandEnv(v.String())).Convert(v.Type())
+	default:
+		return v
+	}
 }
 
 func loadDotEnv(configPath string) error {

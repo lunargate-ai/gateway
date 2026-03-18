@@ -12,3 +12,4 @@ dump.rdb
 *.test
 *.out
 coverage.out
+/gateway

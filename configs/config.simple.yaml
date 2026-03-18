@@ -3,7 +3,6 @@ providers:
     api_key: "${OPENAI_API_KEY}"
 
 routing:
-  default_strategy: "weighted"
   routes:
     - name: "default"
       targets:
