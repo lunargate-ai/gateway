@@ -35,7 +35,7 @@ snapshot:
   version_template: "{{ .Tag }}-snapshot"
 
 brews:
-  - name: gateway
+  - name: lunargate
     directory: Formula
     repository:
       owner: lunargate-ai

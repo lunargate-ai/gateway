@@ -20,9 +20,10 @@ steps:
       - go vet ./...
 
   - name: build-and-push-staging
-    image: plugins/docker
+    image: plugins/buildx
     pull: if-not-exists
     environment:
+      PLUGIN_BUILDER_DRIVER: "docker-container"
       PLUGIN_BUILDX_OPTIONS_SEMICOLON: "--platform=linux/amd64,linux/arm64;--provenance=false"
     settings:
       registry: ghcr.io
@@ -48,9 +49,10 @@ steps:
       - test-vet
 
   - name: build-and-push-prod
-    image: plugins/docker
+    image: plugins/buildx
     pull: if-not-exists
     environment:
+      PLUGIN_BUILDER_DRIVER: "docker-container"
       PLUGIN_BUILDX_OPTIONS_SEMICOLON: "--platform=linux/amd64,linux/arm64;--provenance=false"
     settings:
       registry: ghcr.io
@@ -76,9 +78,10 @@ steps:
       - test-vet
 
   - name: build-and-push-tag
-    image: plugins/docker
+    image: plugins/buildx
     pull: if-not-exists
     environment:
+      PLUGIN_BUILDER_DRIVER: "docker-container"
       PLUGIN_BUILDX_OPTIONS_SEMICOLON: "--platform=linux/amd64,linux/arm64;--provenance=false"
     settings:
       registry: ghcr.io
