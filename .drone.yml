@@ -62,7 +62,6 @@ steps:
       dockerfile: Dockerfile
       tags:
         - '${DRONE_COMMIT_SHA}'
-        - 'latest'
       base_image_username:
         from_secret: dockerhub_username
       base_image_password:
@@ -91,6 +90,7 @@ steps:
       dockerfile: Dockerfile
       tags:
         - '${DRONE_TAG}'
+        - 'latest'
       base_image_username:
         from_secret: dockerhub_username
       base_image_password:
