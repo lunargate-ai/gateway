@@ -31,6 +31,8 @@ steps:
       repo: ghcr.io/lunargate-ai/gateway
       context: .
       dockerfile: Dockerfile
+      build_args:
+        - VERSION=${DRONE_COMMIT_SHA}
       tags:
         - '${DRONE_COMMIT_SHA}'
         - 'staging'
@@ -60,6 +62,8 @@ steps:
       repo: ghcr.io/lunargate-ai/gateway
       context: .
       dockerfile: Dockerfile
+      build_args:
+        - VERSION=${DRONE_COMMIT_SHA}
       tags:
         - '${DRONE_COMMIT_SHA}'
       base_image_username:
@@ -88,6 +92,8 @@ steps:
       repo: ghcr.io/lunargate-ai/gateway
       context: .
       dockerfile: Dockerfile
+      build_args:
+        - VERSION=${DRONE_TAG}
       tags:
         - '${DRONE_TAG}'
         - 'latest'
