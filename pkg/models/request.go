@@ -17,6 +17,7 @@ type UnifiedRequest struct {
 	TopP             *float64        `json:"top_p,omitempty"`
 	N                *int            `json:"n,omitempty"`
 	Stream           bool            `json:"stream,omitempty"`
+	StreamOptions    *StreamOptions  `json:"stream_options,omitempty"`
 	Stop             interface{}     `json:"stop,omitempty"`
 	MaxTokens        *int            `json:"max_tokens,omitempty"`
 	PresencePenalty  *float64        `json:"presence_penalty,omitempty"`
@@ -29,6 +30,10 @@ type UnifiedRequest struct {
 	FunctionCall     interface{}     `json:"function_call,omitempty"`
 	ResponseFormat   *ResponseFormat `json:"response_format,omitempty"`
 	Seed             *int            `json:"seed,omitempty"`
+}
+
+type StreamOptions struct {
+	IncludeUsage bool `json:"include_usage,omitempty"`
 }
 
 type Message struct {

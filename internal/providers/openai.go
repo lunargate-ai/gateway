@@ -83,7 +83,15 @@ func (t *OpenAITranslator) BaseURL() string {
 }
 
 func (t *OpenAITranslator) TranslateRequest(ctx context.Context, req *models.UnifiedRequest) (*http.Request, error) {
-	body, err := json.Marshal(req)
+	reqCopy := *req
+	if reqCopy.Stream {
+		if reqCopy.StreamOptions == nil {
+			reqCopy.StreamOptions = &models.StreamOptions{}
+		}
+		reqCopy.StreamOptions.IncludeUsage = true
+	}
+
+	body, err := json.Marshal(&reqCopy)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal openai request: %w", err)
 	}
