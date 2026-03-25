@@ -111,6 +111,27 @@ func (t *OpenAITranslator) TranslateRequest(ctx context.Context, req *models.Uni
 	return httpReq, nil
 }
 
+func (t *OpenAITranslator) TranslateEmbeddingsRequest(ctx context.Context, req *models.EmbeddingsRequest) (*http.Request, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal openai embeddings request: %w", err)
+	}
+
+	endpoint := fmt.Sprintf("%s/embeddings", t.cfg.BaseURL)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create openai embeddings http request: %w", err)
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+t.cfg.APIKey)
+	if t.cfg.Organization != "" {
+		httpReq.Header.Set("OpenAI-Organization", t.cfg.Organization)
+	}
+
+	return httpReq, nil
+}
+
 func (t *OpenAITranslator) ParseResponse(resp *http.Response) (*models.UnifiedResponse, error) {
 	defer resp.Body.Close()
 
@@ -162,6 +183,39 @@ func (t *OpenAITranslator) ParseResponse(resp *http.Response) (*models.UnifiedRe
 			}
 		}
 		c.Message.Content = cleaned
+	}
+
+	return &result, nil
+}
+
+func (t *OpenAITranslator) ParseEmbeddingsResponse(resp *http.Response) (*models.EmbeddingsResponse, error) {
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read openai embeddings response body: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		var errResp models.ErrorResponse
+		if jsonErr := json.Unmarshal(body, &errResp); jsonErr == nil {
+			return nil, &ProviderError{
+				StatusCode: resp.StatusCode,
+				Message:    errResp.Error.Message,
+				Type:       errResp.Error.Type,
+				Provider:   "openai",
+			}
+		}
+		return nil, &ProviderError{
+			StatusCode: resp.StatusCode,
+			Message:    string(body),
+			Provider:   "openai",
+		}
+	}
+
+	var result models.EmbeddingsResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal openai embeddings response: %w", err)
 	}
 
 	return &result, nil
@@ -223,5 +277,8 @@ func (t *OpenAITranslator) Models() []models.ModelInfo {
 		{ID: "gpt-4o", Object: "model", Created: time.Now().Unix(), OwnedBy: "openai"},
 		{ID: "gpt-4o-mini", Object: "model", Created: time.Now().Unix(), OwnedBy: "openai"},
 		{ID: "gpt-3.5-turbo", Object: "model", Created: time.Now().Unix(), OwnedBy: "openai"},
+		{ID: "text-embedding-3-small", Object: "model", Created: time.Now().Unix(), OwnedBy: "openai"},
+		{ID: "text-embedding-3-large", Object: "model", Created: time.Now().Unix(), OwnedBy: "openai"},
+		{ID: "text-embedding-ada-002", Object: "model", Created: time.Now().Unix(), OwnedBy: "openai"},
 	}
 }

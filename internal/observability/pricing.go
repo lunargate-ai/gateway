@@ -39,6 +39,12 @@ func lookupPricing(provider string, model string) (modelPricing, bool) {
 			return modelPricing{InputPerMTokensUSD: 30, OutputPerMTokensUSD: 60}, true
 		case "gpt-3.5-turbo":
 			return modelPricing{InputPerMTokensUSD: 0.5, OutputPerMTokensUSD: 1.5}, true
+		case "text-embedding-3-small":
+			return modelPricing{InputPerMTokensUSD: 0.02, OutputPerMTokensUSD: 0}, true
+		case "text-embedding-3-large":
+			return modelPricing{InputPerMTokensUSD: 0.13, OutputPerMTokensUSD: 0}, true
+		case "text-embedding-ada-002":
+			return modelPricing{InputPerMTokensUSD: 0.1, OutputPerMTokensUSD: 0}, true
 		default:
 			return modelPricing{}, false
 		}

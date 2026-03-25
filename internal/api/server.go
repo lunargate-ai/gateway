@@ -26,6 +26,7 @@ func NewRouter(handler *Handler, rateLimiter *middleware.RateLimiter, healthChec
 	r.Route("/v1", func(r chi.Router) {
 		r.Use(rateLimiter.Middleware)
 		r.Post("/chat/completions", handler.ChatCompletions)
+		r.Post("/embeddings", handler.Embeddings)
 		r.Get("/models", handler.ListModels)
 		r.Get("/models/{model}", handler.GetModel)
 	})

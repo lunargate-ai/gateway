@@ -31,6 +31,7 @@ type CollectorRequest struct {
 type MetricEventData struct {
 	RequestID           string            `json:"request_id"`
 	Timestamp           time.Time         `json:"timestamp"`
+	RequestType         string            `json:"request_type,omitempty"`
 	DurationMS          int64             `json:"duration_ms"`
 	GatewayPreUpstreamMS *int64           `json:"gateway_pre_upstream_ms,omitempty"`
 	TtftMS              *int64            `json:"ttft_ms,omitempty"`
@@ -66,6 +67,7 @@ type RequestLogEventData struct {
 	RequestID    string            `json:"request_id"`
 	Timestamp    time.Time         `json:"timestamp"`
 	GatewayID    string            `json:"gateway_id"`
+	RequestType  string            `json:"request_type,omitempty"`
 	User         *string           `json:"user,omitempty"`
 	SessionID    *string           `json:"session_id,omitempty"`
 	Provider     string            `json:"provider"`

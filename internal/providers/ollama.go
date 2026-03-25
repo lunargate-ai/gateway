@@ -77,6 +77,19 @@ type ollamaChatResponse struct {
 	Error           string        `json:"error,omitempty"`
 }
 
+type ollamaEmbedRequest struct {
+	Model string      `json:"model"`
+	Input interface{} `json:"input,omitempty"`
+}
+
+type ollamaEmbedResponse struct {
+	Model           string          `json:"model"`
+	Embeddings      json.RawMessage `json:"embeddings,omitempty"`
+	Embedding       []float64       `json:"embedding,omitempty"`
+	PromptEvalCount int             `json:"prompt_eval_count,omitempty"`
+	Error           string          `json:"error,omitempty"`
+}
+
 func (t *OllamaTranslator) TranslateRequest(ctx context.Context, req *models.UnifiedRequest) (*http.Request, error) {
 	msgs := make([]ollamaMessage, 0, len(req.Messages))
 	for i := range req.Messages {
@@ -123,6 +136,30 @@ func (t *OllamaTranslator) TranslateRequest(ctx context.Context, req *models.Uni
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create ollama http request: %w", err)
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+	return httpReq, nil
+}
+
+func (t *OllamaTranslator) TranslateEmbeddingsRequest(ctx context.Context, req *models.EmbeddingsRequest) (*http.Request, error) {
+	input, err := normalizeOllamaEmbeddingInput(req.Input)
+	if err != nil {
+		return nil, err
+	}
+
+	body, err := json.Marshal(ollamaEmbedRequest{
+		Model: req.Model,
+		Input: input,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal ollama embeddings request: %w", err)
+	}
+
+	endpoint := fmt.Sprintf("%s/api/embed", strings.TrimRight(strings.TrimSpace(t.cfg.BaseURL), "/"))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create ollama embeddings http request: %w", err)
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
@@ -220,6 +257,73 @@ func (t *OllamaTranslator) ParseResponse(resp *http.Response) (*models.UnifiedRe
 	}, nil
 }
 
+func (t *OllamaTranslator) ParseEmbeddingsResponse(resp *http.Response) (*models.EmbeddingsResponse, error) {
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read ollama embeddings response body: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		msg := strings.TrimSpace(string(body))
+		var errResp struct {
+			Error string `json:"error"`
+		}
+		if jsonErr := json.Unmarshal(body, &errResp); jsonErr == nil {
+			if strings.TrimSpace(errResp.Error) != "" {
+				msg = strings.TrimSpace(errResp.Error)
+			}
+		}
+		if msg == "" {
+			msg = http.StatusText(resp.StatusCode)
+		}
+		return nil, &ProviderError{StatusCode: resp.StatusCode, Message: msg, Type: "upstream_error", Provider: "ollama"}
+	}
+
+	var result ollamaEmbedResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal ollama embeddings response: %w", err)
+	}
+	if strings.TrimSpace(result.Error) != "" {
+		return nil, &ProviderError{StatusCode: http.StatusBadGateway, Message: strings.TrimSpace(result.Error), Type: "upstream_error", Provider: "ollama"}
+	}
+
+	vectors := make([][]float64, 0, 1)
+	if len(result.Embedding) > 0 {
+		vectors = append(vectors, result.Embedding)
+	}
+	if len(result.Embeddings) > 0 {
+		var batch [][]float64
+		if err := json.Unmarshal(result.Embeddings, &batch); err == nil {
+			vectors = batch
+		} else {
+			var single []float64
+			if err := json.Unmarshal(result.Embeddings, &single); err != nil {
+				return nil, fmt.Errorf("failed to decode ollama embeddings vectors: %w", err)
+			}
+			vectors = [][]float64{single}
+		}
+	}
+
+	data := make([]models.EmbeddingData, 0, len(vectors))
+	for i, vector := range vectors {
+		data = append(data, models.EmbeddingData{Object: "embedding", Embedding: vector, Index: i})
+	}
+
+	var usage *models.EmbeddingUsage
+	if result.PromptEvalCount > 0 {
+		usage = &models.EmbeddingUsage{PromptTokens: result.PromptEvalCount, TotalTokens: result.PromptEvalCount}
+	}
+
+	return &models.EmbeddingsResponse{
+		Object: "list",
+		Data:   data,
+		Model:  strings.TrimSpace(result.Model),
+		Usage:  usage,
+	}, nil
+}
+
 func (t *OllamaTranslator) ParseStreamChunk(data []byte) (*models.StreamChunk, error) {
 	return nil, fmt.Errorf("ollama streaming requires a per-request stream translator")
 }
@@ -229,7 +333,11 @@ func (t *OllamaTranslator) SupportsStreaming() bool {
 }
 
 func (t *OllamaTranslator) Models() []models.ModelInfo {
-	return nil
+	id := strings.TrimSpace(t.cfg.DefaultModel)
+	if id == "" {
+		return nil
+	}
+	return []models.ModelInfo{{ID: id, Object: "model", Created: time.Now().Unix(), OwnedBy: "ollama"}}
 }
 
 func messageContentToString(content interface{}) string {
@@ -258,6 +366,25 @@ func messageContentToString(content interface{}) string {
 		return b.String()
 	default:
 		return ""
+	}
+}
+
+func normalizeOllamaEmbeddingInput(input interface{}) (interface{}, error) {
+	switch v := input.(type) {
+	case string:
+		return v, nil
+	case []interface{}:
+		out := make([]string, 0, len(v))
+		for i := range v {
+			s, ok := v[i].(string)
+			if !ok {
+				return nil, fmt.Errorf("ollama embeddings only supports string or array of strings input")
+			}
+			out = append(out, s)
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("ollama embeddings only supports string or array of strings input")
 	}
 }
 

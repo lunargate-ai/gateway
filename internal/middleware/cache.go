@@ -14,7 +14,7 @@ import (
 
 // CacheEntry stores a cached response with its expiration time.
 type CacheEntry struct {
-	Response  *models.UnifiedResponse
+	Response  interface{}
 	CreatedAt time.Time
 	ExpiresAt time.Time
 }
@@ -67,8 +67,32 @@ func GenerateKey(req *models.UnifiedRequest) string {
 	return fmt.Sprintf("%x", hash[:16])
 }
 
+func GenerateEmbeddingsKey(req *models.EmbeddingsRequest) string {
+	normalized := struct {
+		Model          string      `json:"model"`
+		Input          interface{} `json:"input"`
+		EncodingFormat string      `json:"encoding_format,omitempty"`
+		Dimensions     *int        `json:"dimensions,omitempty"`
+		User           string      `json:"user,omitempty"`
+	}{
+		Model:          req.Model,
+		Input:          req.Input,
+		EncodingFormat: req.EncodingFormat,
+		Dimensions:     req.Dimensions,
+		User:           req.User,
+	}
+
+	data, err := json.Marshal(normalized)
+	if err != nil {
+		return ""
+	}
+
+	hash := sha256.Sum256(data)
+	return fmt.Sprintf("%x", hash[:16])
+}
+
 // Get looks up a cached response. Returns nil if not found or expired.
-func (c *Cache) Get(key string) *models.UnifiedResponse {
+func (c *Cache) Get(key string) interface{} {
 	if !c.cfg.Enabled {
 		return nil
 	}
@@ -93,7 +117,7 @@ func (c *Cache) Get(key string) *models.UnifiedResponse {
 }
 
 // Set stores a response in the cache.
-func (c *Cache) Set(key string, resp *models.UnifiedResponse) {
+func (c *Cache) Set(key string, resp interface{}) {
 	if !c.cfg.Enabled || key == "" {
 		return
 	}
