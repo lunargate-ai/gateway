@@ -1,3 +1,7 @@
+<p align="center">
+  <img src=".github/assets/logo-full-readme.png" alt="LunarGate" width="420" />
+</p>
+
 # LunarGate Gateway
 
 Open-source, self-hosted AI gateway for OpenAI-compatible workloads.
