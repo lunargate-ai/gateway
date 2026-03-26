@@ -264,6 +264,9 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("X-LunarGate-Route", resolved.RouteName)
+	if upstreamRequestType := strings.TrimSpace(resolved.Target.UpstreamRequestType); upstreamRequestType != "" {
+		headers["x-lunargate-request-type"] = upstreamRequestType
+	}
 
 	requestedProvider := ""
 	requestedModelRaw := ""
@@ -1079,6 +1082,9 @@ func (h *Handler) callProvider(ctx context.Context, target routing.Target, req *
 	translator, ok := h.registry.Get(target.Provider)
 	if !ok {
 		return nil, fmt.Errorf("unknown provider: %s", target.Provider)
+	}
+	if upstreamRequestType := strings.TrimSpace(target.UpstreamRequestType); upstreamRequestType != "" {
+		ctx = providers.WithUpstreamRequestType(ctx, upstreamRequestType)
 	}
 
 	// Override model with the target's model if the request model matches a generic name

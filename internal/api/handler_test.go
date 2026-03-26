@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -224,8 +225,8 @@ func TestResponses_StreamPassthrough(t *testing.T) {
 		DefaultStrategy: "weighted",
 		Routes: []config.RouteConfig{
 			{
-				Name:  "responses-default",
-				Match: config.MatchConfig{Path: "/v1/responses"},
+				Name:    "responses-default",
+				Match:   config.MatchConfig{Path: "/v1/responses"},
 				Targets: []config.TargetConfig{{Provider: providerID, Model: "mock-gpt", Weight: 1}},
 			},
 		},
@@ -331,8 +332,8 @@ func TestResponses_StreamToolCallLifecycle(t *testing.T) {
 		DefaultStrategy: "weighted",
 		Routes: []config.RouteConfig{
 			{
-				Name:  "responses-default",
-				Match: config.MatchConfig{Path: "/v1/responses"},
+				Name:    "responses-default",
+				Match:   config.MatchConfig{Path: "/v1/responses"},
 				Targets: []config.TargetConfig{{Provider: providerID, Model: "mock-gpt", Weight: 1}},
 			},
 		},
@@ -458,8 +459,8 @@ func TestResponses_StreamMultipleToolCallsLifecycle(t *testing.T) {
 		DefaultStrategy: "weighted",
 		Routes: []config.RouteConfig{
 			{
-				Name:  "responses-default",
-				Match: config.MatchConfig{Path: "/v1/responses"},
+				Name:    "responses-default",
+				Match:   config.MatchConfig{Path: "/v1/responses"},
 				Targets: []config.TargetConfig{{Provider: providerID, Model: "mock-gpt", Weight: 1}},
 			},
 		},
@@ -513,5 +514,73 @@ func TestCopyHeaders_PreservesExistingDestinationHeaders(t *testing.T) {
 	}
 	if got := dst.Get("Content-Length"); got != "" {
 		t.Fatalf("expected Content-Length to be skipped, got %q", got)
+	}
+}
+
+func TestChatCompletions_UpstreamRequestTypeResponses_UsesResponsesEndpoint(t *testing.T) {
+	var capturedPath string
+	var capturedBody map[string]interface{}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.Path
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream body: %v", err)
+		}
+		if err := json.Unmarshal(body, &capturedBody); err != nil {
+			t.Fatalf("failed to decode upstream body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_1","object":"response","created_at":1,"status":"completed","model":"gpt-5.3-codex","output":[],"output_text":"ok","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`))
+	}))
+	defer upstream.Close()
+
+	providerID := "openai"
+	reg := providers.NewRegistry(map[string]config.ProviderConfig{
+		providerID: {Type: "openai", APIKey: "dummy", BaseURL: upstream.URL + "/v1"},
+	})
+	router := routing.NewEngine(config.RoutingConfig{
+		DefaultStrategy: "weighted",
+		Routes: []config.RouteConfig{{
+			Name:  "responses-upstream-route",
+			Match: config.MatchConfig{Path: "*"},
+			Targets: []config.TargetConfig{{
+				Provider:            providerID,
+				Model:               "gpt-5.3-codex",
+				Weight:              1,
+				UpstreamRequestType: "responses",
+			}},
+		}},
+	})
+	retrier := resilience.NewRetrier(config.RetryConfig{Enabled: false})
+	cbm := resilience.NewCircuitBreakerManager()
+	fb := resilience.NewFallbackExecutor(retrier, cbm)
+	cache := middleware.NewCache(config.CacheConfig{Enabled: false})
+	streamer := streaming.NewHandler()
+	metrics := observability.NewMetricsWithRegisterer(prometheus.NewRegistry())
+	h := NewHandler(reg, router, fb, cache, streamer, metrics, nil, nil, nil)
+
+	payload := []byte(`{"model":"lunargate/auto","messages":[{"role":"user","content":"hello"}],"tools":[{"type":"function","function":{"name":"exec_command","description":"run command","parameters":{"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"]}}}],"tool_choice":"auto"}`)
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/v1/chat/completions", bytes.NewReader(payload))
+	rec := httptest.NewRecorder()
+
+	h.ChatCompletions(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, rec.Code)
+	}
+	if capturedPath != "/v1/responses" {
+		t.Fatalf("expected upstream path /v1/responses, got %q", capturedPath)
+	}
+	if capturedBody == nil {
+		t.Fatalf("expected captured upstream payload")
+	}
+	if _, ok := capturedBody["input"]; !ok {
+		t.Fatalf("expected responses upstream payload with input")
+	}
+	if _, ok := capturedBody["messages"]; ok {
+		t.Fatalf("did not expect chat-completions messages field in responses payload")
+	}
+	if choice, _ := capturedBody["tool_choice"].(string); choice != "auto" {
+		t.Fatalf("expected responses upstream tool_choice=auto to be preserved, got %q", choice)
 	}
 }

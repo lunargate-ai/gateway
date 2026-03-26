@@ -142,9 +142,10 @@ type ConditionConfig struct {
 }
 
 type TargetConfig struct {
-	Provider string `mapstructure:"provider"`
-	Model    string `mapstructure:"model"`
-	Weight   int    `mapstructure:"weight"`
+	Provider            string `mapstructure:"provider"`
+	Model               string `mapstructure:"model"`
+	Weight              int    `mapstructure:"weight"`
+	UpstreamRequestType string `mapstructure:"upstream_request_type"`
 }
 
 type RateLimitConfig struct {

@@ -14,9 +14,10 @@ import (
 
 // Target represents a resolved routing target (provider + model).
 type Target struct {
-	Provider string
-	Model    string
-	Weight   int
+	Provider            string
+	Model               string
+	Weight              int
+	UpstreamRequestType string
 }
 
 // ResolvedRoute contains the matched route and selected target.
@@ -89,9 +90,10 @@ func (e *Engine) Resolve(ctx context.Context, path string, headers map[string]st
 			var fallbacks []Target
 			for _, fb := range route.Fallback {
 				fallbacks = append(fallbacks, Target{
-					Provider: fb.Provider,
-					Model:    fb.Model,
-					Weight:   fb.Weight,
+					Provider:            fb.Provider,
+					Model:               fb.Model,
+					Weight:              fb.Weight,
+					UpstreamRequestType: fb.UpstreamRequestType,
 				})
 			}
 
@@ -192,23 +194,23 @@ func (e *Engine) weightedSelect(targets []config.TargetConfig) (Target, int) {
 		}
 		r -= w
 		if r < 0 {
-			return Target{Provider: t.Provider, Model: t.Model, Weight: t.Weight}, i
+			return Target{Provider: t.Provider, Model: t.Model, Weight: t.Weight, UpstreamRequestType: t.UpstreamRequestType}, i
 		}
 	}
 
 	// Fallback to first
 	t := targets[0]
-	return Target{Provider: t.Provider, Model: t.Model, Weight: t.Weight}, 0
+	return Target{Provider: t.Provider, Model: t.Model, Weight: t.Weight, UpstreamRequestType: t.UpstreamRequestType}, 0
 }
 
 func (e *Engine) roundRobinSelect(targets []config.TargetConfig) (Target, int) {
 	idx := int(e.counter.Add(1)-1) % len(targets)
 	t := targets[idx]
-	return Target{Provider: t.Provider, Model: t.Model, Weight: t.Weight}, idx
+	return Target{Provider: t.Provider, Model: t.Model, Weight: t.Weight, UpstreamRequestType: t.UpstreamRequestType}, idx
 }
 
 func (e *Engine) randomSelect(targets []config.TargetConfig) (Target, int) {
 	idx := rand.Intn(len(targets))
 	t := targets[idx]
-	return Target{Provider: t.Provider, Model: t.Model, Weight: t.Weight}, idx
+	return Target{Provider: t.Provider, Model: t.Model, Weight: t.Weight, UpstreamRequestType: t.UpstreamRequestType}, idx
 }

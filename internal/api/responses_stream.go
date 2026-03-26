@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/lunargate-ai/gateway/pkg/models"
+	"github.com/rs/zerolog/log"
 )
 
 const (
@@ -29,6 +30,7 @@ type responsesStreamProxy struct {
 	created    int64
 	text       strings.Builder
 	started    bool
+	messageStarted bool
 	completed  bool
 	eventSeq   int
 
@@ -67,6 +69,9 @@ func (p *responsesStreamProxy) WriteHeader(statusCode int) {
 }
 
 func (p *responsesStreamProxy) Flush() {
+	if !p.headersSent {
+		return
+	}
 	if f, ok := p.target.(http.Flusher); ok {
 		f.Flush()
 	}
@@ -136,9 +141,14 @@ func (p *responsesStreamProxy) processToolCallDelta(tc models.ToolCall) error {
 
 	st, ok := p.toolCalls[key]
 	if !ok {
-		itemID := strings.TrimSpace(tc.ID)
+		rawID := strings.TrimSpace(tc.ID)
+		itemID := responsesCanonicalFunctionItemID(rawID)
+		callID := responsesCanonicalFunctionCallID(rawID)
 		if itemID == "" {
 			itemID = fmt.Sprintf("fc_%s_%d", p.responseID, p.nextOutputIndex)
+		}
+		if callID == "" {
+			callID = responsesCanonicalFunctionCallID(itemID)
 		}
 		name := strings.TrimSpace(tc.Function.Name)
 		if name == "" {
@@ -146,21 +156,41 @@ func (p *responsesStreamProxy) processToolCallDelta(tc models.ToolCall) error {
 		}
 		st = &responsesToolCallState{
 			ItemID:      itemID,
-			CallID:      itemID,
+			CallID:      callID,
 			Name:        name,
 			OutputIndex: p.nextOutputIndex,
 		}
 		p.nextOutputIndex++
 		p.toolCalls[key] = st
 		p.toolCallOrder = append(p.toolCallOrder, key)
+		log.Debug().
+			Str("response_id", p.responseID).
+			Str("tool_key", key).
+			Str("item_id", st.ItemID).
+			Str("call_id", st.CallID).
+			Str("tool_name", st.Name).
+			Int("output_index", st.OutputIndex).
+			Msg("responses stream proxy started tool call")
 	}
 
 	if name := strings.TrimSpace(tc.Function.Name); name != "" {
 		st.Name = name
 	}
 	if id := strings.TrimSpace(tc.ID); id != "" {
-		st.ItemID = id
-		st.CallID = id
+		if !st.Added {
+			if canonicalItemID := responsesCanonicalFunctionItemID(id); canonicalItemID != "" {
+				st.ItemID = canonicalItemID
+			}
+		}
+		if canonicalCallID := responsesCanonicalFunctionCallID(id); canonicalCallID != "" && st.CallID == "" {
+			st.CallID = canonicalCallID
+		}
+	}
+	if st.ItemID == "" {
+		st.ItemID = responsesCanonicalFunctionItemID(st.CallID)
+	}
+	if st.CallID == "" {
+		st.CallID = responsesCanonicalFunctionCallID(st.ItemID)
 	}
 
 	if !st.Added {
@@ -184,6 +214,12 @@ func (p *responsesStreamProxy) processToolCallDelta(tc models.ToolCall) error {
 
 	if delta := tc.Function.Arguments; delta != "" {
 		st.Arguments += delta
+		log.Debug().
+			Str("response_id", p.responseID).
+			Str("call_id", st.CallID).
+			Int("delta_len", len(delta)).
+			Int("arguments_len", len(st.Arguments)).
+			Msg("responses stream proxy accumulated tool arguments")
 		if err := p.writeEvent(map[string]interface{}{
 			"type":         "response.function_call_arguments.delta",
 			"response_id":  p.responseID,
@@ -248,14 +284,20 @@ func (p *responsesStreamProxy) processFrame(frame string) error {
 			if !ok || delta == "" {
 				continue
 			}
-			p.text.WriteString(delta)
+			emittedDelta := p.mergeTextDelta(delta)
+			if emittedDelta == "" {
+				continue
+			}
+			if err := p.ensureMessageStarted(); err != nil {
+				return err
+			}
 			event := map[string]interface{}{
 				"type":          "response.output_text.delta",
 				"response_id":   p.responseID,
 				"item_id":       p.itemID,
 				"output_index":  0,
 				"content_index": 0,
-				"delta":         delta,
+				"delta":         emittedDelta,
 			}
 			if err := p.writeEvent(event); err != nil {
 				return err
@@ -263,6 +305,35 @@ func (p *responsesStreamProxy) processFrame(frame string) error {
 		}
 	}
 	return nil
+}
+
+func (p *responsesStreamProxy) mergeTextDelta(delta string) string {
+	if delta == "" {
+		return ""
+	}
+
+	current := p.text.String()
+	if current == "" {
+		p.text.WriteString(delta)
+		return delta
+	}
+
+	// Some providers emit final text snapshots in *.done events.
+	// Convert snapshot updates to true deltas and drop exact duplicates.
+	if delta == current || strings.HasSuffix(current, delta) {
+		return ""
+	}
+	if strings.HasPrefix(delta, current) {
+		tail := strings.TrimPrefix(delta, current)
+		if tail == "" {
+			return ""
+		}
+		p.text.WriteString(tail)
+		return tail
+	}
+
+	p.text.WriteString(delta)
+	return delta
 }
 
 func (p *responsesStreamProxy) ensureStarted() error {
@@ -297,6 +368,15 @@ func (p *responsesStreamProxy) ensureStarted() error {
 		return err
 	}
 
+	return nil
+}
+
+func (p *responsesStreamProxy) ensureMessageStarted() error {
+	if p.messageStarted {
+		return nil
+	}
+	p.messageStarted = true
+
 	if err := p.writeEvent(map[string]interface{}{
 		"type":         "response.output_item.added",
 		"response_id":  p.responseID,
@@ -325,7 +405,6 @@ func (p *responsesStreamProxy) ensureStarted() error {
 	}); err != nil {
 		return err
 	}
-
 	return nil
 }
 
@@ -339,51 +418,54 @@ func (p *responsesStreamProxy) emitCompleted() error {
 	}
 
 	text := p.text.String()
-	if err := p.writeEvent(map[string]interface{}{
-		"type":          "response.output_text.done",
-		"response_id":   p.responseID,
-		"item_id":       p.itemID,
-		"output_index":  0,
-		"content_index": 0,
-		"text":          text,
-	}); err != nil {
-		return err
-	}
+	var item map[string]interface{}
+	if p.messageStarted {
+		if err := p.writeEvent(map[string]interface{}{
+			"type":          "response.output_text.done",
+			"response_id":   p.responseID,
+			"item_id":       p.itemID,
+			"output_index":  0,
+			"content_index": 0,
+			"text":          text,
+		}); err != nil {
+			return err
+		}
 
-	if err := p.writeEvent(map[string]interface{}{
-		"type":          "response.content_part.done",
-		"response_id":   p.responseID,
-		"item_id":       p.itemID,
-		"output_index":  0,
-		"content_index": 0,
-		"part": map[string]interface{}{
-			"type": "output_text",
-			"text": text,
-		},
-	}); err != nil {
-		return err
-	}
-
-	item := map[string]interface{}{
-		"id":     p.itemID,
-		"type":   "message",
-		"role":   "assistant",
-		"status": "completed",
-		"content": []map[string]interface{}{
-			{
+		if err := p.writeEvent(map[string]interface{}{
+			"type":          "response.content_part.done",
+			"response_id":   p.responseID,
+			"item_id":       p.itemID,
+			"output_index":  0,
+			"content_index": 0,
+			"part": map[string]interface{}{
 				"type": "output_text",
 				"text": text,
 			},
-		},
-	}
+		}); err != nil {
+			return err
+		}
 
-	if err := p.writeEvent(map[string]interface{}{
-		"type":         "response.output_item.done",
-		"response_id":  p.responseID,
-		"output_index": 0,
-		"item":         item,
-	}); err != nil {
-		return err
+		item = map[string]interface{}{
+			"id":     p.itemID,
+			"type":   "message",
+			"role":   "assistant",
+			"status": "completed",
+			"content": []map[string]interface{}{
+				{
+					"type": "output_text",
+					"text": text,
+				},
+			},
+		}
+
+		if err := p.writeEvent(map[string]interface{}{
+			"type":         "response.output_item.done",
+			"response_id":  p.responseID,
+			"output_index": 0,
+			"item":         item,
+		}); err != nil {
+			return err
+		}
 	}
 
 	toolItems := make([]interface{}, 0, len(p.toolCallOrder))
@@ -440,7 +522,19 @@ func (p *responsesStreamProxy) emitCompleted() error {
 
 		toolItems = append(toolItems, fcItem)
 		st.Done = true
+		log.Debug().
+			Str("response_id", p.responseID).
+			Str("call_id", st.CallID).
+			Str("tool_name", st.Name).
+			Int("arguments_len", len(st.Arguments)).
+			Msg("responses stream proxy finalized tool call")
 	}
+
+	outputItems := make([]interface{}, 0, 1+len(toolItems))
+	if item != nil {
+		outputItems = append(outputItems, item)
+	}
+	outputItems = append(outputItems, toolItems...)
 
 	resp := map[string]interface{}{
 		"id":          p.responseID,
@@ -449,7 +543,7 @@ func (p *responsesStreamProxy) emitCompleted() error {
 		"status":      "completed",
 		"model":       p.model,
 		"output_text": text,
-		"output":      append([]interface{}{item}, toolItems...),
+		"output":      outputItems,
 	}
 
 	if p.responseID == "" {
@@ -500,4 +594,38 @@ func (p *responsesStreamProxy) sendHeadersIfNeeded() {
 	}
 	p.target.Header().Set("Content-Type", "text/event-stream")
 	p.target.WriteHeader(p.statusCode)
+}
+
+func responsesCanonicalFunctionItemID(raw string) string {
+	id := strings.TrimSpace(raw)
+	if id == "" {
+		return ""
+	}
+	if strings.HasPrefix(id, "fc_") {
+		return id
+	}
+	if strings.HasPrefix(id, "call_") {
+		return "fc_" + strings.TrimPrefix(id, "call_")
+	}
+	if strings.HasPrefix(id, "fc") {
+		return id
+	}
+	return "fc_" + id
+}
+
+func responsesCanonicalFunctionCallID(raw string) string {
+	id := strings.TrimSpace(raw)
+	if id == "" {
+		return ""
+	}
+	if strings.HasPrefix(id, "call_") {
+		return id
+	}
+	if strings.HasPrefix(id, "fc_") {
+		return "call_" + strings.TrimPrefix(id, "fc_")
+	}
+	if strings.HasPrefix(id, "fc") {
+		return "call_" + strings.TrimPrefix(id, "fc")
+	}
+	return "call_" + id
 }
