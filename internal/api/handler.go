@@ -226,6 +226,11 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	userSpecifiedModel := strings.TrimSpace(req.Model) != ""
 
 	headers := extractHeaders(r)
+	requestType := strings.TrimSpace(headers["x-lunargate-request-type"])
+	if requestType == "" {
+		requestType = "chat_completions"
+		headers["x-lunargate-request-type"] = requestType
+	}
 	if req.Model != "" {
 		headers["x-lunargate-model"] = strings.TrimSpace(req.Model)
 		if p, _, ok := modelid.SplitCanonical(req.Model); ok {
@@ -419,6 +424,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				Data: observability.MetricEventData{
 					RequestID:            requestID,
 					Timestamp:            startTime.UTC(),
+					RequestType:          requestType,
 					DurationMS:           duration.Milliseconds(),
 					GatewayPreUpstreamMS: upstreamPtr,
 					Provider:             usedTarget.Provider,
@@ -450,6 +456,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 						RequestID:    requestID,
 						Timestamp:    startTime.UTC(),
 						GatewayID:    h.collector.GatewayID(),
+						RequestType:  requestType,
 						User:         userPtr,
 						SessionID:    sessionIDPtr,
 						Provider:     usedTarget.Provider,
@@ -726,6 +733,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				Data: observability.MetricEventData{
 					RequestID:            requestID,
 					Timestamp:            startTime.UTC(),
+					RequestType:          requestType,
 					DurationMS:           duration.Milliseconds(),
 					GatewayPreUpstreamMS: upstreamPtr,
 					TtftMS:               ttftPtr,
@@ -804,6 +812,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 						RequestID:    requestID,
 						Timestamp:    startTime.UTC(),
 						GatewayID:    h.collector.GatewayID(),
+						RequestType:  requestType,
 						User:         userPtr,
 						SessionID:    sessionIDPtr,
 						Provider:     usedTarget.Provider,
@@ -883,6 +892,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				Data: observability.MetricEventData{
 					RequestID:            requestID,
 					Timestamp:            startTime.UTC(),
+					RequestType:          requestType,
 					DurationMS:           duration.Milliseconds(),
 					GatewayPreUpstreamMS: upstreamPtr,
 					Provider:             usedTarget.Provider,
@@ -914,6 +924,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 						RequestID:    requestID,
 						Timestamp:    startTime.UTC(),
 						GatewayID:    h.collector.GatewayID(),
+						RequestType:  requestType,
 						User:         userPtr,
 						SessionID:    sessionIDPtr,
 						Provider:     usedTarget.Provider,
@@ -984,6 +995,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			Data: observability.MetricEventData{
 				RequestID:            requestID,
 				Timestamp:            startTime.UTC(),
+				RequestType:          requestType,
 				DurationMS:           duration.Milliseconds(),
 				GatewayPreUpstreamMS: upstreamPtr,
 				Provider:             usedTarget.Provider,
@@ -1020,6 +1032,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 					RequestID:    requestID,
 					Timestamp:    startTime.UTC(),
 					GatewayID:    h.collector.GatewayID(),
+					RequestType:  requestType,
 					User:         userPtr,
 					SessionID:    sessionIDPtr,
 					Provider:     usedTarget.Provider,
@@ -1107,6 +1120,7 @@ func extractHeaders(r *http.Request) map[string]string {
 	headers := make(map[string]string)
 	for _, key := range []string{
 		"x-environment",
+		"x-lunargate-request-type",
 		"x-lunargate-provider",
 		"x-lunargate-model",
 		"x-lunargate-route",
