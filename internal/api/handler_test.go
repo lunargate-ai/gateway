@@ -370,6 +370,130 @@ func TestResponses_StreamToolCallLifecycle(t *testing.T) {
 	}
 }
 
+func TestResponses_StreamMultipleToolCallsLifecycle(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		chunk1 := map[string]interface{}{
+			"id":      "chatcmpl-tool-multi",
+			"object":  "chat.completion.chunk",
+			"created": 1,
+			"model":   "mock-gpt",
+			"choices": []map[string]interface{}{
+				{
+					"index": 0,
+					"delta": map[string]interface{}{
+						"tool_calls": []map[string]interface{}{
+							{
+								"index": 0,
+								"id":    "call_1",
+								"type":  "function",
+								"function": map[string]interface{}{
+									"name":      "exec_a",
+									"arguments": "{\"x\":1",
+								},
+							},
+							{
+								"index": 1,
+								"id":    "call_2",
+								"type":  "function",
+								"function": map[string]interface{}{
+									"name":      "exec_b",
+									"arguments": "{\"y\":2",
+								},
+							},
+						},
+					},
+					"finish_reason": nil,
+				},
+			},
+		}
+		chunk1Bytes, _ := json.Marshal(chunk1)
+		_, _ = w.Write([]byte("data: " + string(chunk1Bytes) + "\n\n"))
+
+		chunk2 := map[string]interface{}{
+			"id":      "chatcmpl-tool-multi",
+			"object":  "chat.completion.chunk",
+			"created": 1,
+			"model":   "mock-gpt",
+			"choices": []map[string]interface{}{
+				{
+					"index": 0,
+					"delta": map[string]interface{}{
+						"tool_calls": []map[string]interface{}{
+							{
+								"index": 0,
+								"id":    "call_1",
+								"type":  "function",
+								"function": map[string]interface{}{
+									"arguments": "}",
+								},
+							},
+							{
+								"index": 1,
+								"id":    "call_2",
+								"type":  "function",
+								"function": map[string]interface{}{
+									"arguments": "}",
+								},
+							},
+						},
+					},
+					"finish_reason": "tool_calls",
+				},
+			},
+		}
+		chunk2Bytes, _ := json.Marshal(chunk2)
+		_, _ = w.Write([]byte("data: " + string(chunk2Bytes) + "\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	providerID := "openai"
+	cfgProviders := map[string]config.ProviderConfig{
+		providerID: {Type: "openai", APIKey: "dummy", BaseURL: upstream.URL},
+	}
+	reg := providers.NewRegistry(cfgProviders)
+
+	router := routing.NewEngine(config.RoutingConfig{
+		DefaultStrategy: "weighted",
+		Routes: []config.RouteConfig{
+			{
+				Name:  "responses-default",
+				Match: config.MatchConfig{Path: "/v1/responses"},
+				Targets: []config.TargetConfig{{Provider: providerID, Model: "mock-gpt", Weight: 1}},
+			},
+		},
+	})
+
+	retrier := resilience.NewRetrier(config.RetryConfig{Enabled: false})
+	cbm := resilience.NewCircuitBreakerManager()
+	fb := resilience.NewFallbackExecutor(retrier, cbm)
+	cache := middleware.NewCache(config.CacheConfig{Enabled: false})
+	streamer := streaming.NewHandler()
+	metrics := observability.NewMetricsWithRegisterer(prometheus.NewRegistry())
+	h := NewHandler(reg, router, fb, cache, streamer, metrics, nil, nil, nil)
+
+	payload := []byte(`{"model":"lunargate/auto","stream":true,"input":[{"role":"user","content":[{"type":"input_text","text":"run tools"}]}]}`)
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/v1/responses", bytes.NewReader(payload))
+	rec := httptest.NewRecorder()
+
+	h.Responses(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, rec.Code)
+	}
+	body := rec.Body.String()
+	if strings.Count(body, `"type":"response.function_call_arguments.done"`) != 2 {
+		t.Fatalf("expected two function_call_arguments.done events, got %q", body)
+	}
+	if !strings.Contains(body, `"call_id":"call_1"`) || !strings.Contains(body, `"call_id":"call_2"`) {
+		t.Fatalf("expected both call_ids in stream output, got %q", body)
+	}
+	if !strings.Contains(body, `"type":"response.completed"`) {
+		t.Fatalf("expected response.completed event, got %q", body)
+	}
+}
+
 func TestCopyHeaders_PreservesExistingDestinationHeaders(t *testing.T) {
 	dst := http.Header{}
 	dst.Set("X-Keep", "keep")

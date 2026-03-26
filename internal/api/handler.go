@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -95,8 +96,7 @@ func writeRequestDecodeError(w http.ResponseWriter, err error) {
 }
 
 func parseUnifiedRequest(w http.ResponseWriter, r *http.Request, captureBody bool) ([]byte, *models.UnifiedRequest, bool) {
-	const maxRequestBodyBytes int64 = 10 << 20
-	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+	limitRequestBody(w, r)
 	defer r.Body.Close()
 
 	var req models.UnifiedRequest
@@ -109,18 +109,12 @@ func parseUnifiedRequest(w http.ResponseWriter, r *http.Request, captureBody boo
 			writeRequestReadError(w, err)
 			return nil, nil, false
 		}
-		if err := json.Unmarshal(body, &req); err != nil {
+		if err := decodeJSONStrict(bytes.NewReader(body), &req); err != nil {
 			writeRequestDecodeError(w, err)
 			return nil, nil, false
 		}
 	} else {
-		decoder := json.NewDecoder(r.Body)
-		if err := decoder.Decode(&req); err != nil {
-			writeRequestDecodeError(w, err)
-			return nil, nil, false
-		}
-		var extra json.RawMessage
-		if err := decoder.Decode(&extra); err != io.EOF {
+		if err := decodeJSONStrict(r.Body, &req); err != nil {
 			writeRequestDecodeError(w, err)
 			return nil, nil, false
 		}
