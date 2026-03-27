@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 
 	"github.com/lunargate-ai/gateway/pkg/models"
@@ -45,14 +44,19 @@ func makeResponsesChatRequest(r *http.Request, unifiedReq *models.UnifiedRequest
 		return nil, err
 	}
 
+	originalPath := strings.TrimSpace(r.URL.Path)
+	if originalPath == "" {
+		originalPath = "/v1/responses"
+	}
 	chatReq := r.Clone(r.Context())
-	chatReq.URL.Path = "/v1/responses"
-	chatReq.RequestURI = "/v1/responses"
+	chatReq.URL.Path = "/v1/chat/completions"
+	chatReq.RequestURI = "/v1/chat/completions"
 	chatReq.Body = io.NopCloser(bytes.NewReader(body))
 	chatReq.ContentLength = int64(len(body))
 	chatReq.Header = r.Header.Clone()
 	chatReq.Header.Set("Content-Type", "application/json")
 	chatReq.Header.Set("X-LunarGate-Request-Type", "responses")
+	chatReq.Header.Set("X-LunarGate-Original-Path", originalPath)
 	return chatReq, nil
 }
 
@@ -65,24 +69,20 @@ func (h *Handler) handleResponsesStream(w http.ResponseWriter, chatReq *http.Req
 }
 
 func (h *Handler) handleResponsesNonStream(w http.ResponseWriter, chatReq *http.Request) {
-	rec := httptest.NewRecorder()
-	h.ChatCompletions(rec, chatReq)
-
-	copyHeaders(w.Header(), rec.Header())
-	if rec.Code >= 400 {
-		w.WriteHeader(rec.Code)
-		_, _ = w.Write(rec.Body.Bytes())
-		return
-	}
-
-	var unifiedResp models.UnifiedResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &unifiedResp); err != nil {
+	status, headers, unifiedResp, errorBody, err := h.executeChatCompletionsUnified(chatReq)
+	copyHeaders(w.Header(), headers)
+	if err != nil {
 		writeError(w, http.StatusBadGateway, "failed to parse provider response", "provider_error")
 		return
 	}
+	if status >= 400 {
+		w.WriteHeader(status)
+		_, _ = w.Write(errorBody)
+		return
+	}
 
-	resp := models.UnifiedResponseToResponses(&unifiedResp)
-	writeJSON(w, rec.Code, resp)
+	resp := models.UnifiedResponseToResponses(unifiedResp)
+	writeJSON(w, status, resp)
 }
 
 func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {

@@ -50,6 +50,12 @@ type trackedFlusherResponseWriter struct {
 	flusher http.Flusher
 }
 
+type capturedResponseWriter struct {
+	headers    http.Header
+	statusCode int
+	body       bytes.Buffer
+}
+
 func (w *trackedResponseWriter) WriteHeader(statusCode int) {
 	w.wroteHeader = true
 	w.ResponseWriter.WriteHeader(statusCode)
@@ -64,6 +70,27 @@ func (w *trackedResponseWriter) Write(p []byte) (int, error) {
 
 func (w *trackedFlusherResponseWriter) Flush() {
 	w.flusher.Flush()
+}
+
+func newCapturedResponseWriter() *capturedResponseWriter {
+	return &capturedResponseWriter{
+		headers: make(http.Header),
+	}
+}
+
+func (w *capturedResponseWriter) Header() http.Header {
+	return w.headers
+}
+
+func (w *capturedResponseWriter) WriteHeader(statusCode int) {
+	w.statusCode = statusCode
+}
+
+func (w *capturedResponseWriter) Write(p []byte) (int, error) {
+	if w.statusCode == 0 {
+		w.statusCode = http.StatusOK
+	}
+	return w.body.Write(p)
 }
 
 func newProviderHTTPClient() *http.Client {
@@ -257,7 +284,16 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	resolved, err := h.router.Resolve(r.Context(), r.URL.Path, headers)
+	resolvePath := r.URL.Path
+	originalPath := strings.TrimSpace(r.Header.Get("X-LunarGate-Original-Path"))
+	if strings.EqualFold(requestType, "responses") && originalPath != "" {
+		resolvePath = originalPath
+	}
+	resolved, err := h.router.Resolve(r.Context(), resolvePath, headers)
+	if err != nil && strings.EqualFold(requestType, "responses") && originalPath != "" && originalPath != r.URL.Path {
+		resolvePath = r.URL.Path
+		resolved, err = h.router.Resolve(r.Context(), resolvePath, headers)
+	}
 	if err != nil {
 		log.Error().Err(err).Str("request_id", requestID).Msg("failed to resolve route")
 		writeError(w, http.StatusBadGateway, "no route matched for this request", "routing_error")
@@ -1163,6 +1199,28 @@ func (h *Handler) enrichCollectorTags(headers map[string]string, provider string
 		}
 	}
 	return tags
+}
+
+func (h *Handler) executeChatCompletionsUnified(r *http.Request) (int, http.Header, *models.UnifiedResponse, []byte, error) {
+	rec := newCapturedResponseWriter()
+	h.ChatCompletions(rec, r)
+
+	status := rec.statusCode
+	if status == 0 {
+		status = http.StatusOK
+	}
+	headers := rec.Header().Clone()
+	body := rec.body.Bytes()
+
+	if status >= 400 {
+		return status, headers, nil, body, nil
+	}
+
+	var unified models.UnifiedResponse
+	if err := json.Unmarshal(body, &unified); err != nil {
+		return status, headers, nil, nil, err
+	}
+	return status, headers, &unified, nil, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

@@ -592,7 +592,9 @@ func (p *responsesStreamProxy) sendHeadersIfNeeded() {
 			p.target.Header().Add(key, value)
 		}
 	}
-	p.target.Header().Set("Content-Type", "text/event-stream")
+	if p.statusCode < 400 {
+		p.target.Header().Set("Content-Type", "text/event-stream")
+	}
 	p.target.WriteHeader(p.statusCode)
 }
 

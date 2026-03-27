@@ -207,6 +207,114 @@ func TestResponses_MapsToChatCompletions(t *testing.T) {
 	}
 }
 
+func TestResponses_RoutesViaChatPathWhenOnlyChatRouteConfigured(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"mock-gpt","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer upstream.Close()
+
+	providerID := "openai"
+	cfgProviders := map[string]config.ProviderConfig{
+		providerID: {Type: "openai", APIKey: "dummy", BaseURL: upstream.URL},
+	}
+	reg := providers.NewRegistry(cfgProviders)
+
+	router := routing.NewEngine(config.RoutingConfig{
+		DefaultStrategy: "weighted",
+		Routes: []config.RouteConfig{
+			{
+				Name:    "chat-only-route",
+				Match:   config.MatchConfig{Path: "/v1/chat/completions"},
+				Targets: []config.TargetConfig{{Provider: providerID, Model: "mock-gpt", Weight: 1}},
+			},
+		},
+	})
+
+	retrier := resilience.NewRetrier(config.RetryConfig{Enabled: false})
+	cbm := resilience.NewCircuitBreakerManager()
+	fb := resilience.NewFallbackExecutor(retrier, cbm)
+	cache := middleware.NewCache(config.CacheConfig{Enabled: false})
+	streamer := streaming.NewHandler()
+	metrics := observability.NewMetricsWithRegisterer(prometheus.NewRegistry())
+	h := NewHandler(reg, router, fb, cache, streamer, metrics, nil, nil, nil)
+
+	payload := []byte(`{"model":"lunargate/auto","input":[{"role":"user","content":[{"type":"input_text","text":"Say hi"}]}]}`)
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/v1/responses", bytes.NewReader(payload))
+	rec := httptest.NewRecorder()
+
+	h.Responses(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, rec.Code)
+	}
+	if got := rec.Header().Get("X-LunarGate-Route"); got != "chat-only-route" {
+		t.Fatalf("expected routed via chat-only-route, got %q", got)
+	}
+
+	var out models.ResponsesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("failed to unmarshal responses payload: %v", err)
+	}
+	if out.OutputText != "ok" {
+		t.Fatalf("expected output_text %q, got %q", "ok", out.OutputText)
+	}
+}
+
+func TestResponses_RoutesViaResponsesPathWhenResponsesRouteConfigured(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-2","object":"chat.completion","created":1,"model":"mock-gpt","choices":[{"index":0,"message":{"role":"assistant","content":"ok-responses-route"},"finish_reason":"stop"}]}`))
+	}))
+	defer upstream.Close()
+
+	providerID := "openai"
+	cfgProviders := map[string]config.ProviderConfig{
+		providerID: {Type: "openai", APIKey: "dummy", BaseURL: upstream.URL},
+	}
+	reg := providers.NewRegistry(cfgProviders)
+
+	router := routing.NewEngine(config.RoutingConfig{
+		DefaultStrategy: "weighted",
+		Routes: []config.RouteConfig{
+			{
+				Name:    "responses-only-route",
+				Match:   config.MatchConfig{Path: "/v1/responses"},
+				Targets: []config.TargetConfig{{Provider: providerID, Model: "mock-gpt", Weight: 1}},
+			},
+		},
+	})
+
+	retrier := resilience.NewRetrier(config.RetryConfig{Enabled: false})
+	cbm := resilience.NewCircuitBreakerManager()
+	fb := resilience.NewFallbackExecutor(retrier, cbm)
+	cache := middleware.NewCache(config.CacheConfig{Enabled: false})
+	streamer := streaming.NewHandler()
+	metrics := observability.NewMetricsWithRegisterer(prometheus.NewRegistry())
+	h := NewHandler(reg, router, fb, cache, streamer, metrics, nil, nil, nil)
+
+	payload := []byte(`{"model":"lunargate/auto","input":[{"role":"user","content":[{"type":"input_text","text":"Say hi"}]}]}`)
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/v1/responses", bytes.NewReader(payload))
+	rec := httptest.NewRecorder()
+
+	h.Responses(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, rec.Code)
+	}
+	if got := rec.Header().Get("X-LunarGate-Route"); got != "responses-only-route" {
+		t.Fatalf("expected routed via responses-only-route, got %q", got)
+	}
+
+	var out models.ResponsesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("failed to unmarshal responses payload: %v", err)
+	}
+	if out.OutputText != "ok-responses-route" {
+		t.Fatalf("expected output_text %q, got %q", "ok-responses-route", out.OutputText)
+	}
+}
+
 func TestResponses_StreamPassthrough(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

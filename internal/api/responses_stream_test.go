@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -158,6 +159,167 @@ func TestResponsesStreamProxy_ToolOnlyTurnDoesNotEmitEmptyAssistantMessage(t *te
 	}
 }
 
+func TestResponsesStreamProxy_ErrorPassthroughKeepsContentType(t *testing.T) {
+	rec := httptest.NewRecorder()
+	proxy := newResponsesStreamProxy(rec)
+
+	proxy.Header().Set("Content-Type", "application/json")
+	proxy.WriteHeader(http.StatusBadRequest)
+	_, err := proxy.Write([]byte(`{"error":{"message":"bad request","type":"invalid_request_error"}}`))
+	if err != nil {
+		t.Fatalf("write error: %v", err)
+	}
+	if err := proxy.finalize(); err != nil {
+		t.Fatalf("finalize error: %v", err)
+	}
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, rec.Code)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("expected content-type application/json, got %q", got)
+	}
+	body := strings.TrimSpace(rec.Body.String())
+	if !strings.Contains(body, `"invalid_request_error"`) {
+		t.Fatalf("expected passthrough error payload, got %q", body)
+	}
+}
+
+func TestResponsesStreamProxy_EventOrderingWithTextAndToolCall(t *testing.T) {
+	rec := httptest.NewRecorder()
+	proxy := newResponsesStreamProxy(rec)
+
+	firstChunk := `data: {"id":"chatcmpl-order","object":"chat.completion.chunk","created":1,"model":"mock-gpt","choices":[{"index":0,"delta":{"content":"Hello"}}]}
+
+`
+	if _, err := proxy.Write([]byte(firstChunk)); err != nil {
+		t.Fatalf("write first chunk error: %v", err)
+	}
+
+	secondChunk := `data: {"id":"chatcmpl-order","object":"chat.completion.chunk","created":1,"model":"mock-gpt","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_order","type":"function","function":{"name":"exec_command","arguments":"{\"cmd\":\"p"}}]}}]}
+
+`
+	if _, err := proxy.Write([]byte(secondChunk)); err != nil {
+		t.Fatalf("write second chunk error: %v", err)
+	}
+
+	thirdChunk := `data: {"id":"chatcmpl-order","object":"chat.completion.chunk","created":1,"model":"mock-gpt","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_order","type":"function","function":{"arguments":"wd\"}"}}]},"finish_reason":"tool_calls"}]}
+
+`
+	if _, err := proxy.Write([]byte(thirdChunk)); err != nil {
+		t.Fatalf("write third chunk error: %v", err)
+	}
+
+	if _, err := proxy.Write([]byte("data: [DONE]\n\n")); err != nil {
+		t.Fatalf("write done chunk error: %v", err)
+	}
+	if err := proxy.finalize(); err != nil {
+		t.Fatalf("finalize error: %v", err)
+	}
+
+	events := decodeSSEEvents(t, rec.Body.String())
+	typeOrder := make([]string, 0, len(events))
+	for _, evt := range events {
+		if typeName, _ := evt["type"].(string); typeName != "" {
+			typeOrder = append(typeOrder, typeName)
+		}
+	}
+
+	idxCreated := firstIndex(typeOrder, "response.created")
+	idxMsgAdded := firstIndex(typeOrder, "response.output_item.added")
+	idxPartAdded := firstIndex(typeOrder, "response.content_part.added")
+	idxTextDelta := firstIndex(typeOrder, "response.output_text.delta")
+	idxToolArgsDelta := firstIndex(typeOrder, "response.function_call_arguments.delta")
+	idxTextDone := firstIndex(typeOrder, "response.output_text.done")
+	idxToolArgsDone := firstIndex(typeOrder, "response.function_call_arguments.done")
+	idxCompleted := firstIndex(typeOrder, "response.completed")
+
+	if idxCreated < 0 || idxMsgAdded < 0 || idxPartAdded < 0 || idxTextDelta < 0 || idxToolArgsDelta < 0 || idxTextDone < 0 || idxToolArgsDone < 0 || idxCompleted < 0 {
+		t.Fatalf("expected lifecycle events missing, order=%v", typeOrder)
+	}
+	if !(idxCreated < idxMsgAdded && idxMsgAdded < idxPartAdded && idxPartAdded < idxTextDelta) {
+		t.Fatalf("expected message/text start ordering, order=%v", typeOrder)
+	}
+	if !(idxTextDelta < idxTextDone && idxToolArgsDelta < idxToolArgsDone && idxToolArgsDone < idxCompleted) {
+		t.Fatalf("expected completion ordering, order=%v", typeOrder)
+	}
+}
+
+func TestResponsesStreamProxy_FunctionArgumentsAssembleAcrossChunks(t *testing.T) {
+	rec := httptest.NewRecorder()
+	proxy := newResponsesStreamProxy(rec)
+
+	chunks := []string{
+		`data: {"id":"chatcmpl-args","object":"chat.completion.chunk","created":1,"model":"mock-gpt","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_assemble","type":"function","function":{"name":"exec_command","arguments":"{\"cmd\":\"p"}}]}}]}
+
+`,
+		`data: {"id":"chatcmpl-args","object":"chat.completion.chunk","created":1,"model":"mock-gpt","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_assemble","type":"function","function":{"arguments":"wd\",\"cwd\":\"/"}}]}}]}
+
+`,
+		`data: {"id":"chatcmpl-args","object":"chat.completion.chunk","created":1,"model":"mock-gpt","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_assemble","type":"function","function":{"arguments":"tmp\"}"}}]},"finish_reason":"tool_calls"}]}
+
+`,
+	}
+
+	for i, chunk := range chunks {
+		if _, err := proxy.Write([]byte(chunk)); err != nil {
+			t.Fatalf("write chunk %d error: %v", i+1, err)
+		}
+	}
+	if _, err := proxy.Write([]byte("data: [DONE]\n\n")); err != nil {
+		t.Fatalf("write done chunk error: %v", err)
+	}
+	if err := proxy.finalize(); err != nil {
+		t.Fatalf("finalize error: %v", err)
+	}
+
+	events := decodeSSEEvents(t, rec.Body.String())
+	expectedArgs := `{"cmd":"pwd","cwd":"/tmp"}`
+
+	foundDoneArgs := false
+	var completedResponse map[string]interface{}
+	for _, evt := range events {
+		typeName, _ := evt["type"].(string)
+		if typeName == "response.function_call_arguments.done" {
+			if got, _ := evt["arguments"].(string); got == expectedArgs {
+				foundDoneArgs = true
+			}
+		}
+		if typeName == "response.completed" {
+			completedResponse, _ = evt["response"].(map[string]interface{})
+		}
+	}
+	if !foundDoneArgs {
+		t.Fatalf("expected function_call_arguments.done with assembled args %q", expectedArgs)
+	}
+	if completedResponse == nil {
+		t.Fatalf("expected response.completed event")
+	}
+
+	output, _ := completedResponse["output"].([]interface{})
+	if len(output) == 0 {
+		t.Fatalf("expected completed output items")
+	}
+	foundOutputArgs := false
+	for _, rawItem := range output {
+		item, _ := rawItem.(map[string]interface{})
+		if item == nil {
+			continue
+		}
+		itemType, _ := item["type"].(string)
+		if itemType != "function_call" {
+			continue
+		}
+		if got, _ := item["arguments"].(string); got == expectedArgs {
+			foundOutputArgs = true
+			break
+		}
+	}
+	if !foundOutputArgs {
+		t.Fatalf("expected completed function_call output to include assembled args %q", expectedArgs)
+	}
+}
+
 func decodeSSEEvents(t *testing.T, body string) []map[string]interface{} {
 	t.Helper()
 	frames := strings.Split(body, "\n\n")
@@ -181,4 +343,13 @@ func decodeSSEEvents(t *testing.T, body string) []map[string]interface{} {
 		events = append(events, event)
 	}
 	return events
+}
+
+func firstIndex(items []string, target string) int {
+	for i, item := range items {
+		if item == target {
+			return i
+		}
+	}
+	return -1
 }
