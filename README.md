@@ -2,50 +2,154 @@
   <img src=".github/assets/logo-full-readme.png" alt="LunarGate" width="420" />
 </p>
 
-# LunarGate Gateway
+<div align="center">
+Self-hosted open-source AI gateway with OpenAI-compatible APIs, Ollama upstream support, routing, fallback, and observability-friendly data sharing.
 
-Open-source, self-hosted AI gateway for OpenAI-compatible workloads.
+[Docs](https://docs.lunargate.ai) | [API Reference](https://docs.lunargate.ai/reference/http-api/) | [Examples](https://github.com/lunargate-ai/gateway-examples) | [Website](https://lunargate.ai)
 
-## Status
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://github.com/lunargate-ai/gateway/blob/main/LICENSE)
+</div>
 
-This repository is still a work in progress.
+---
+
+> [!IMPORTANT]
+> LunarGate is under active development. The core gateway is already usable today, but interfaces and configuration may still evolve.
+
+LunarGate is a Go-based AI gateway that lets you expose one stable endpoint to your applications while routing requests to different upstream model providers behind the scenes.
+
+## What LunarGate does
+
+- Exposes an OpenAI-compatible API for client apps
+- Routes requests across providers and models with weighted or conditional rules
+- Adds retries, fallbacks, and circuit breakers at the gateway layer
+- Supports streaming and tool-calling flows
+- Keeps a small footprint: the standalone binary is typically around 10-12 MB depending on platform, and the container image is around 12 MB
+- Keeps data local by default, with optional prompt/response sharing for observability
+- Works with providers such as OpenAI, Anthropic, Ollama, and other OpenAI-compatible local backends
+
+## Supported endpoints
+
+- `POST /v1/chat/completions`
+- `POST /v1/responses`
+- `POST /v1/embeddings`
+- `GET /v1/models`
+
+## Provider support
+
+LunarGate exposes an OpenAI-compatible client-facing API, but it can route to multiple upstream provider types behind the scenes, including:
+
+- OpenAI
+- Anthropic
+- Ollama
+- other OpenAI-compatible backends
+
+That means your app can keep one stable client integration while the gateway talks to the upstream provider in the format it expects.
 
 ## Documentation
 
-Full documentation lives at `https://docs.lunargate.ai`.
+Full documentation lives at [docs.lunargate.ai](https://docs.lunargate.ai).
 
-## Quick Start
+Useful starting points:
+
+- [Quickstart](https://docs.lunargate.ai/getting-started/quickstart/)
+- [Routing and fallback](https://docs.lunargate.ai/guides/routing/)
+- [Configuration reference](https://docs.lunargate.ai/reference/configuration/)
+- [Runnable examples](https://github.com/lunargate-ai/gateway-examples)
+
+## Quick start
+
+Choose one install path:
+
+- [Homebrew on macOS](#homebrew-macos)
+- [Install script on Linux](#install-script-linux)
+- [Build from source](#build-from-source)
+
+### Homebrew (macOS)
 
 ```bash
-cp configs/config.example.yaml ./config.yaml
+brew tap lunargate-ai/tap
+brew install lunargate
+```
+
+### Install script (Linux)
+
+```bash
+curl -fsSL https://get.lunargate.ai/install.sh | sh
+```
+
+### Build from source
+
+```bash
 make build
-./bin/lunargate
 ```
 
-By default, the gateway looks for `config.yaml` in the current working directory.
+## Minimal configuration
 
-If your `config.yaml` uses environment placeholders such as `${OPENAI_API_KEY}`, create a `.env` file in the same directory or export the variables before starting the gateway.
+Create `config.yaml`:
 
-Example:
+```yaml
+providers:
+  openai:
+    api_key: "${OPENAI_API_KEY}"
+    base_url: "https://api.openai.com/v1"
+    default_model: "gpt-5.2"
 
-```bash
-cat > .env <<'EOF'
-OPENAI_API_KEY=your-openai-key
-ANTHROPIC_API_KEY=your-anthropic-key
-EOF
+routing:
+  routes:
+    - name: "default"
+      targets:
+        - provider: openai
+          model: "gpt-5.2"
 ```
 
-If you want to connect the gateway to LunarGate observability, go to `https://lunargate.ai`, create a gateway there, then copy its `gateway_id` and generated gateway API key into your environment:
+If you use environment placeholders such as `${OPENAI_API_KEY}`, either export them in your shell or place them in a local `.env` file:
 
 ```bash
-cat >> .env <<'EOF'
-LUNARGATE_BACKEND_URL=https://api.lunargate.ai/v1
+OPENAI_API_KEY=sk-xxxxxxxxx
+```
+
+Then start the gateway:
+
+```bash
+lunargate --config ./config.yaml
+```
+
+If you omit `--config`, LunarGate will look for `config.yaml` in the current directory.
+
+## Call the gateway
+
+Point your OpenAI-compatible client at:
+
+```text
+http://localhost:8080/v1
+```
+
+For a runnable client example, see [`gateway-examples/`](https://github.com/lunargate-ai/gateway-examples).
+
+## Observability
+
+By default, LunarGate does not forward prompts or responses outside your infrastructure.
+
+If you want to connect the gateway to LunarGate observability, create a gateway in the LunarGate app and add the generated credentials to your environment:
+
+```bash
 LUNARGATE_GATEWAY_ID=gw_your_gateway_id
 LUNARGATE_GATEWAY_API_KEY=lgw_your_gateway_api_key
-EOF
 ```
 
-With that in place, enable `data_sharing` in `config.yaml` and the gateway will start sending metrics/logs to LunarGate.
+Then enable `data_sharing` in `config.yaml`:
+
+```yaml
+data_sharing:
+  enabled: true
+  share_prompts: true
+  share_responses: true
+  remote_control: true
+  gateway_id: "${LUNARGATE_GATEWAY_ID}"
+  api_key: "${LUNARGATE_GATEWAY_API_KEY}"
+```
+
+You can keep `share_prompts` and `share_responses` off if you want metrics-only forwarding.
 
 ## Security
 
