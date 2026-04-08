@@ -167,6 +167,32 @@ func setTimingHeaders(w http.ResponseWriter, totalMS int64, overheadMS int64) {
 	}
 }
 
+func requestContextWithRetryPolicy(r *http.Request) context.Context {
+	ctx := r.Context()
+	if strings.EqualFold(strings.TrimSpace(r.Header.Get("X-LunarGate-No-Retry")), "true") {
+		return resilience.WithRetryDisabled(ctx)
+	}
+	return ctx
+}
+
+func (h *Handler) observeCircuitBreakerState(provider string, state string) {
+	if h == nil || h.metrics == nil {
+		return
+	}
+	if provider == "" || state == "" {
+		return
+	}
+
+	value := 0.0
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "half-open":
+		value = 1
+	case "open":
+		value = 2
+	}
+	h.metrics.CircuitBreakerState.WithLabelValues(provider).Set(value)
+}
+
 // NewHandler creates a new API handler with all dependencies.
 func NewHandler(
 	registry *providers.Registry,
@@ -411,10 +437,9 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return h.callProvider(ctx, target, &req, markUpstreamStart)
 	}
 
-	noRetry := r.Header.Get("X-LunarGate-No-Retry") == "true"
-	_ = noRetry // TODO: pass this to fallback executor
-
-	resp, usedTarget, fallbackUsed, retryCount, cbState, err := h.fallback.Execute(r.Context(), resolved.Target, resolved.Fallbacks, executeFunc)
+	requestCtx := requestContextWithRetryPolicy(r)
+	resp, usedTarget, fallbackUsed, retryCount, cbState, err := h.fallback.Execute(requestCtx, resolved.Target, resolved.Fallbacks, executeFunc)
+	h.observeCircuitBreakerState(usedTarget.Provider, cbState)
 	if err != nil {
 		duration := time.Since(startTime)
 		status := http.StatusBadGateway

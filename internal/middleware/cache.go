@@ -21,9 +21,11 @@ type CacheEntry struct {
 
 // Cache provides in-memory exact-match caching for LLM responses.
 type Cache struct {
-	mu      sync.RWMutex
-	entries map[string]*CacheEntry
-	cfg     config.CacheConfig
+	mu       sync.RWMutex
+	entries  map[string]*CacheEntry
+	cfg      config.CacheConfig
+	stopCh   chan struct{}
+	stopOnce sync.Once
 }
 
 // NewCache creates a new in-memory cache.
@@ -31,6 +33,7 @@ func NewCache(cfg config.CacheConfig) *Cache {
 	c := &Cache{
 		entries: make(map[string]*CacheEntry),
 		cfg:     cfg,
+		stopCh:  make(chan struct{}),
 	}
 
 	// Start cleanup goroutine
@@ -145,6 +148,16 @@ func (c *Cache) Enabled() bool {
 	return c.cfg.Enabled
 }
 
+// Stop shuts down the background cleanup loop.
+func (c *Cache) Stop() {
+	if c == nil {
+		return
+	}
+	c.stopOnce.Do(func() {
+		close(c.stopCh)
+	})
+}
+
 func (c *Cache) evictOldest() {
 	var oldestKey string
 	var oldestTime time.Time
@@ -165,14 +178,19 @@ func (c *Cache) cleanup() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		c.mu.Lock()
-		now := time.Now()
-		for key, entry := range c.entries {
-			if now.After(entry.ExpiresAt) {
-				delete(c.entries, key)
+	for {
+		select {
+		case <-ticker.C:
+			c.mu.Lock()
+			now := time.Now()
+			for key, entry := range c.entries {
+				if now.After(entry.ExpiresAt) {
+					delete(c.entries, key)
+				}
 			}
+			c.mu.Unlock()
+		case <-c.stopCh:
+			return
 		}
-		c.mu.Unlock()
 	}
 }

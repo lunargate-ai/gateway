@@ -315,7 +315,9 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 		return h.callEmbeddingsProvider(ctx, target, &req, markUpstreamStart)
 	}
 
-	resp, usedTarget, fallbackUsed, retryCount, cbState, err := h.fallback.Execute(r.Context(), resolved.Target, resolved.Fallbacks, executeFunc)
+	requestCtx := requestContextWithRetryPolicy(r)
+	resp, usedTarget, fallbackUsed, retryCount, cbState, err := h.fallback.Execute(requestCtx, resolved.Target, resolved.Fallbacks, executeFunc)
+	h.observeCircuitBreakerState(usedTarget.Provider, cbState)
 	if err != nil {
 		duration := time.Since(startTime)
 		status := http.StatusBadGateway

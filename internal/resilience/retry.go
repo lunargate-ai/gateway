@@ -33,8 +33,13 @@ func (r *Retrier) Do(ctx context.Context, fn DoFunc) (*http.Response, int, error
 		return resp, 0, err
 	}
 
+	maxAttempts := r.cfg.MaxAttempts
+	if retryDisabled(ctx) && maxAttempts > 1 {
+		maxAttempts = 1
+	}
+
 	var lastErr error
-	for attempt := 0; attempt < r.cfg.MaxAttempts; attempt++ {
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		resp, err := fn(ctx)
 
 		if err == nil && resp != nil && !r.isRetryableStatus(resp.StatusCode) {
@@ -49,11 +54,11 @@ func (r *Retrier) Do(ctx context.Context, fn DoFunc) (*http.Response, int, error
 			resp.Body.Close()
 		}
 
-		if attempt < r.cfg.MaxAttempts-1 {
+		if attempt < maxAttempts-1 {
 			delay := r.calculateDelay(attempt)
 			log.Debug().
 				Int("attempt", attempt+1).
-				Int("max_attempts", r.cfg.MaxAttempts).
+				Int("max_attempts", maxAttempts).
 				Dur("delay", delay).
 				Err(lastErr).
 				Msg("retrying request")
@@ -66,7 +71,7 @@ func (r *Retrier) Do(ctx context.Context, fn DoFunc) (*http.Response, int, error
 		}
 	}
 
-	return nil, r.cfg.MaxAttempts, fmt.Errorf("max retries (%d) exceeded: %w", r.cfg.MaxAttempts, lastErr)
+	return nil, maxAttempts, fmt.Errorf("max retries (%d) exceeded: %w", maxAttempts, lastErr)
 }
 
 func (r *Retrier) isRetryableStatus(code int) bool {

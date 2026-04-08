@@ -19,6 +19,7 @@ import (
 	"github.com/lunargate-ai/gateway/pkg/models"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func TestChatCompletions_RequestBodyTooLarge_Returns413(t *testing.T) {
@@ -97,6 +98,80 @@ func TestChatCompletions_ProviderErrorPassthrough(t *testing.T) {
 	}
 	if resp.Error.Message != "bad key" {
 		t.Fatalf("expected error message %q, got %q", "bad key", resp.Error.Message)
+	}
+}
+
+func TestChatCompletions_NoRetryDisablesPerTargetRetriesAndStillFallsBack(t *testing.T) {
+	primaryCalls := 0
+	primaryUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryCalls++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":{"message":"try fallback","type":"server_error"}}`))
+	}))
+	defer primaryUpstream.Close()
+
+	fallbackCalls := 0
+	fallbackUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-fallback","object":"chat.completion","created":1,"model":"fallback-gpt","choices":[{"index":0,"message":{"role":"assistant","content":"ok-from-fallback"},"finish_reason":"stop"}]}`))
+	}))
+	defer fallbackUpstream.Close()
+
+	cfgProviders := map[string]config.ProviderConfig{
+		"primary":  {Type: "openai", APIKey: "dummy", BaseURL: primaryUpstream.URL},
+		"fallback": {Type: "openai", APIKey: "dummy", BaseURL: fallbackUpstream.URL},
+	}
+	reg := providers.NewRegistry(cfgProviders)
+
+	router := routing.NewEngine(config.RoutingConfig{
+		DefaultStrategy: "weighted",
+		Routes: []config.RouteConfig{
+			{
+				Name:    "default",
+				Match:   config.MatchConfig{Path: "*"},
+				Targets: []config.TargetConfig{{Provider: "primary", Model: "gpt-primary", Weight: 1}},
+				Fallback: []config.TargetConfig{
+					{Provider: "fallback", Model: "gpt-fallback", Weight: 1},
+				},
+			},
+		},
+	})
+
+	retrier := resilience.NewRetrier(config.RetryConfig{Enabled: true, MaxAttempts: 3, RetryableErrors: []int{500}})
+	cbm := resilience.NewCircuitBreakerManager()
+	fb := resilience.NewFallbackExecutor(retrier, cbm)
+	cache := middleware.NewCache(config.CacheConfig{Enabled: false})
+	streamer := streaming.NewHandler()
+	metrics := observability.NewMetricsWithRegisterer(prometheus.NewRegistry())
+	h := NewHandler(reg, router, fb, cache, streamer, metrics, nil, nil, nil)
+
+	payload := models.UnifiedRequest{Model: "gpt-primary", Messages: []models.Message{{Role: "user", Content: "hi"}}}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("failed to marshal payload: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/v1/chat/completions", bytes.NewReader(b))
+	req.Header.Set("X-LunarGate-No-Retry", "true")
+	rec := httptest.NewRecorder()
+
+	h.ChatCompletions(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, rec.Code)
+	}
+	if primaryCalls != 1 {
+		t.Fatalf("expected exactly one primary attempt with X-LunarGate-No-Retry, got %d", primaryCalls)
+	}
+	if fallbackCalls != 1 {
+		t.Fatalf("expected fallback to run after the single primary failure, got %d calls", fallbackCalls)
+	}
+	if got := rec.Header().Get("X-LunarGate-Provider"); got != "fallback" {
+		t.Fatalf("expected fallback provider in response header, got %q", got)
+	}
+	if gauge := testutil.ToFloat64(metrics.CircuitBreakerState.WithLabelValues("fallback")); gauge != 0 {
+		t.Fatalf("expected fallback circuit breaker gauge to remain closed, got %v", gauge)
 	}
 }
 

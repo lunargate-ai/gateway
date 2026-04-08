@@ -166,6 +166,12 @@ func main() {
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Error().Err(err).Msg("server shutdown error")
 	}
+	if collectorClient != nil {
+		collectorClient.Stop()
+	}
+	if cache != nil {
+		cache.Stop()
+	}
 
 	log.Info().Msg("gateway stopped")
 }
