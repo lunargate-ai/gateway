@@ -96,11 +96,11 @@ func GenerateEmbeddingsKey(req *models.EmbeddingsRequest) string {
 
 // Get looks up a cached response. Returns nil if not found or expired.
 func (c *Cache) Get(key string) interface{} {
+	c.mu.RLock()
 	if !c.cfg.Enabled {
+		c.mu.RUnlock()
 		return nil
 	}
-
-	c.mu.RLock()
 	entry, ok := c.entries[key]
 	c.mu.RUnlock()
 
@@ -121,12 +121,15 @@ func (c *Cache) Get(key string) interface{} {
 
 // Set stores a response in the cache.
 func (c *Cache) Set(key string, resp interface{}) {
-	if !c.cfg.Enabled || key == "" {
+	if key == "" {
 		return
 	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if !c.cfg.Enabled {
+		return
+	}
 
 	// Evict if at capacity
 	if len(c.entries) >= c.cfg.MaxSize {
@@ -145,7 +148,22 @@ func (c *Cache) Set(key string, resp interface{}) {
 
 // Enabled returns whether caching is enabled.
 func (c *Cache) Enabled() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.cfg.Enabled
+}
+
+// UpdateConfig hot-reloads cache settings and resets entries so TTL/max-size
+// semantics are immediately consistent with the new config.
+func (c *Cache) UpdateConfig(cfg config.CacheConfig) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.cfg = cfg
+	c.entries = make(map[string]*CacheEntry)
+	c.mu.Unlock()
+	log.Info().Msg("cache config updated")
 }
 
 // Stop shuts down the background cleanup loop.

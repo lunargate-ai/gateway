@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/lunargate-ai/gateway/internal/config"
@@ -14,12 +15,25 @@ import (
 
 // Retrier handles retry logic with exponential backoff and jitter.
 type Retrier struct {
-	cfg config.RetryConfig
+	cfg atomic.Value
 }
 
 // NewRetrier creates a new retrier from config.
 func NewRetrier(cfg config.RetryConfig) *Retrier {
-	return &Retrier{cfg: cfg}
+	r := &Retrier{}
+	r.cfg.Store(cfg)
+	return r
+}
+
+// UpdateConfig hot-reloads the retry configuration.
+func (r *Retrier) UpdateConfig(cfg config.RetryConfig) {
+	r.cfg.Store(cfg)
+	log.Info().Msg("retry config updated")
+}
+
+func (r *Retrier) currentConfig() config.RetryConfig {
+	cfg, _ := r.cfg.Load().(config.RetryConfig)
+	return cfg
 }
 
 // DoFunc is the function signature for retryable operations.
@@ -28,12 +42,13 @@ type DoFunc func(ctx context.Context) (*http.Response, error)
 // Do executes the given function with retry logic.
 // Returns the response from the first successful attempt or the last error.
 func (r *Retrier) Do(ctx context.Context, fn DoFunc) (*http.Response, int, error) {
-	if !r.cfg.Enabled {
+	cfg := r.currentConfig()
+	if !cfg.Enabled {
 		resp, err := fn(ctx)
 		return resp, 0, err
 	}
 
-	maxAttempts := r.cfg.MaxAttempts
+	maxAttempts := cfg.MaxAttempts
 	if retryDisabled(ctx) && maxAttempts > 1 {
 		maxAttempts = 1
 	}
@@ -54,8 +69,8 @@ func (r *Retrier) Do(ctx context.Context, fn DoFunc) (*http.Response, int, error
 			resp.Body.Close()
 		}
 
-		if attempt < maxAttempts-1 {
-			delay := r.calculateDelay(attempt)
+			if attempt < maxAttempts-1 {
+				delay := r.calculateDelay(attempt)
 			log.Debug().
 				Int("attempt", attempt+1).
 				Int("max_attempts", maxAttempts).
@@ -75,7 +90,8 @@ func (r *Retrier) Do(ctx context.Context, fn DoFunc) (*http.Response, int, error
 }
 
 func (r *Retrier) isRetryableStatus(code int) bool {
-	for _, retryable := range r.cfg.RetryableErrors {
+	cfg := r.currentConfig()
+	for _, retryable := range cfg.RetryableErrors {
 		if code == retryable {
 			return true
 		}
@@ -84,18 +100,19 @@ func (r *Retrier) isRetryableStatus(code int) bool {
 }
 
 func (r *Retrier) calculateDelay(attempt int) time.Duration {
-	delay := float64(r.cfg.InitialDelay) * math.Pow(r.cfg.Multiplier, float64(attempt))
+	cfg := r.currentConfig()
+	delay := float64(cfg.InitialDelay) * math.Pow(cfg.Multiplier, float64(attempt))
 
-	if delay > float64(r.cfg.MaxDelay) {
-		delay = float64(r.cfg.MaxDelay)
+	if delay > float64(cfg.MaxDelay) {
+		delay = float64(cfg.MaxDelay)
 	}
 
 	// Add jitter: delay * (1 +/- jitterFactor/2)
-	jitter := delay * r.cfg.JitterFactor * (rand.Float64() - 0.5)
+	jitter := delay * cfg.JitterFactor * (rand.Float64() - 0.5)
 	result := delay + jitter
 
 	if result < 0 {
-		result = float64(r.cfg.InitialDelay)
+		result = float64(cfg.InitialDelay)
 	}
 
 	return time.Duration(result)

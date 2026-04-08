@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"reflect"
+	"sync"
 	"syscall"
 	"time"
 
@@ -73,48 +75,87 @@ func main() {
 	collectorClient := observability.NewCollectorClient(cfg.DataSharing, version)
 	selector := modelselect.NewEngine(cfg.ModelSelect)
 	store := modelstore.NewStore(registry, cfg.Providers)
-	localBaseURL := "http://" + localLoopbackAddress(cfg.Server)
-	remoteControlClient := remotecontrol.NewClient(
-		cfg.DataSharing,
-		version,
-		localBaseURL,
-		routingEngine.RouteNames,
-		func(ctx context.Context) []string {
-			var ids []string
-			if store != nil {
-				for _, item := range store.AllModels(ctx) {
-					if item.ID != "" {
-						ids = append(ids, item.ID)
-					}
+	remoteControlBaseURL := "http://" + localLoopbackAddress(cfg.Server)
+	modelIDs := func(ctx context.Context) []string {
+		var ids []string
+		if store != nil {
+			for _, item := range store.AllModels(ctx) {
+				if item.ID != "" {
+					ids = append(ids, item.ID)
 				}
 			}
-			return ids
-		},
-	)
-	remoteControlEnabled := cfg.DataSharing.RemoteControl && remoteControlClient != nil
-	remoteControlInstanceID := ""
-	if remoteControlClient != nil {
-		remoteControlInstanceID = remoteControlClient.InstanceID()
+		}
+		return ids
 	}
-
-	log.Info().
-		Bool("data_sharing_enabled", cfg.DataSharing.Enabled).
-		Bool("remote_control_enabled", remoteControlEnabled).
-		Str("gateway_id", cfg.DataSharing.GatewayID).
-		Str("instance_id", remoteControlInstanceID).
-		Str("backend_url", cfg.DataSharing.BackendURL).
-		Msg("gateway data sharing and remote control status")
-
-	// --- Setup Hot-Reload ---
-	cfgManager.OnChange(func(newCfg *config.Config) {
-		routingEngine.UpdateConfig(newCfg.Routing)
-		rateLimiter.UpdateConfig(newCfg.RateLimit)
-		selector.UpdateConfig(newCfg.ModelSelect)
-		store.UpdateProvidersConfig(newCfg.Providers)
+	var remoteControlMu sync.Mutex
+	var remoteControlClient *remotecontrol.Client
+	remoteControlCancel := func() {}
+	refreshRemoteControlHello := func() {
+		remoteControlMu.Lock()
+		defer remoteControlMu.Unlock()
 		if remoteControlClient != nil {
 			remoteControlClient.RefreshHello()
 		}
-		log.Info().Msg("hot-reload: routing, rate limit, model selection, and model store config updated")
+	}
+	reconcileRemoteControl := func(cfg *config.Config) {
+		remoteControlMu.Lock()
+		defer remoteControlMu.Unlock()
+
+		remoteControlCancel()
+		remoteControlCancel = func() {}
+			remoteControlClient = remotecontrol.NewClient(
+				cfg.DataSharing,
+				version,
+				remoteControlBaseURL,
+				routingEngine.RouteNames,
+				modelIDs,
+			)
+		if remoteControlClient != nil {
+			rcCtx, cancel := context.WithCancel(context.Background())
+			remoteControlCancel = cancel
+			remoteControlClient.Start(rcCtx)
+		}
+
+		logRemoteControlStatus(cfg, remoteControlClient)
+	}
+	currentCfg := cfg
+	reconcileRemoteControl(cfg)
+
+	// --- Setup Hot-Reload ---
+	cfgManager.OnChange(func(newCfg *config.Config) {
+		oldCfg := currentCfg
+		currentCfg = newCfg
+		providersChanged := !reflect.DeepEqual(oldCfg.Providers, newCfg.Providers)
+		routingChanged := !reflect.DeepEqual(oldCfg.Routing, newCfg.Routing)
+		modelSelectChanged := !reflect.DeepEqual(oldCfg.ModelSelect, newCfg.ModelSelect)
+		dataSharingChanged := !reflect.DeepEqual(oldCfg.DataSharing, newCfg.DataSharing)
+		serverChanged := !reflect.DeepEqual(oldCfg.Server, newCfg.Server)
+
+		if serverChanged {
+			log.Warn().Msg("server config changed; listen address and timeouts still require process restart to fully apply")
+		}
+
+		setupLogging(newCfg.Logging)
+		routingEngine.UpdateConfig(newCfg.Routing)
+		if registry.UpdateProvidersConfig(newCfg.Providers) {
+			store.UpdateProvidersConfig(newCfg.Providers)
+		}
+		rateLimiter.UpdateConfig(newCfg.RateLimit)
+		cache.UpdateConfig(newCfg.Cache)
+		retrier.UpdateConfig(newCfg.Retry)
+		selector.UpdateConfig(newCfg.ModelSelect)
+		collectorClient.UpdateConfig(newCfg.DataSharing)
+
+		if dataSharingChanged {
+			reconcileRemoteControl(newCfg)
+		} else if providersChanged || routingChanged || modelSelectChanged {
+			refreshRemoteControlHello()
+			remoteControlMu.Lock()
+			clientSnapshot := remoteControlClient
+			remoteControlMu.Unlock()
+			logRemoteControlStatus(newCfg, clientSnapshot)
+		}
+		log.Info().Msg("hot-reload: routing, providers, retry, cache, rate limit, model selection, collector, and remote control reconciled")
 	})
 	cfgManager.WatchChanges()
 
@@ -148,17 +189,13 @@ func main() {
 		}
 	}()
 
-	remoteControlCtx, remoteControlCancel := context.WithCancel(context.Background())
-	defer remoteControlCancel()
-	if remoteControlClient != nil {
-		remoteControlClient.Start(remoteControlCtx)
-	}
-
 	<-done
 	log.Info().Msg("shutting down gateway...")
 
 	healthChecker.SetReady(false)
+	remoteControlMu.Lock()
 	remoteControlCancel()
+	remoteControlMu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -214,4 +251,20 @@ func localLoopbackAddress(cfg config.ServerConfig) string {
 		host = "127.0.0.1"
 	}
 	return fmt.Sprintf("%s:%d", host, cfg.Port)
+}
+
+func logRemoteControlStatus(cfg *config.Config, remoteControlClient *remotecontrol.Client) {
+	remoteControlEnabled := cfg.DataSharing.RemoteControl && remoteControlClient != nil
+	remoteControlInstanceID := ""
+	if remoteControlClient != nil {
+		remoteControlInstanceID = remoteControlClient.InstanceID()
+	}
+
+	log.Info().
+		Bool("data_sharing_enabled", cfg.DataSharing.Enabled).
+		Bool("remote_control_enabled", remoteControlEnabled).
+		Str("gateway_id", cfg.DataSharing.GatewayID).
+		Str("instance_id", remoteControlInstanceID).
+		Str("backend_url", cfg.DataSharing.BackendURL).
+		Msg("gateway data sharing and remote control status")
 }

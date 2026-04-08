@@ -91,16 +91,19 @@ type collectorItem struct {
 	payload   []byte
 }
 
-type CollectorClient struct {
+type collectorRuntimeConfig struct {
+	enabled        bool
 	backendURL     string
 	gatewayID      string
-	gatewayVersion string
 	apiKey         string
 	gatewayLat     string
 	gatewayLon     string
-
 	sharePrompts   bool
 	shareResponses bool
+}
+
+type CollectorClient struct {
+	gatewayVersion string
 
 	httpClient *http.Client
 	queue      chan collectorItem
@@ -108,32 +111,21 @@ type CollectorClient struct {
 	cancel     context.CancelFunc
 	wg         sync.WaitGroup
 	stopOnce   sync.Once
+	mu         sync.RWMutex
+	cfg        collectorRuntimeConfig
 }
 
 func NewCollectorClient(cfg config.DataSharingConfig, gatewayVersion string) *CollectorClient {
-	if !cfg.Enabled {
-		return nil
-	}
-	if strings.TrimSpace(cfg.BackendURL) == "" || strings.TrimSpace(cfg.GatewayID) == "" || strings.TrimSpace(cfg.APIKey) == "" {
-		return nil
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &CollectorClient{
-		backendURL:     strings.TrimSpace(cfg.BackendURL),
-		gatewayID:      strings.TrimSpace(cfg.GatewayID),
 		gatewayVersion: gatewayVersion,
-		apiKey:         strings.TrimSpace(cfg.APIKey),
-		gatewayLat:     strings.TrimSpace(cfg.GatewayLat),
-		gatewayLon:     strings.TrimSpace(cfg.GatewayLon),
-		sharePrompts:   cfg.SharePrompts,
-		shareResponses: cfg.ShareResponses,
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
 		queue:  make(chan collectorItem, 1000),
 		ctx:    ctx,
 		cancel: cancel,
+		cfg:    normalizeCollectorConfig(cfg),
 	}
 
 	c.wg.Add(1)
@@ -141,37 +133,79 @@ func NewCollectorClient(cfg config.DataSharingConfig, gatewayVersion string) *Co
 	return c
 }
 
+func normalizeCollectorConfig(cfg config.DataSharingConfig) collectorRuntimeConfig {
+	backendURL := strings.TrimSpace(cfg.BackendURL)
+	gatewayID := strings.TrimSpace(cfg.GatewayID)
+	apiKey := strings.TrimSpace(cfg.APIKey)
+
+	return collectorRuntimeConfig{
+		enabled:        cfg.Enabled && backendURL != "" && gatewayID != "" && apiKey != "",
+		backendURL:     backendURL,
+		gatewayID:      gatewayID,
+		apiKey:         apiKey,
+		gatewayLat:     strings.TrimSpace(cfg.GatewayLat),
+		gatewayLon:     strings.TrimSpace(cfg.GatewayLon),
+		sharePrompts:   cfg.SharePrompts,
+		shareResponses: cfg.ShareResponses,
+	}
+}
+
+func (c *CollectorClient) snapshot() collectorRuntimeConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.cfg
+}
+
+// UpdateConfig hot-reloads collector behavior without restarting the process.
+func (c *CollectorClient) UpdateConfig(cfg config.DataSharingConfig) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.cfg = normalizeCollectorConfig(cfg)
+	c.mu.Unlock()
+	log.Info().Bool("enabled", c.Enabled()).Msg("collector config updated")
+}
+
 func (c *CollectorClient) GatewayLat() string {
 	if c == nil {
 		return ""
 	}
-	return c.gatewayLat
+	return c.snapshot().gatewayLat
 }
 
 func (c *CollectorClient) GatewayLon() string {
 	if c == nil {
 		return ""
 	}
-	return c.gatewayLon
+	return c.snapshot().gatewayLon
 }
 
 func (c *CollectorClient) Enabled() bool {
-	return c != nil
+	return c != nil && c.snapshot().enabled
 }
 
 func (c *CollectorClient) SharePrompts() bool {
-	return c != nil && c.sharePrompts
+	if c == nil {
+		return false
+	}
+	cfg := c.snapshot()
+	return cfg.enabled && cfg.sharePrompts
 }
 
 func (c *CollectorClient) ShareResponses() bool {
-	return c != nil && c.shareResponses
+	if c == nil {
+		return false
+	}
+	cfg := c.snapshot()
+	return cfg.enabled && cfg.shareResponses
 }
 
 func (c *CollectorClient) GatewayID() string {
 	if c == nil {
 		return ""
 	}
-	return c.gatewayID
+	return c.snapshot().gatewayID
 }
 
 func (c *CollectorClient) Enqueue(ctx context.Context, requestID string, events []Event) {
@@ -181,10 +215,14 @@ func (c *CollectorClient) Enqueue(ctx context.Context, requestID string, events 
 	if len(events) == 0 {
 		return
 	}
+	cfg := c.snapshot()
+	if !cfg.enabled {
+		return
+	}
 
 	req := CollectorRequest{
 		Version:        "1.0",
-		GatewayID:      c.gatewayID,
+		GatewayID:      cfg.gatewayID,
 		GatewayVersion: c.gatewayVersion,
 		Timestamp:      time.Now().UTC(),
 		Events:         events,
@@ -255,7 +293,12 @@ func (c *CollectorClient) sendWithRetry(ctx context.Context, item collectorItem)
 }
 
 func (c *CollectorClient) send(ctx context.Context, payload []byte) error {
-	collectorURL, err := url.JoinPath(c.backendURL, "collector")
+	cfg := c.snapshot()
+	if !cfg.enabled {
+		return nil
+	}
+
+	collectorURL, err := url.JoinPath(cfg.backendURL, "collector")
 	if err != nil {
 		return err
 	}
@@ -265,7 +308,7 @@ func (c *CollectorClient) send(ctx context.Context, payload []byte) error {
 		return err
 	}
 
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	req.Header.Set("Authorization", "Bearer "+cfg.apiKey)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)

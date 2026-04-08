@@ -27,7 +27,31 @@ func NewRegistry(providers map[string]config.ProviderConfig) *Registry {
 	r := &Registry{
 		providers: make(map[string]registryEntry),
 	}
+	r.providers = buildRegistryEntries(providers)
 
+	return r
+}
+
+// UpdateProvidersConfig hot-reloads provider translators in-place.
+// It preserves the current registry if the new config would leave the gateway
+// without any valid providers.
+func (r *Registry) UpdateProvidersConfig(providers map[string]config.ProviderConfig) bool {
+	next := buildRegistryEntries(providers)
+	if len(next) == 0 {
+		log.Error().Msg("provider config reload produced zero valid providers; keeping existing registry")
+		return false
+	}
+
+	r.mu.Lock()
+	r.providers = next
+	r.mu.Unlock()
+
+	log.Info().Int("providers", len(next)).Msg("provider registry updated")
+	return true
+}
+
+func buildRegistryEntries(providers map[string]config.ProviderConfig) map[string]registryEntry {
+	entries := make(map[string]registryEntry, len(providers))
 	for id, cfg := range providers {
 		providerType, err := resolveProviderType(id, cfg)
 		if err != nil {
@@ -40,15 +64,14 @@ func NewRegistry(providers map[string]config.ProviderConfig) *Registry {
 			log.Warn().Err(err).Str("provider", id).Str("provider_type", providerType).Msg("failed to create provider translator, skipping")
 			continue
 		}
-		r.providers[id] = registryEntry{translator: translator, providerType: providerType}
+		entries[id] = registryEntry{translator: translator, providerType: providerType}
 		log.Info().
 			Str("provider", id).
 			Str("provider_type", providerType).
 			Str("default_model", translator.DefaultModel()).
 			Msg("registered provider")
 	}
-
-	return r
+	return entries
 }
 
 

@@ -130,15 +130,8 @@ type RouteConfig struct {
 }
 
 type MatchConfig struct {
-	Path       string            `mapstructure:"path"`
-	Headers    map[string]string `mapstructure:"headers"`
-	Conditions []ConditionConfig `mapstructure:"conditions"`
-}
-
-type ConditionConfig struct {
-	Field    string `mapstructure:"field"`
-	Operator string `mapstructure:"operator"`
-	Value    string `mapstructure:"value"`
+	Path    string            `mapstructure:"path"`
+	Headers map[string]string `mapstructure:"headers"`
 }
 
 type TargetConfig struct {

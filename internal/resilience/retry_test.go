@@ -71,3 +71,38 @@ func TestRetrier_Do_UsesConfiguredRetriesByDefault(t *testing.T) {
 		t.Fatalf("expected retryCount=3, got %d", retryCount)
 	}
 }
+
+func TestRetrier_UpdateConfig_AppliesNewMaxAttempts(t *testing.T) {
+	retrier := NewRetrier(config.RetryConfig{
+		Enabled:         true,
+		MaxAttempts:     3,
+		InitialDelay:    0,
+		MaxDelay:        0,
+		Multiplier:      1,
+		RetryableErrors: []int{http.StatusInternalServerError},
+	})
+	retrier.UpdateConfig(config.RetryConfig{
+		Enabled:         true,
+		MaxAttempts:     1,
+		InitialDelay:    0,
+		MaxDelay:        0,
+		Multiplier:      1,
+		RetryableErrors: []int{http.StatusInternalServerError},
+	})
+
+	attempts := 0
+	_, retryCount, err := retrier.Do(context.Background(), func(ctx context.Context) (*http.Response, error) {
+		attempts++
+		return nil, fmt.Errorf("boom")
+	})
+
+	if err == nil {
+		t.Fatalf("expected retry error after config update")
+	}
+	if attempts != 1 {
+		t.Fatalf("expected one attempt after config update, got %d", attempts)
+	}
+	if retryCount != 1 {
+		t.Fatalf("expected retryCount=1 after config update, got %d", retryCount)
+	}
+}
