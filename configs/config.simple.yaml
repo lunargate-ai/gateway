@@ -13,5 +13,4 @@ data_sharing:
   enabled: true # disabled by default
   share_prompts: true # disabled by default
   share_responses: true # disabled by default
-  gateway_id: "${LUNARGATE_GATEWAY_ID}"
   api_key: "${LUNARGATE_GATEWAY_API_KEY}"

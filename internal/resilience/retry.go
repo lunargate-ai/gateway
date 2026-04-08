@@ -69,8 +69,8 @@ func (r *Retrier) Do(ctx context.Context, fn DoFunc) (*http.Response, int, error
 			resp.Body.Close()
 		}
 
-			if attempt < maxAttempts-1 {
-				delay := r.calculateDelay(attempt)
+		if attempt < maxAttempts-1 {
+			delay := r.calculateDelay(attempt)
 			log.Debug().
 				Int("attempt", attempt+1).
 				Int("max_attempts", maxAttempts).

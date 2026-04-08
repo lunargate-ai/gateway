@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
@@ -23,7 +24,7 @@ type Event struct {
 
 type CollectorRequest struct {
 	Version        string    `json:"version"`
-	GatewayID      string    `json:"gateway_id"`
+	GatewayID      string    `json:"gateway_id,omitempty"`
 	GatewayVersion string    `json:"gateway_version,omitempty"`
 	Timestamp      time.Time `json:"timestamp"`
 	Events         []Event   `json:"events"`
@@ -67,7 +68,7 @@ type TraceEventData struct {
 type RequestLogEventData struct {
 	RequestID    string            `json:"request_id"`
 	Timestamp    time.Time         `json:"timestamp"`
-	GatewayID    string            `json:"gateway_id"`
+	GatewayID    string            `json:"gateway_id,omitempty"`
 	RequestType  string            `json:"request_type,omitempty"`
 	User         *string           `json:"user,omitempty"`
 	SessionID    *string           `json:"session_id,omitempty"`
@@ -94,7 +95,6 @@ type collectorItem struct {
 type collectorRuntimeConfig struct {
 	enabled        bool
 	backendURL     string
-	gatewayID      string
 	apiKey         string
 	gatewayLat     string
 	gatewayLon     string
@@ -113,6 +113,8 @@ type CollectorClient struct {
 	stopOnce   sync.Once
 	mu         sync.RWMutex
 	cfg        collectorRuntimeConfig
+	lastLogKey string
+	lastLogAt  time.Time
 }
 
 func NewCollectorClient(cfg config.DataSharingConfig, gatewayVersion string) *CollectorClient {
@@ -135,13 +137,11 @@ func NewCollectorClient(cfg config.DataSharingConfig, gatewayVersion string) *Co
 
 func normalizeCollectorConfig(cfg config.DataSharingConfig) collectorRuntimeConfig {
 	backendURL := strings.TrimSpace(cfg.BackendURL)
-	gatewayID := strings.TrimSpace(cfg.GatewayID)
 	apiKey := strings.TrimSpace(cfg.APIKey)
 
 	return collectorRuntimeConfig{
-		enabled:        cfg.Enabled && backendURL != "" && gatewayID != "" && apiKey != "",
+		enabled:        cfg.Enabled && backendURL != "" && apiKey != "",
 		backendURL:     backendURL,
-		gatewayID:      gatewayID,
 		apiKey:         apiKey,
 		gatewayLat:     strings.TrimSpace(cfg.GatewayLat),
 		gatewayLon:     strings.TrimSpace(cfg.GatewayLon),
@@ -201,13 +201,6 @@ func (c *CollectorClient) ShareResponses() bool {
 	return cfg.enabled && cfg.shareResponses
 }
 
-func (c *CollectorClient) GatewayID() string {
-	if c == nil {
-		return ""
-	}
-	return c.snapshot().gatewayID
-}
-
 func (c *CollectorClient) Enqueue(ctx context.Context, requestID string, events []Event) {
 	if c == nil {
 		return
@@ -222,7 +215,6 @@ func (c *CollectorClient) Enqueue(ctx context.Context, requestID string, events 
 
 	req := CollectorRequest{
 		Version:        "1.0",
-		GatewayID:      cfg.gatewayID,
 		GatewayVersion: c.gatewayVersion,
 		Timestamp:      time.Now().UTC(),
 		Events:         events,
@@ -277,6 +269,9 @@ func (c *CollectorClient) sendWithRetry(ctx context.Context, item collectorItem)
 			return
 		} else {
 			lastErr = err
+			if !isRetryableSendError(err) {
+				break
+			}
 			timer := time.NewTimer(time.Duration(attempt+1) * 500 * time.Millisecond)
 			select {
 			case <-ctx.Done():
@@ -288,7 +283,7 @@ func (c *CollectorClient) sendWithRetry(ctx context.Context, item collectorItem)
 	}
 
 	if lastErr != nil {
-		log.Warn().Err(lastErr).Str("request_id", item.requestID).Msg("failed to send collector payload after retries")
+		c.logSendError(item.requestID, lastErr)
 	}
 }
 
@@ -322,14 +317,68 @@ func (c *CollectorClient) send(ctx context.Context, payload []byte) error {
 		return nil
 	}
 
-	io.Copy(io.Discard, resp.Body)
-	return &httpStatusError{statusCode: resp.StatusCode}
+	return &httpStatusError{
+		statusCode: resp.StatusCode,
+		detail:     readResponseSnippet(resp.Body),
+	}
 }
 
 type httpStatusError struct {
 	statusCode int
+	detail     string
 }
 
 func (e *httpStatusError) Error() string {
-	return "unexpected status code: " + strconv.Itoa(e.statusCode) + " (" + http.StatusText(e.statusCode) + ")"
+	if e.detail == "" {
+		return "unexpected status code: " + strconv.Itoa(e.statusCode) + " (" + http.StatusText(e.statusCode) + ")"
+	}
+	return "unexpected status code: " + strconv.Itoa(e.statusCode) + " (" + http.StatusText(e.statusCode) + "): " + e.detail
+}
+
+func readResponseSnippet(r io.Reader) string {
+	if r == nil {
+		return ""
+	}
+	body, err := io.ReadAll(io.LimitReader(r, 2048))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(body))
+}
+
+func isRetryableSendError(err error) bool {
+	var statusErr *httpStatusError
+	if !errors.As(err, &statusErr) {
+		return true
+	}
+	return statusErr.statusCode == http.StatusTooManyRequests || statusErr.statusCode >= 500
+}
+
+func (c *CollectorClient) logSendError(requestID string, err error) {
+	if err == nil {
+		return
+	}
+
+	key := err.Error()
+	now := time.Now()
+	if key == c.lastLogKey && now.Sub(c.lastLogAt) < 30*time.Second {
+		return
+	}
+	c.lastLogKey = key
+	c.lastLogAt = now
+
+	var statusErr *httpStatusError
+	if errors.As(err, &statusErr) && (statusErr.statusCode == http.StatusUnauthorized || statusErr.statusCode == http.StatusForbidden) {
+		event := log.Warn().
+			Str("request_id", requestID).
+			Int("status_code", statusErr.statusCode).
+			Str("status_text", http.StatusText(statusErr.statusCode))
+		if statusErr.detail != "" {
+			event = event.Str("detail", statusErr.detail)
+		}
+		event.Msg("collector authentication rejected by lunargate.ai; go to app.lunargate.ai and check data_sharing.api_key")
+		return
+	}
+
+	log.Warn().Err(err).Str("request_id", requestID).Msg("failed to send collector payload after retries")
 }

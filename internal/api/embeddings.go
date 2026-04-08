@@ -390,7 +390,6 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 					Data: observability.RequestLogEventData{
 						RequestID:    requestID,
 						Timestamp:    startTime.UTC(),
-						GatewayID:    h.collector.GatewayID(),
 						RequestType:  "embeddings",
 						User:         userPtr,
 						SessionID:    sessionIDPtr,
@@ -531,7 +530,6 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 					Data: observability.RequestLogEventData{
 						RequestID:    requestID,
 						Timestamp:    startTime.UTC(),
-						GatewayID:    h.collector.GatewayID(),
 						RequestType:  "embeddings",
 						User:         userPtr,
 						SessionID:    sessionIDPtr,
@@ -635,7 +633,6 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 				Data: observability.RequestLogEventData{
 					RequestID:    requestID,
 					Timestamp:    startTime.UTC(),
-					GatewayID:    h.collector.GatewayID(),
 					RequestType:  "embeddings",
 					User:         userPtr,
 					SessionID:    sessionIDPtr,

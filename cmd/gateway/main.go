@@ -103,13 +103,13 @@ func main() {
 
 		remoteControlCancel()
 		remoteControlCancel = func() {}
-			remoteControlClient = remotecontrol.NewClient(
-				cfg.DataSharing,
-				version,
-				remoteControlBaseURL,
-				routingEngine.RouteNames,
-				modelIDs,
-			)
+		remoteControlClient = remotecontrol.NewClient(
+			cfg.DataSharing,
+			version,
+			remoteControlBaseURL,
+			routingEngine.RouteNames,
+			modelIDs,
+		)
 		if remoteControlClient != nil {
 			rcCtx, cancel := context.WithCancel(context.Background())
 			remoteControlCancel = cancel
@@ -263,7 +263,6 @@ func logRemoteControlStatus(cfg *config.Config, remoteControlClient *remotecontr
 	log.Info().
 		Bool("data_sharing_enabled", cfg.DataSharing.Enabled).
 		Bool("remote_control_enabled", remoteControlEnabled).
-		Str("gateway_id", cfg.DataSharing.GatewayID).
 		Str("instance_id", remoteControlInstanceID).
 		Str("backend_url", cfg.DataSharing.BackendURL).
 		Msg("gateway data sharing and remote control status")

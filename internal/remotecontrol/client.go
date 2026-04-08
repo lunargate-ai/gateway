@@ -2,9 +2,10 @@ package remotecontrol
 
 import (
 	"bytes"
-	"crypto/rand"
 	"context"
+	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -29,6 +30,8 @@ type Client struct {
 	modelIDs     ModelListFunc
 	httpClient   *http.Client
 	refreshCh    chan struct{}
+	lastLogKey   string
+	lastLogAt    time.Time
 }
 
 type helloMessage struct {
@@ -80,8 +83,8 @@ func NewClient(
 	if !dataSharing.RemoteControl {
 		return nil
 	}
-	if strings.TrimSpace(dataSharing.GatewayID) == "" || strings.TrimSpace(dataSharing.APIKey) == "" {
-		log.Warn().Msg("remote control disabled: gateway_id/api_key missing in data_sharing config")
+	if strings.TrimSpace(dataSharing.APIKey) == "" {
+		log.Warn().Msg("remote control disabled: api_key missing in data_sharing config")
 		return nil
 	}
 	return &Client{
@@ -127,7 +130,7 @@ func (c *Client) run(ctx context.Context) {
 			return
 		}
 		if err := c.connectAndServe(ctx); err != nil && ctx.Err() == nil {
-			log.Warn().Err(err).Msg("remote control connection closed")
+			c.logConnectionIssue(err)
 		}
 		select {
 		case <-ctx.Done():
@@ -147,9 +150,9 @@ func (c *Client) connectAndServe(ctx context.Context) error {
 	}
 	headers := http.Header{}
 	headers.Set("Authorization", "Bearer "+strings.TrimSpace(c.dataSharing.APIKey))
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, headers)
+	conn, resp, err := websocket.DefaultDialer.DialContext(ctx, wsURL, headers)
 	if err != nil {
-		return err
+		return classifyDialError(err, resp)
 	}
 	defer conn.Close()
 
@@ -354,10 +357,74 @@ func (c *Client) websocketURL() (string, error) {
 		return "", fmt.Errorf("unsupported data_sharing.backend_url scheme: %s", base.Scheme)
 	}
 	base.Path = strings.TrimRight(base.Path, "/") + "/remote-control/ws/gateway"
-	q := base.Query()
-	q.Set("gateway_id", strings.TrimSpace(c.dataSharing.GatewayID))
-	base.RawQuery = q.Encode()
 	return base.String(), nil
+}
+
+func (c *Client) logConnectionIssue(err error) {
+	if err == nil {
+		return
+	}
+
+	key := err.Error()
+	now := time.Now()
+	if key == c.lastLogKey && now.Sub(c.lastLogAt) < 30*time.Second {
+		return
+	}
+	c.lastLogKey = key
+	c.lastLogAt = now
+
+	var statusErr *dialStatusError
+	if errors.As(err, &statusErr) && (statusErr.statusCode == http.StatusUnauthorized || statusErr.statusCode == http.StatusForbidden) {
+		event := log.Warn().
+			Int("status_code", statusErr.statusCode).
+			Str("status_text", http.StatusText(statusErr.statusCode))
+		if statusErr.detail != "" {
+			event = event.Str("detail", statusErr.detail)
+		}
+		event.Msg("remote control authentication rejected by lunargate.ai; go to app.lunargate.ai and check data_sharing.api_key")
+		return
+	}
+
+	log.Warn().Err(err).Msg("remote control connection closed")
+}
+
+func classifyDialError(err error, resp *http.Response) error {
+	if resp == nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	detail := readResponseSnippet(resp.Body)
+	if resp.StatusCode == 0 {
+		return err
+	}
+	return &dialStatusError{
+		statusCode: resp.StatusCode,
+		detail:     detail,
+	}
+}
+
+type dialStatusError struct {
+	statusCode int
+	detail     string
+}
+
+func (e *dialStatusError) Error() string {
+	if e.detail == "" {
+		return fmt.Sprintf("websocket handshake failed with status %d (%s)", e.statusCode, http.StatusText(e.statusCode))
+	}
+	return fmt.Sprintf("websocket handshake failed with status %d (%s): %s", e.statusCode, http.StatusText(e.statusCode), e.detail)
+}
+
+func readResponseSnippet(r io.Reader) string {
+	if r == nil {
+		return ""
+	}
+	body, err := io.ReadAll(io.LimitReader(r, 2048))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(body))
 }
 
 func collectHeaders(h http.Header) map[string]string {

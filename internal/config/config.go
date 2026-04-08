@@ -20,16 +20,16 @@ const defaultDataSharingBackendURL = "https://api.lunargate.ai/v1"
 
 // Config holds the entire gateway configuration.
 type Config struct {
-	Server        ServerConfig              `mapstructure:"server"`
-	Providers     map[string]ProviderConfig `mapstructure:"providers"`
-	Routing       RoutingConfig             `mapstructure:"routing"`
-	ModelSelect   ModelSelectionConfig      `mapstructure:"model_selection"`
-	RateLimit     RateLimitConfig           `mapstructure:"rate_limiting"`
-	Cache         CacheConfig               `mapstructure:"caching"`
-	Retry         RetryConfig               `mapstructure:"retry"`
-	Logging       LoggingConfig             `mapstructure:"logging"`
-	Security      SecurityConfig            `mapstructure:"security"`
-	DataSharing   DataSharingConfig         `mapstructure:"data_sharing"`
+	Server      ServerConfig              `mapstructure:"server"`
+	Providers   map[string]ProviderConfig `mapstructure:"providers"`
+	Routing     RoutingConfig             `mapstructure:"routing"`
+	ModelSelect ModelSelectionConfig      `mapstructure:"model_selection"`
+	RateLimit   RateLimitConfig           `mapstructure:"rate_limiting"`
+	Cache       CacheConfig               `mapstructure:"caching"`
+	Retry       RetryConfig               `mapstructure:"retry"`
+	Logging     LoggingConfig             `mapstructure:"logging"`
+	Security    SecurityConfig            `mapstructure:"security"`
+	DataSharing DataSharingConfig         `mapstructure:"data_sharing"`
 }
 
 type ServerConfig struct {
@@ -181,7 +181,6 @@ type DataSharingConfig struct {
 	SharePrompts   bool   `mapstructure:"share_prompts"`
 	ShareResponses bool   `mapstructure:"share_responses"`
 	BackendURL     string `mapstructure:"backend_url"`
-	GatewayID      string `mapstructure:"gateway_id"`
 	APIKey         string `mapstructure:"api_key"`
 	GatewayLat     string `mapstructure:"gateway_lat"`
 	GatewayLon     string `mapstructure:"gateway_lon"`
@@ -269,7 +268,6 @@ func (m *Manager) setDefaults() {
 	m.v.SetDefault("data_sharing.share_prompts", false)
 	m.v.SetDefault("data_sharing.share_responses", false)
 	m.v.SetDefault("data_sharing.backend_url", defaultDataSharingBackendURL)
-	m.v.SetDefault("data_sharing.gateway_id", "")
 	m.v.SetDefault("data_sharing.api_key", "")
 	m.v.SetDefault("data_sharing.remote_control", false)
 }
@@ -294,7 +292,6 @@ func (m *Manager) load() error {
 	if strings.TrimSpace(cfg.DataSharing.BackendURL) == "" {
 		cfg.DataSharing.BackendURL = defaultDataSharingBackendURL
 	}
-	cfg.DataSharing.GatewayID = expandEnv(cfg.DataSharing.GatewayID)
 	cfg.DataSharing.APIKey = expandEnv(cfg.DataSharing.APIKey)
 
 	m.current.Store(cfg)

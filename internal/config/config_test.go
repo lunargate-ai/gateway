@@ -12,7 +12,6 @@ func TestNewManagerExpandsEnvAcrossConfig(t *testing.T) {
 	t.Setenv("LIGHT_MODEL", "gpt-5.2-nano")
 	t.Setenv("HEAVY_MODEL", "gpt-5.2")
 	t.Setenv("BACKEND_URL", "https://api.lunargate.ai/v1")
-	t.Setenv("GATEWAY_ID", "gw_test")
 	t.Setenv("GATEWAY_API_KEY", "lgw_test")
 
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
@@ -34,7 +33,6 @@ routing:
 data_sharing:
   enabled: true
   backend_url: "${BACKEND_URL}/collector"
-  gateway_id: "${GATEWAY_ID}"
   api_key: "${GATEWAY_API_KEY}"
 `
 	if err := os.WriteFile(configPath, []byte(configBody), 0o644); err != nil {
@@ -65,9 +63,6 @@ data_sharing:
 
 	if cfg.DataSharing.BackendURL != "https://api.lunargate.ai/v1" {
 		t.Fatalf("data_sharing backend_url = %q, want %q", cfg.DataSharing.BackendURL, "https://api.lunargate.ai/v1")
-	}
-	if cfg.DataSharing.GatewayID != "gw_test" {
-		t.Fatalf("data_sharing gateway_id = %q, want %q", cfg.DataSharing.GatewayID, "gw_test")
 	}
 	if cfg.DataSharing.APIKey != "lgw_test" {
 		t.Fatalf("data_sharing api_key = %q, want %q", cfg.DataSharing.APIKey, "lgw_test")

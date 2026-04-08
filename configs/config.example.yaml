@@ -160,6 +160,5 @@ data_sharing:
   share_prompts: false        # Forward user prompts to SaaS backend
   share_responses: false      # Forward LLM responses to SaaS backend
   backend_url: "${LUNARGATE_BACKEND_URL}"
-  gateway_id: "${LUNARGATE_GATEWAY_ID}"
   api_key: "${LUNARGATE_GATEWAY_API_KEY}"
   remote_control: false

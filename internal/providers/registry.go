@@ -74,7 +74,6 @@ func buildRegistryEntries(providers map[string]config.ProviderConfig) map[string
 	return entries
 }
 
-
 func resolveProviderType(providerID string, cfg config.ProviderConfig) (string, error) {
 	if t := strings.TrimSpace(cfg.Type); t != "" {
 		return strings.ToLower(t), nil

@@ -133,7 +133,6 @@ By default, LunarGate does not forward prompts or responses outside your infrast
 If you want to connect the gateway to LunarGate observability, create a gateway in the LunarGate app and add the generated credentials to your environment:
 
 ```bash
-LUNARGATE_GATEWAY_ID=gw_your_gateway_id
 LUNARGATE_GATEWAY_API_KEY=lgw_your_gateway_api_key
 ```
 
@@ -145,7 +144,6 @@ data_sharing:
   share_prompts: true
   share_responses: true
   remote_control: true
-  gateway_id: "${LUNARGATE_GATEWAY_ID}"
   api_key: "${LUNARGATE_GATEWAY_API_KEY}"
 ```
 

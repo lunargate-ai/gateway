@@ -513,7 +513,6 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 					Data: observability.RequestLogEventData{
 						RequestID:    requestID,
 						Timestamp:    startTime.UTC(),
-						GatewayID:    h.collector.GatewayID(),
 						RequestType:  requestType,
 						User:         userPtr,
 						SessionID:    sessionIDPtr,
@@ -869,7 +868,6 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 					Data: observability.RequestLogEventData{
 						RequestID:    requestID,
 						Timestamp:    startTime.UTC(),
-						GatewayID:    h.collector.GatewayID(),
 						RequestType:  requestType,
 						User:         userPtr,
 						SessionID:    sessionIDPtr,
@@ -981,7 +979,6 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 					Data: observability.RequestLogEventData{
 						RequestID:    requestID,
 						Timestamp:    startTime.UTC(),
-						GatewayID:    h.collector.GatewayID(),
 						RequestType:  requestType,
 						User:         userPtr,
 						SessionID:    sessionIDPtr,
@@ -1089,7 +1086,6 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				Data: observability.RequestLogEventData{
 					RequestID:    requestID,
 					Timestamp:    startTime.UTC(),
-					GatewayID:    h.collector.GatewayID(),
 					RequestType:  requestType,
 					User:         userPtr,
 					SessionID:    sessionIDPtr,
