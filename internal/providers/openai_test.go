@@ -85,6 +85,38 @@ func TestOpenAITranslator_ResponsesUpstreamUsesResponsesEndpoint(t *testing.T) {
 	}
 }
 
+func TestOpenAITranslator_ResponsesUpstreamPreservesPreviousResponseID(t *testing.T) {
+	translator := NewOpenAITranslator(config.ProviderConfig{
+		APIKey:  "dummy",
+		BaseURL: "https://api.openai.com/v1",
+	})
+
+	ctx := WithUpstreamRequestType(context.Background(), "responses")
+	req, err := translator.TranslateRequest(ctx, &models.UnifiedRequest{
+		Model:              "gpt-5.2",
+		PreviousResponseID: "resp_prev_123",
+		Messages: []models.Message{
+			{Role: "tool", ToolCallID: "call_123", Content: `{"ok":true}`},
+		},
+	})
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("failed to read request body: %v", err)
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("failed to unmarshal request payload: %v", err)
+	}
+	if got, _ := payload["previous_response_id"].(string); got != "resp_prev_123" {
+		t.Fatalf("expected previous_response_id to be preserved, got %q", got)
+	}
+}
+
 func TestOpenAITranslator_ResponsesUpstreamFunctionCallIDsAreFCAndCallIDIsPreserved(t *testing.T) {
 	translator := NewOpenAITranslator(config.ProviderConfig{
 		APIKey:  "dummy",
@@ -178,6 +210,30 @@ func TestOpenAITranslator_ParseResponse_ResponsesObject(t *testing.T) {
 	}
 	if len(unified.Choices[0].Message.ToolCalls) != 1 {
 		t.Fatalf("expected one tool call, got %d", len(unified.Choices[0].Message.ToolCalls))
+	}
+}
+
+func TestOpenAITranslator_ParseResponse_ResponsesObjectFallsBackToMessageContent(t *testing.T) {
+	translator := NewOpenAITranslator(config.ProviderConfig{
+		APIKey:  "dummy",
+		BaseURL: "https://api.openai.com/v1",
+	})
+
+	respBody := `{"id":"resp_2","object":"response","created_at":1,"status":"completed","model":"gpt-5.2","output":[{"type":"message","id":"msg_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"final answer from message content"}]}],"output_text":"","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}`
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(respBody)),
+	}
+
+	unified, err := translator.ParseResponse(resp)
+	if err != nil {
+		t.Fatalf("ParseResponse returned error: %v", err)
+	}
+	if len(unified.Choices) == 0 || unified.Choices[0].Message == nil {
+		t.Fatalf("expected assistant message in unified response")
+	}
+	if got, _ := unified.Choices[0].Message.Content.(string); got != "final answer from message content" {
+		t.Fatalf("expected assistant content from message content fallback, got %q", got)
 	}
 }
 

@@ -11,25 +11,26 @@ import (
 // UnifiedRequest represents an OpenAI-compatible chat completion request.
 // All provider translators convert FROM this format to their native format.
 type UnifiedRequest struct {
-	Model            string          `json:"model"`
-	Messages         []Message       `json:"messages"`
-	Temperature      *float64        `json:"temperature,omitempty"`
-	TopP             *float64        `json:"top_p,omitempty"`
-	N                *int            `json:"n,omitempty"`
-	Stream           bool            `json:"stream,omitempty"`
-	StreamOptions    *StreamOptions  `json:"stream_options,omitempty"`
-	Stop             interface{}     `json:"stop,omitempty"`
-	MaxTokens        *int            `json:"max_tokens,omitempty"`
-	PresencePenalty  *float64        `json:"presence_penalty,omitempty"`
-	FrequencyPenalty *float64        `json:"frequency_penalty,omitempty"`
-	LogitBias        map[string]int  `json:"logit_bias,omitempty"`
-	User             string          `json:"user,omitempty"`
-	Tools            []Tool          `json:"tools,omitempty"`
-	ToolChoice       interface{}     `json:"tool_choice,omitempty"`
-	Functions        []ToolFunction  `json:"functions,omitempty"`
-	FunctionCall     interface{}     `json:"function_call,omitempty"`
-	ResponseFormat   *ResponseFormat `json:"response_format,omitempty"`
-	Seed             *int            `json:"seed,omitempty"`
+	Model              string          `json:"model"`
+	Messages           []Message       `json:"messages"`
+	Temperature        *float64        `json:"temperature,omitempty"`
+	TopP               *float64        `json:"top_p,omitempty"`
+	N                  *int            `json:"n,omitempty"`
+	Stream             bool            `json:"stream,omitempty"`
+	StreamOptions      *StreamOptions  `json:"stream_options,omitempty"`
+	Stop               interface{}     `json:"stop,omitempty"`
+	MaxTokens          *int            `json:"max_tokens,omitempty"`
+	PresencePenalty    *float64        `json:"presence_penalty,omitempty"`
+	FrequencyPenalty   *float64        `json:"frequency_penalty,omitempty"`
+	LogitBias          map[string]int  `json:"logit_bias,omitempty"`
+	User               string          `json:"user,omitempty"`
+	Tools              []Tool          `json:"tools,omitempty"`
+	ToolChoice         interface{}     `json:"tool_choice,omitempty"`
+	Functions          []ToolFunction  `json:"functions,omitempty"`
+	FunctionCall       interface{}     `json:"function_call,omitempty"`
+	ResponseFormat     *ResponseFormat `json:"response_format,omitempty"`
+	Seed               *int            `json:"seed,omitempty"`
+	PreviousResponseID string          `json:"previous_response_id,omitempty"`
 }
 
 type StreamOptions struct {
@@ -37,13 +38,13 @@ type StreamOptions struct {
 }
 
 type Message struct {
-	Role       string      `json:"role,omitempty"`
-	Content    interface{} `json:"content,omitempty"`
-	ReasoningContent string `json:"reasoning_content,omitempty"`
-	Name       string      `json:"name,omitempty"`
-	ToolCalls  []ToolCall  `json:"tool_calls,omitempty"`
-	ToolCallID string      `json:"tool_call_id,omitempty"`
-	FunctionCall *FunctionCall `json:"function_call,omitempty"`
+	Role             string        `json:"role,omitempty"`
+	Content          interface{}   `json:"content,omitempty"`
+	ReasoningContent string        `json:"reasoning_content,omitempty"`
+	Name             string        `json:"name,omitempty"`
+	ToolCalls        []ToolCall    `json:"tool_calls,omitempty"`
+	ToolCallID       string        `json:"tool_call_id,omitempty"`
+	FunctionCall     *FunctionCall `json:"function_call,omitempty"`
 }
 
 // ContentString returns the message content as a plain string.

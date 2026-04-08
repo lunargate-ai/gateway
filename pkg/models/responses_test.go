@@ -125,7 +125,8 @@ func TestResponsesToUnifiedRequest_MapsWebSearchToolToFunctionCompat(t *testing.
 
 func TestResponsesToUnifiedRequest_MapsFunctionCallOutputChain(t *testing.T) {
 	req := &ResponsesRequest{
-		Model: "lunargate/auto",
+		Model:              "lunargate/auto",
+		PreviousResponseID: "resp_prev_123",
 		Input: []interface{}{
 			map[string]interface{}{
 				"type":      "function_call",
@@ -147,6 +148,9 @@ func TestResponsesToUnifiedRequest_MapsFunctionCallOutputChain(t *testing.T) {
 	}
 	if len(unified.Messages) != 2 {
 		t.Fatalf("expected 2 messages, got %d", len(unified.Messages))
+	}
+	if unified.PreviousResponseID != "resp_prev_123" {
+		t.Fatalf("expected previous_response_id to be preserved, got %q", unified.PreviousResponseID)
 	}
 
 	assistant := unified.Messages[0]

@@ -8,16 +8,17 @@ import (
 )
 
 type ResponsesRequest struct {
-	Model           string      `json:"model"`
-	Input           interface{} `json:"input"`
-	Instructions    string      `json:"instructions,omitempty"`
-	Temperature     *float64    `json:"temperature,omitempty"`
-	TopP            *float64    `json:"top_p,omitempty"`
-	MaxOutputTokens *int        `json:"max_output_tokens,omitempty"`
-	Tools           []ResponsesTool `json:"tools,omitempty"`
-	ToolChoice      interface{} `json:"tool_choice,omitempty"`
-	Stream          bool        `json:"stream,omitempty"`
-	User            string      `json:"user,omitempty"`
+	Model              string          `json:"model"`
+	Input              interface{}     `json:"input"`
+	PreviousResponseID string          `json:"previous_response_id,omitempty"`
+	Instructions       string          `json:"instructions,omitempty"`
+	Temperature        *float64        `json:"temperature,omitempty"`
+	TopP               *float64        `json:"top_p,omitempty"`
+	MaxOutputTokens    *int            `json:"max_output_tokens,omitempty"`
+	Tools              []ResponsesTool `json:"tools,omitempty"`
+	ToolChoice         interface{}     `json:"tool_choice,omitempty"`
+	Stream             bool            `json:"stream,omitempty"`
+	User               string          `json:"user,omitempty"`
 }
 
 type ResponsesTool struct {
@@ -89,12 +90,13 @@ func ResponsesToUnifiedRequest(req *ResponsesRequest) (*UnifiedRequest, error) {
 	}
 
 	unified := &UnifiedRequest{
-		Model:      strings.TrimSpace(req.Model),
-		Messages:   messages,
-		Tools:      tools,
-		ToolChoice: toolChoice,
-		Stream:     req.Stream,
-		User:       req.User,
+		Model:              strings.TrimSpace(req.Model),
+		Messages:           messages,
+		Tools:              tools,
+		ToolChoice:         toolChoice,
+		Stream:             req.Stream,
+		User:               req.User,
+		PreviousResponseID: strings.TrimSpace(req.PreviousResponseID),
 	}
 
 	if req.Temperature != nil {
@@ -392,8 +394,8 @@ func responsesToolsToUnified(tools []ResponsesTool) ([]Tool, error) {
 			parameters := t.Parameters
 			if parameters == nil {
 				parameters = map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{},
+					"type":                 "object",
+					"properties":           map[string]interface{}{},
 					"additionalProperties": true,
 				}
 			} else {
@@ -468,7 +470,7 @@ func normalizeResponsesToolChoice(toolChoice interface{}) (interface{}, error) {
 			if topName, _ := v["name"].(string); strings.TrimSpace(topName) != "" {
 				fnObj["name"] = strings.TrimSpace(topName)
 				return map[string]interface{}{
-					"type": "function",
+					"type":     "function",
 					"function": fnObj,
 				}, nil
 			}

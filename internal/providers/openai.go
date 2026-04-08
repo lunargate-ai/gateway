@@ -357,14 +357,15 @@ func unifiedToResponsesPayload(req *models.UnifiedRequest) *models.ResponsesRequ
 	}
 
 	out := &models.ResponsesRequest{
-		Model:       req.Model,
-		Input:       input,
-		Temperature: req.Temperature,
-		TopP:        req.TopP,
-		Tools:       make([]models.ResponsesTool, 0, len(req.Tools)),
-		ToolChoice:  normalizeResponsesToolChoiceForUpstream(req.ToolChoice),
-		Stream:      req.Stream,
-		User:        req.User,
+		Model:              req.Model,
+		Input:              input,
+		PreviousResponseID: strings.TrimSpace(req.PreviousResponseID),
+		Temperature:        req.Temperature,
+		TopP:               req.TopP,
+		Tools:              make([]models.ResponsesTool, 0, len(req.Tools)),
+		ToolChoice:         normalizeResponsesToolChoiceForUpstream(req.ToolChoice),
+		Stream:             req.Stream,
+		User:               req.User,
 	}
 	if len(instructions) > 0 {
 		out.Instructions = strings.Join(instructions, "\n")
@@ -394,8 +395,8 @@ func responsesResponseToUnified(resp *models.ResponsesResponse) *models.UnifiedR
 	}
 
 	message := &models.Message{Role: "assistant"}
-	if strings.TrimSpace(resp.OutputText) != "" {
-		message.Content = resp.OutputText
+	if text := strings.TrimSpace(firstNonEmptyResponsesText(resp)); text != "" {
+		message.Content = text
 	}
 
 	toolCalls := make([]models.ToolCall, 0)
@@ -445,6 +446,33 @@ func responsesResponseToUnified(resp *models.ResponsesResponse) *models.UnifiedR
 	}
 
 	return out
+}
+
+func firstNonEmptyResponsesText(resp *models.ResponsesResponse) string {
+	if resp == nil {
+		return ""
+	}
+	if text := strings.TrimSpace(resp.OutputText); text != "" {
+		return text
+	}
+
+	parts := make([]string, 0, 2)
+	for i := range resp.Output {
+		item := resp.Output[i]
+		if item.Type != "message" {
+			continue
+		}
+		for j := range item.Content {
+			part := item.Content[j]
+			switch strings.TrimSpace(part.Type) {
+			case "output_text", "text":
+				if text := strings.TrimSpace(part.Text); text != "" {
+					parts = append(parts, text)
+				}
+			}
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 func responsesEventToStreamChunk(data []byte) (*models.StreamChunk, error) {
