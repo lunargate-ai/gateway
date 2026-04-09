@@ -29,12 +29,18 @@ type UnifiedRequest struct {
 	Functions          []ToolFunction  `json:"functions,omitempty"`
 	FunctionCall       interface{}     `json:"function_call,omitempty"`
 	ResponseFormat     *ResponseFormat `json:"response_format,omitempty"`
+	ReasoningEffort    string          `json:"reasoning_effort,omitempty"`
+	Reasoning          *Reasoning      `json:"reasoning,omitempty"`
 	Seed               *int            `json:"seed,omitempty"`
 	PreviousResponseID string          `json:"previous_response_id,omitempty"`
 }
 
 type StreamOptions struct {
 	IncludeUsage bool `json:"include_usage,omitempty"`
+}
+
+type Reasoning struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 type Message struct {
@@ -95,6 +101,14 @@ type ResponseFormat struct {
 func NormalizeUnifiedRequest(req *UnifiedRequest) error {
 	if req == nil {
 		return nil
+	}
+
+	if req.Reasoning != nil {
+		if strings.TrimSpace(req.ReasoningEffort) == "" {
+			req.ReasoningEffort = strings.TrimSpace(req.Reasoning.Effort)
+		}
+		// Keep a single canonical field in unified request payloads.
+		req.Reasoning = nil
 	}
 
 	// Reject conflicting modes.

@@ -39,6 +39,7 @@ type Handler struct {
 	selector        *modelselect.Engine
 	store           *modelstore.Store
 	providerClients *providerClientRegistry
+	responsesState  *responsesStateStore
 }
 
 type trackedResponseWriter struct {
@@ -217,6 +218,7 @@ func NewHandler(
 		selector:        selector,
 		store:           store,
 		providerClients: newProviderClientRegistry(nil),
+		responsesState:  newResponsesStateStore(30 * time.Minute),
 	}
 }
 

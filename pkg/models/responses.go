@@ -12,6 +12,7 @@ type ResponsesRequest struct {
 	Input              interface{}     `json:"input"`
 	PreviousResponseID string          `json:"previous_response_id,omitempty"`
 	Instructions       string          `json:"instructions,omitempty"`
+	Reasoning          *Reasoning      `json:"reasoning,omitempty"`
 	Temperature        *float64        `json:"temperature,omitempty"`
 	TopP               *float64        `json:"top_p,omitempty"`
 	MaxOutputTokens    *int            `json:"max_output_tokens,omitempty"`
@@ -46,6 +47,7 @@ type ResponsesOutput struct {
 	Status    string                 `json:"status,omitempty"`
 	Role      string                 `json:"role,omitempty"`
 	Content   []ResponsesContentPart `json:"content,omitempty"`
+	Summary   []ResponsesSummaryPart `json:"summary,omitempty"`
 	CallID    string                 `json:"call_id,omitempty"`
 	Name      string                 `json:"name,omitempty"`
 	Arguments string                 `json:"arguments,omitempty"`
@@ -55,6 +57,11 @@ type ResponsesContentPart struct {
 	Type        string `json:"type"`
 	Text        string `json:"text,omitempty"`
 	Annotations []any  `json:"annotations,omitempty"`
+}
+
+type ResponsesSummaryPart struct {
+	Type string `json:"type"`
+	Text string `json:"text,omitempty"`
 }
 
 type ResponsesUsage struct {
@@ -97,6 +104,9 @@ func ResponsesToUnifiedRequest(req *ResponsesRequest) (*UnifiedRequest, error) {
 		Stream:             req.Stream,
 		User:               req.User,
 		PreviousResponseID: strings.TrimSpace(req.PreviousResponseID),
+	}
+	if req.Reasoning != nil {
+		unified.ReasoningEffort = strings.TrimSpace(req.Reasoning.Effort)
 	}
 
 	if req.Temperature != nil {
@@ -151,6 +161,18 @@ func UnifiedResponseToResponses(resp *UnifiedResponse) *ResponsesResponse {
 			Role:    "assistant",
 			Content: parts,
 		})
+
+		if reasoning := strings.TrimSpace(choice.Message.ReasoningContent); reasoning != "" {
+			output = append(output, ResponsesOutput{
+				Type:   "reasoning",
+				ID:     fmt.Sprintf("rs_%s_%d", strings.TrimSpace(resp.ID), i),
+				Status: "completed",
+				Summary: []ResponsesSummaryPart{{
+					Type: "summary_text",
+					Text: reasoning,
+				}},
+			})
+		}
 
 		for _, tc := range choice.Message.ToolCalls {
 			output = append(output, ResponsesOutput{

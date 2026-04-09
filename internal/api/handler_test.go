@@ -861,6 +861,202 @@ func TestResponses_StreamMultipleToolCallsLifecycle(t *testing.T) {
 	}
 }
 
+func TestResponses_PreviousResponseIDResolvedLocallyForNonStreamFollowUp(t *testing.T) {
+	var capturedBodies []map[string]interface{}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream body: %v", err)
+		}
+		var payload map[string]interface{}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatalf("failed to decode upstream body: %v", err)
+		}
+		capturedBodies = append(capturedBodies, payload)
+
+		w.Header().Set("Content-Type", "application/json")
+		switch len(capturedBodies) {
+		case 1:
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-tool-1","object":"chat.completion","created":1,"model":"mock-gpt","choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_time_1","type":"function","function":{"name":"get_current_time","arguments":"{\"format\":\"iso\"}"}}]},"finish_reason":"tool_calls"}]}`))
+		case 2:
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-tool-2","object":"chat.completion","created":2,"model":"mock-gpt","choices":[{"index":0,"message":{"role":"assistant","content":"The current time is 2026-04-09T16:51:50Z."},"finish_reason":"stop"}]}`))
+		default:
+			t.Fatalf("unexpected upstream call %d", len(capturedBodies))
+		}
+	}))
+	defer upstream.Close()
+
+	providerID := "openai"
+	cfgProviders := map[string]config.ProviderConfig{
+		providerID: {Type: "openai", APIKey: "dummy", BaseURL: upstream.URL},
+	}
+	reg := providers.NewRegistry(cfgProviders)
+	router := routing.NewEngine(config.RoutingConfig{
+		DefaultStrategy: "weighted",
+		Routes: []config.RouteConfig{{
+			Name:    "responses-default",
+			Match:   config.MatchConfig{Path: "/v1/responses"},
+			Targets: []config.TargetConfig{{Provider: providerID, Model: "mock-gpt", Weight: 1}},
+		}},
+	})
+	retrier := resilience.NewRetrier(config.RetryConfig{Enabled: false})
+	cbm := resilience.NewCircuitBreakerManager()
+	fb := resilience.NewFallbackExecutor(retrier, cbm)
+	cache := middleware.NewCache(config.CacheConfig{Enabled: false})
+	streamer := streaming.NewHandler()
+	metrics := observability.NewMetricsWithRegisterer(prometheus.NewRegistry())
+	h := NewHandler(reg, router, fb, cache, streamer, metrics, nil, nil, nil)
+
+	firstPayload := []byte(`{"model":"lunargate/auto","input":"Call get_current_time once and then answer with a short sentence that includes the returned timestamp.","tools":[{"type":"function","name":"get_current_time","description":"Return the current UTC time in ISO 8601 format.","parameters":{"type":"object","properties":{"format":{"type":"string"}}}}],"tool_choice":"auto"}`)
+	firstReq := httptest.NewRequest(http.MethodPost, "http://example.com/v1/responses", bytes.NewReader(firstPayload))
+	firstRec := httptest.NewRecorder()
+	h.Responses(firstRec, firstReq)
+
+	if firstRec.Code != http.StatusOK {
+		t.Fatalf("expected first status %d, got %d", http.StatusOK, firstRec.Code)
+	}
+	var firstResp models.ResponsesResponse
+	if err := json.Unmarshal(firstRec.Body.Bytes(), &firstResp); err != nil {
+		t.Fatalf("failed to unmarshal first responses payload: %v", err)
+	}
+
+	secondPayload := []byte(`{"model":"lunargate/auto","previous_response_id":"chatcmpl-tool-1","input":[{"type":"function_call_output","call_id":"call_time_1","output":"{\"iso\":\"2026-04-09T16:51:50Z\"}"}],"tools":[{"type":"function","name":"get_current_time","description":"Return the current UTC time in ISO 8601 format.","parameters":{"type":"object","properties":{"format":{"type":"string"}}}}],"tool_choice":"auto"}`)
+	secondReq := httptest.NewRequest(http.MethodPost, "http://example.com/v1/responses", bytes.NewReader(secondPayload))
+	secondRec := httptest.NewRecorder()
+	h.Responses(secondRec, secondReq)
+
+	if secondRec.Code != http.StatusOK {
+		t.Fatalf("expected second status %d, got %d", http.StatusOK, secondRec.Code)
+	}
+	var secondResp models.ResponsesResponse
+	if err := json.Unmarshal(secondRec.Body.Bytes(), &secondResp); err != nil {
+		t.Fatalf("failed to unmarshal second responses payload: %v", err)
+	}
+	if secondResp.OutputText != "The current time is 2026-04-09T16:51:50Z." {
+		t.Fatalf("expected final assistant text, got %q", secondResp.OutputText)
+	}
+
+	if len(capturedBodies) != 2 {
+		t.Fatalf("expected two upstream calls, got %d", len(capturedBodies))
+	}
+	messages, _ := capturedBodies[1]["messages"].([]interface{})
+	if len(messages) != 3 {
+		t.Fatalf("expected follow-up request to include prior history plus tool output, got %d messages", len(messages))
+	}
+	assistant, _ := messages[1].(map[string]interface{})
+	assistantToolCalls, _ := assistant["tool_calls"].([]interface{})
+	if len(assistantToolCalls) != 1 {
+		t.Fatalf("expected assistant tool call history in follow-up request, got %v", assistant["tool_calls"])
+	}
+	toolMsg, _ := messages[2].(map[string]interface{})
+	if got, _ := toolMsg["role"].(string); got != "tool" {
+		t.Fatalf("expected final follow-up message role=tool, got %q", got)
+	}
+	if got, _ := toolMsg["tool_call_id"].(string); got != "call_time_1" {
+		t.Fatalf("expected tool_call_id call_time_1, got %q", got)
+	}
+	if got, _ := toolMsg["content"].(string); got != `{"iso":"2026-04-09T16:51:50Z"}` {
+		t.Fatalf("expected tool output content to be preserved, got %q", got)
+	}
+	_ = firstResp
+}
+
+func TestResponses_PreviousResponseIDResolvedLocallyForStreamFollowUp(t *testing.T) {
+	var capturedBodies []map[string]interface{}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("failed to read upstream body: %v", err)
+		}
+		var payload map[string]interface{}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatalf("failed to decode upstream body: %v", err)
+		}
+		capturedBodies = append(capturedBodies, payload)
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch len(capturedBodies) {
+		case 1:
+			_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-stream-tool-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"mock-gpt\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_time_stream_1\",\"type\":\"function\",\"function\":{\"name\":\"get_current_time\",\"arguments\":\"{\\\"format\\\":\\\"iso\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case 2:
+			_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-stream-tool-2\",\"object\":\"chat.completion.chunk\",\"created\":2,\"model\":\"mock-gpt\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The current time is 2026-04-09T16:51:50Z.\"},\"finish_reason\":\"stop\"}]}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		default:
+			t.Fatalf("unexpected upstream call %d", len(capturedBodies))
+		}
+	}))
+	defer upstream.Close()
+
+	providerID := "openai"
+	cfgProviders := map[string]config.ProviderConfig{
+		providerID: {Type: "openai", APIKey: "dummy", BaseURL: upstream.URL},
+	}
+	reg := providers.NewRegistry(cfgProviders)
+	router := routing.NewEngine(config.RoutingConfig{
+		DefaultStrategy: "weighted",
+		Routes: []config.RouteConfig{{
+			Name:    "responses-default",
+			Match:   config.MatchConfig{Path: "/v1/responses"},
+			Targets: []config.TargetConfig{{Provider: providerID, Model: "mock-gpt", Weight: 1}},
+		}},
+	})
+	retrier := resilience.NewRetrier(config.RetryConfig{Enabled: false})
+	cbm := resilience.NewCircuitBreakerManager()
+	fb := resilience.NewFallbackExecutor(retrier, cbm)
+	cache := middleware.NewCache(config.CacheConfig{Enabled: false})
+	streamer := streaming.NewHandler()
+	metrics := observability.NewMetricsWithRegisterer(prometheus.NewRegistry())
+	h := NewHandler(reg, router, fb, cache, streamer, metrics, nil, nil, nil)
+
+	firstPayload := []byte(`{"model":"lunargate/auto","stream":true,"input":"Call get_current_time once and then answer with a short sentence that includes the returned timestamp.","tools":[{"type":"function","name":"get_current_time","description":"Return the current UTC time in ISO 8601 format.","parameters":{"type":"object","properties":{"format":{"type":"string"}}}}],"tool_choice":"auto"}`)
+	firstReq := httptest.NewRequest(http.MethodPost, "http://example.com/v1/responses", bytes.NewReader(firstPayload))
+	firstRec := httptest.NewRecorder()
+	h.Responses(firstRec, firstReq)
+
+	if firstRec.Code != http.StatusOK {
+		t.Fatalf("expected first status %d, got %d", http.StatusOK, firstRec.Code)
+	}
+	firstEvents := decodeSSEEvents(t, firstRec.Body.String())
+	var firstResponseID string
+	for _, evt := range firstEvents {
+		if typ, _ := evt["type"].(string); typ != "response.completed" {
+			continue
+		}
+		responseObj, _ := evt["response"].(map[string]interface{})
+		firstResponseID, _ = responseObj["id"].(string)
+	}
+	if firstResponseID != "chatcmpl-stream-tool-1" {
+		t.Fatalf("expected cached first response id, got %q", firstResponseID)
+	}
+
+	secondPayload := []byte(`{"model":"lunargate/auto","stream":true,"previous_response_id":"chatcmpl-stream-tool-1","input":[{"type":"function_call_output","call_id":"call_time_stream_1","output":"{\"iso\":\"2026-04-09T16:51:50Z\"}"}],"tools":[{"type":"function","name":"get_current_time","description":"Return the current UTC time in ISO 8601 format.","parameters":{"type":"object","properties":{"format":{"type":"string"}}}}],"tool_choice":"auto"}`)
+	secondReq := httptest.NewRequest(http.MethodPost, "http://example.com/v1/responses", bytes.NewReader(secondPayload))
+	secondRec := httptest.NewRecorder()
+	h.Responses(secondRec, secondReq)
+
+	if secondRec.Code != http.StatusOK {
+		t.Fatalf("expected second status %d, got %d", http.StatusOK, secondRec.Code)
+	}
+	secondBody := secondRec.Body.String()
+	if !strings.Contains(secondBody, `"The current time is 2026-04-09T16:51:50Z."`) {
+		t.Fatalf("expected streamed final assistant text, got %q", secondBody)
+	}
+
+	if len(capturedBodies) != 2 {
+		t.Fatalf("expected two upstream calls, got %d", len(capturedBodies))
+	}
+	messages, _ := capturedBodies[1]["messages"].([]interface{})
+	if len(messages) != 3 {
+		t.Fatalf("expected streamed follow-up request to include prior history plus tool output, got %d messages", len(messages))
+	}
+	assistant, _ := messages[1].(map[string]interface{})
+	assistantToolCalls, _ := assistant["tool_calls"].([]interface{})
+	if len(assistantToolCalls) != 1 {
+		t.Fatalf("expected assistant tool call history in streamed follow-up request, got %v", assistant["tool_calls"])
+	}
+}
+
 func TestCopyHeaders_PreservesExistingDestinationHeaders(t *testing.T) {
 	dst := http.Header{}
 	dst.Set("X-Keep", "keep")

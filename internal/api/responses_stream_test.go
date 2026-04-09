@@ -320,6 +320,137 @@ func TestResponsesStreamProxy_FunctionArgumentsAssembleAcrossChunks(t *testing.T
 	}
 }
 
+func TestResponsesStreamProxy_ReasoningLifecycleAndCompletedSummary(t *testing.T) {
+	rec := httptest.NewRecorder()
+	proxy := newResponsesStreamProxy(rec)
+
+	chunks := []string{
+		`data: {"id":"chatcmpl-reason","object":"chat.completion.chunk","created":1,"model":"mock-gpt","choices":[{"index":0,"delta":{"reasoning_content":"step 1: gather context. ","content":"Answer"}}]}
+
+`,
+		`data: {"id":"chatcmpl-reason","object":"chat.completion.chunk","created":1,"model":"mock-gpt","choices":[{"index":0,"delta":{"reasoning_content":"step 2: propose fix.","content":" done"}}]}
+
+`,
+	}
+
+	for i, chunk := range chunks {
+		if _, err := proxy.Write([]byte(chunk)); err != nil {
+			t.Fatalf("write chunk %d error: %v", i+1, err)
+		}
+	}
+	if _, err := proxy.Write([]byte("data: [DONE]\n\n")); err != nil {
+		t.Fatalf("write done chunk error: %v", err)
+	}
+	if err := proxy.finalize(); err != nil {
+		t.Fatalf("finalize error: %v", err)
+	}
+
+	events := decodeSSEEvents(t, rec.Body.String())
+	assertSequenceNumbersMonotonic(t, events)
+
+	if !containsEventType(events, "response.reasoning_summary_part.added") {
+		t.Fatalf("expected response.reasoning_summary_part.added event")
+	}
+	if !containsEventType(events, "response.reasoning_summary_text.delta") {
+		t.Fatalf("expected response.reasoning_summary_text.delta event")
+	}
+	if !containsEventType(events, "response.reasoning_summary_text.done") {
+		t.Fatalf("expected response.reasoning_summary_text.done event")
+	}
+	if !containsEventType(events, "response.reasoning_summary_part.done") {
+		t.Fatalf("expected response.reasoning_summary_part.done event")
+	}
+
+	var reasoningItemDone map[string]interface{}
+	var completedResponse map[string]interface{}
+	for _, evt := range events {
+		evtType, _ := evt["type"].(string)
+		if evtType == "response.output_item.done" {
+			item, _ := evt["item"].(map[string]interface{})
+			if item != nil {
+				if itemType, _ := item["type"].(string); itemType == "reasoning" {
+					reasoningItemDone = item
+				}
+			}
+		}
+		if evtType == "response.completed" {
+			completedResponse, _ = evt["response"].(map[string]interface{})
+		}
+	}
+	if reasoningItemDone == nil {
+		t.Fatalf("expected completed reasoning output item")
+	}
+	summary, _ := reasoningItemDone["summary"].([]interface{})
+	if len(summary) == 0 {
+		t.Fatalf("expected reasoning summary in output item")
+	}
+	summaryPart, _ := summary[0].(map[string]interface{})
+	if summaryPart == nil {
+		t.Fatalf("expected reasoning summary object")
+	}
+	reasoningText, _ := summaryPart["text"].(string)
+	if !strings.Contains(reasoningText, "step 1") || !strings.Contains(reasoningText, "step 2") {
+		t.Fatalf("expected merged reasoning summary, got %q", reasoningText)
+	}
+
+	if completedResponse == nil {
+		t.Fatalf("expected response.completed payload")
+	}
+	reasoningObj, _ := completedResponse["reasoning"].(map[string]interface{})
+	if reasoningObj == nil {
+		t.Fatalf("expected response.completed to include reasoning object")
+	}
+	completedSummary, _ := reasoningObj["summary"].([]interface{})
+	if len(completedSummary) == 0 {
+		t.Fatalf("expected response.completed reasoning summary")
+	}
+}
+
+func TestResponsesStreamProxy_FunctionArgumentsDoneIncludesName(t *testing.T) {
+	rec := httptest.NewRecorder()
+	proxy := newResponsesStreamProxy(rec)
+	proxy.responseID = "resp_tool_done_name"
+	proxy.model = "gpt-5.3-codex"
+	proxy.created = 123
+
+	if err := proxy.ensureStarted(); err != nil {
+		t.Fatalf("ensureStarted error: %v", err)
+	}
+	if err := proxy.processToolCallDelta(models.ToolCall{
+		ID:   "call_done_name",
+		Type: "function",
+		Function: models.ToolCallFunction{
+			Name:      "exec_command",
+			Arguments: "{\"cmd\":\"pwd\"}",
+		},
+	}); err != nil {
+		t.Fatalf("processToolCallDelta error: %v", err)
+	}
+	if err := proxy.emitCompleted(); err != nil {
+		t.Fatalf("emitCompleted error: %v", err)
+	}
+
+	events := decodeSSEEvents(t, rec.Body.String())
+	assertSequenceNumbersMonotonic(t, events)
+
+	var doneEvent map[string]interface{}
+	for _, evt := range events {
+		if evtType, _ := evt["type"].(string); evtType == "response.function_call_arguments.done" {
+			doneEvent = evt
+			break
+		}
+	}
+	if doneEvent == nil {
+		t.Fatalf("expected response.function_call_arguments.done event")
+	}
+	if got, _ := doneEvent["name"].(string); got != "exec_command" {
+		t.Fatalf("expected done event name %q, got %q", "exec_command", got)
+	}
+	if _, ok := doneEvent["sequence_number"]; !ok {
+		t.Fatalf("expected sequence_number on done event")
+	}
+}
+
 func decodeSSEEvents(t *testing.T, body string) []map[string]interface{} {
 	t.Helper()
 	frames := strings.Split(body, "\n\n")
@@ -343,6 +474,35 @@ func decodeSSEEvents(t *testing.T, body string) []map[string]interface{} {
 		events = append(events, event)
 	}
 	return events
+}
+
+func containsEventType(events []map[string]interface{}, targetType string) bool {
+	for _, event := range events {
+		if evtType, _ := event["type"].(string); evtType == targetType {
+			return true
+		}
+	}
+	return false
+}
+
+func assertSequenceNumbersMonotonic(t *testing.T, events []map[string]interface{}) {
+	t.Helper()
+	prev := 0
+	for i, evt := range events {
+		raw, ok := evt["sequence_number"]
+		if !ok {
+			t.Fatalf("event %d missing sequence_number", i)
+		}
+		nFloat, ok := raw.(float64)
+		if !ok {
+			t.Fatalf("event %d has non-numeric sequence_number type %T", i, raw)
+		}
+		n := int(nFloat)
+		if n <= prev {
+			t.Fatalf("sequence_number not monotonic at event %d: prev=%d current=%d", i, prev, n)
+		}
+		prev = n
+	}
 }
 
 func firstIndex(items []string, target string) int {

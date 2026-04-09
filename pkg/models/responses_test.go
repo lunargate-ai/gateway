@@ -258,6 +258,24 @@ func TestResponsesToUnifiedRequest_MergesConsecutiveFunctionCallItems(t *testing
 	}
 }
 
+func TestResponsesToUnifiedRequest_MapsReasoningEffort(t *testing.T) {
+	req := &ResponsesRequest{
+		Model: "lunargate/auto",
+		Input: "hello",
+		Reasoning: &Reasoning{
+			Effort: "medium",
+		},
+	}
+
+	unified, err := ResponsesToUnifiedRequest(req)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if unified.ReasoningEffort != "medium" {
+		t.Fatalf("expected reasoning_effort=medium, got %q", unified.ReasoningEffort)
+	}
+}
+
 func TestUnifiedResponseToResponses_SerializesNonStringContent(t *testing.T) {
 	resp := &UnifiedResponse{
 		ID:      "resp_1",
@@ -290,5 +308,52 @@ func TestUnifiedResponseToResponses_SerializesNonStringContent(t *testing.T) {
 	}
 	if !strings.Contains(out.OutputText, "\"url\":\"https://example.com/a.png\"") {
 		t.Fatalf("expected output_text to include serialized content, got %q", out.OutputText)
+	}
+}
+
+func TestUnifiedResponseToResponses_PreservesReasoningAsOutputItem(t *testing.T) {
+	resp := &UnifiedResponse{
+		ID:      "resp_reasoning_1",
+		Created: 123,
+		Model:   "openai/gpt-5.4",
+		Choices: []Choice{{
+			Index: 0,
+			Message: &Message{
+				Role:             "assistant",
+				Content:          "final answer",
+				ReasoningContent: "step 1 then step 2",
+			},
+		}},
+	}
+
+	out := UnifiedResponseToResponses(resp)
+	if out == nil {
+		t.Fatalf("expected non-nil response")
+	}
+	if len(out.Output) != 2 {
+		t.Fatalf("expected message + reasoning output items, got %d", len(out.Output))
+	}
+
+	var reasoningItem *ResponsesOutput
+	for i := range out.Output {
+		if out.Output[i].Type == "reasoning" {
+			reasoningItem = &out.Output[i]
+			break
+		}
+	}
+	if reasoningItem == nil {
+		t.Fatalf("expected reasoning output item")
+	}
+	if reasoningItem.Status != "completed" {
+		t.Fatalf("expected completed reasoning item status, got %q", reasoningItem.Status)
+	}
+	if len(reasoningItem.Summary) != 1 {
+		t.Fatalf("expected one reasoning summary part, got %d", len(reasoningItem.Summary))
+	}
+	if reasoningItem.Summary[0].Type != "summary_text" {
+		t.Fatalf("expected summary_text type, got %q", reasoningItem.Summary[0].Type)
+	}
+	if reasoningItem.Summary[0].Text != "step 1 then step 2" {
+		t.Fatalf("expected preserved reasoning text, got %q", reasoningItem.Summary[0].Text)
 	}
 }

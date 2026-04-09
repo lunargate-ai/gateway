@@ -117,6 +117,40 @@ func TestOpenAITranslator_ResponsesUpstreamPreservesPreviousResponseID(t *testin
 	}
 }
 
+func TestOpenAITranslator_ResponsesUpstreamMapsReasoningEffort(t *testing.T) {
+	translator := NewOpenAITranslator(config.ProviderConfig{
+		APIKey:  "dummy",
+		BaseURL: "https://api.openai.com/v1",
+	})
+
+	ctx := WithUpstreamRequestType(context.Background(), "responses")
+	req, err := translator.TranslateRequest(ctx, &models.UnifiedRequest{
+		Model:           "gpt-5.2",
+		ReasoningEffort: "high",
+		Messages:        []models.Message{{Role: "user", Content: "hello"}},
+	})
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("failed to read request body: %v", err)
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("failed to unmarshal request payload: %v", err)
+	}
+	reasoning, ok := payload["reasoning"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected reasoning object in responses payload")
+	}
+	if got, _ := reasoning["effort"].(string); got != "high" {
+		t.Fatalf("expected reasoning.effort=high, got %q", got)
+	}
+}
+
 func TestOpenAITranslator_ResponsesUpstreamFunctionCallIDsAreFCAndCallIDIsPreserved(t *testing.T) {
 	translator := NewOpenAITranslator(config.ProviderConfig{
 		APIKey:  "dummy",
@@ -237,6 +271,30 @@ func TestOpenAITranslator_ParseResponse_ResponsesObjectFallsBackToMessageContent
 	}
 }
 
+func TestOpenAITranslator_ParseResponse_ResponsesObjectPreservesReasoningSummary(t *testing.T) {
+	translator := NewOpenAITranslator(config.ProviderConfig{
+		APIKey:  "dummy",
+		BaseURL: "https://api.openai.com/v1",
+	})
+
+	respBody := `{"id":"resp_reason","object":"response","created_at":1,"status":"completed","model":"gpt-5.2","output":[{"type":"reasoning","id":"rs_1","status":"completed","summary":[{"type":"summary_text","text":"plan before final answer"}]},{"type":"message","id":"msg_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"done"}]}],"output_text":"done","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}`
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(respBody)),
+	}
+
+	unified, err := translator.ParseResponse(resp)
+	if err != nil {
+		t.Fatalf("ParseResponse returned error: %v", err)
+	}
+	if len(unified.Choices) == 0 || unified.Choices[0].Message == nil {
+		t.Fatalf("expected assistant message in unified response")
+	}
+	if got := unified.Choices[0].Message.ReasoningContent; got != "plan before final answer" {
+		t.Fatalf("expected reasoning summary to be preserved, got %q", got)
+	}
+}
+
 func TestOpenAITranslator_ParseStreamChunk_ResponsesEvents(t *testing.T) {
 	translator := NewOpenAITranslator(config.ProviderConfig{
 		APIKey:  "dummy",
@@ -311,6 +369,60 @@ func TestOpenAITranslator_ParseStreamChunk_OutputItemDoneMessageEmitsText(t *tes
 	}
 	if got, _ := chunk.Choices[0].Delta.Content.(string); got != "from item done" {
 		t.Fatalf("expected content from output_item.done message, got %q", got)
+	}
+}
+
+func TestOpenAITranslator_ParseStreamChunk_ReasoningSummaryTextDeltaEmitsReasoning(t *testing.T) {
+	translator := NewOpenAITranslator(config.ProviderConfig{
+		APIKey:  "dummy",
+		BaseURL: "https://api.openai.com/v1",
+	})
+
+	chunk, err := translator.ParseStreamChunk([]byte(`{"type":"response.reasoning_summary_text.delta","response_id":"resp_1","item_id":"rs_1","output_index":1,"summary_index":0,"delta":"thinking delta"}`))
+	if err != nil {
+		t.Fatalf("ParseStreamChunk returned error: %v", err)
+	}
+	if chunk == nil || len(chunk.Choices) == 0 || chunk.Choices[0].Delta == nil {
+		t.Fatalf("expected converted stream chunk")
+	}
+	if chunk.Choices[0].Delta.ReasoningContent != "thinking delta" {
+		t.Fatalf("expected reasoning content delta, got %q", chunk.Choices[0].Delta.ReasoningContent)
+	}
+}
+
+func TestOpenAITranslator_ParseStreamChunk_ReasoningTextDeltaEmitsReasoning(t *testing.T) {
+	translator := NewOpenAITranslator(config.ProviderConfig{
+		APIKey:  "dummy",
+		BaseURL: "https://api.openai.com/v1",
+	})
+
+	chunk, err := translator.ParseStreamChunk([]byte(`{"type":"response.reasoning_text.delta","response_id":"resp_1","item_id":"rs_1","output_index":1,"delta":"hidden thinking"}`))
+	if err != nil {
+		t.Fatalf("ParseStreamChunk returned error: %v", err)
+	}
+	if chunk == nil || len(chunk.Choices) == 0 || chunk.Choices[0].Delta == nil {
+		t.Fatalf("expected converted stream chunk")
+	}
+	if chunk.Choices[0].Delta.ReasoningContent != "hidden thinking" {
+		t.Fatalf("expected reasoning content delta, got %q", chunk.Choices[0].Delta.ReasoningContent)
+	}
+}
+
+func TestOpenAITranslator_ParseStreamChunk_ReasoningSummaryPartDoneEmitsReasoning(t *testing.T) {
+	translator := NewOpenAITranslator(config.ProviderConfig{
+		APIKey:  "dummy",
+		BaseURL: "https://api.openai.com/v1",
+	})
+
+	chunk, err := translator.ParseStreamChunk([]byte(`{"type":"response.reasoning_summary_part.done","response_id":"resp_1","item_id":"rs_1","output_index":1,"summary_index":0,"part":{"type":"summary_text","text":"thinking final"}}`))
+	if err != nil {
+		t.Fatalf("ParseStreamChunk returned error: %v", err)
+	}
+	if chunk == nil || len(chunk.Choices) == 0 || chunk.Choices[0].Delta == nil {
+		t.Fatalf("expected converted stream chunk")
+	}
+	if chunk.Choices[0].Delta.ReasoningContent != "thinking final" {
+		t.Fatalf("expected reasoning content from summary part, got %q", chunk.Choices[0].Delta.ReasoningContent)
 	}
 }
 

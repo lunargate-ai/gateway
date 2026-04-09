@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/lunargate-ai/gateway/pkg/models"
@@ -24,19 +25,24 @@ type responsesStreamProxy struct {
 	headersSent bool
 	buffer      bytes.Buffer
 
-	responseID string
-	itemID     string
-	model      string
-	created    int64
-	text       strings.Builder
-	started    bool
-	messageStarted bool
-	completed  bool
-	eventSeq   int
+	responseID       string
+	itemID           string
+	reasoningItemID  string
+	model            string
+	created          int64
+	text             strings.Builder
+	reasoningText    strings.Builder
+	started          bool
+	messageStarted   bool
+	reasoningStarted bool
+	completed        bool
+	eventSeq         int
 
-	nextOutputIndex int
-	toolCalls       map[string]*responsesToolCallState
-	toolCallOrder   []string
+	nextOutputIndex      int
+	reasoningOutputIndex int
+	toolCalls            map[string]*responsesToolCallState
+	toolCallOrder        []string
+	completedResponse    map[string]interface{}
 }
 
 type responsesToolCallState struct {
@@ -51,12 +57,13 @@ type responsesToolCallState struct {
 
 func newResponsesStreamProxy(target http.ResponseWriter) *responsesStreamProxy {
 	return &responsesStreamProxy{
-		target:          target,
-		headers:         make(http.Header),
-		statusCode:      http.StatusOK,
-		nextOutputIndex: 1,
-		toolCalls:       make(map[string]*responsesToolCallState),
-		toolCallOrder:   make([]string, 0, 4),
+		target:               target,
+		headers:              make(http.Header),
+		statusCode:           http.StatusOK,
+		nextOutputIndex:      1,
+		reasoningOutputIndex: -1,
+		toolCalls:            make(map[string]*responsesToolCallState),
+		toolCallOrder:        make([]string, 0, 4),
 	}
 }
 
@@ -273,6 +280,24 @@ func (p *responsesStreamProxy) processFrame(frame string) error {
 			if c.Delta == nil {
 				continue
 			}
+			if reasoningDelta := c.Delta.ReasoningContent; reasoningDelta != "" {
+				emittedReasoningDelta := p.mergeReasoningDelta(reasoningDelta)
+				if emittedReasoningDelta != "" {
+					if err := p.ensureReasoningStarted(); err != nil {
+						return err
+					}
+					if err := p.writeEvent(map[string]interface{}{
+						"type":          "response.reasoning_summary_text.delta",
+						"response_id":   p.responseID,
+						"item_id":       p.reasoningItemID,
+						"output_index":  p.reasoningOutputIndex,
+						"summary_index": 0,
+						"delta":         emittedReasoningDelta,
+					}); err != nil {
+						return err
+					}
+				}
+			}
 			if len(c.Delta.ToolCalls) > 0 {
 				for _, tc := range c.Delta.ToolCalls {
 					if err := p.processToolCallDelta(tc); err != nil {
@@ -336,6 +361,34 @@ func (p *responsesStreamProxy) mergeTextDelta(delta string) string {
 	return delta
 }
 
+func (p *responsesStreamProxy) mergeReasoningDelta(delta string) string {
+	if delta == "" {
+		return ""
+	}
+
+	current := p.reasoningText.String()
+	if current == "" {
+		p.reasoningText.WriteString(delta)
+		return delta
+	}
+
+	// Some providers emit cumulative snapshots for reasoning summaries.
+	if delta == current || strings.HasSuffix(current, delta) {
+		return ""
+	}
+	if strings.HasPrefix(delta, current) {
+		tail := strings.TrimPrefix(delta, current)
+		if tail == "" {
+			return ""
+		}
+		p.reasoningText.WriteString(tail)
+		return tail
+	}
+
+	p.reasoningText.WriteString(delta)
+	return delta
+}
+
 func (p *responsesStreamProxy) ensureStarted() error {
 	if p.started {
 		return nil
@@ -363,6 +416,51 @@ func (p *responsesStreamProxy) ensureStarted() error {
 			"status":     "in_progress",
 			"model":      p.model,
 			"output":     []interface{}{},
+		},
+	}); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (p *responsesStreamProxy) ensureReasoningStarted() error {
+	if p.reasoningStarted {
+		return nil
+	}
+	p.reasoningStarted = true
+
+	if p.reasoningOutputIndex < 0 {
+		p.reasoningOutputIndex = p.nextOutputIndex
+		p.nextOutputIndex++
+	}
+	if p.reasoningItemID == "" {
+		p.reasoningItemID = fmt.Sprintf("rs_%s_%d", p.responseID, p.reasoningOutputIndex)
+	}
+
+	if err := p.writeEvent(map[string]interface{}{
+		"type":         "response.output_item.added",
+		"response_id":  p.responseID,
+		"output_index": p.reasoningOutputIndex,
+		"item": map[string]interface{}{
+			"id":      p.reasoningItemID,
+			"type":    "reasoning",
+			"status":  "in_progress",
+			"summary": []interface{}{},
+		},
+	}); err != nil {
+		return err
+	}
+
+	if err := p.writeEvent(map[string]interface{}{
+		"type":          "response.reasoning_summary_part.added",
+		"response_id":   p.responseID,
+		"item_id":       p.reasoningItemID,
+		"output_index":  p.reasoningOutputIndex,
+		"summary_index": 0,
+		"part": map[string]interface{}{
+			"type": "summary_text",
+			"text": "",
 		},
 	}); err != nil {
 		return err
@@ -418,7 +516,13 @@ func (p *responsesStreamProxy) emitCompleted() error {
 	}
 
 	text := p.text.String()
-	var item map[string]interface{}
+	reasoning := p.reasoningText.String()
+
+	type indexedOutputItem struct {
+		outputIndex int
+		item        interface{}
+	}
+	indexedOutputItems := make([]indexedOutputItem, 0, 2+len(p.toolCallOrder))
 	if p.messageStarted {
 		if err := p.writeEvent(map[string]interface{}{
 			"type":          "response.output_text.done",
@@ -445,7 +549,7 @@ func (p *responsesStreamProxy) emitCompleted() error {
 			return err
 		}
 
-		item = map[string]interface{}{
+		messageItem := map[string]interface{}{
 			"id":     p.itemID,
 			"type":   "message",
 			"role":   "assistant",
@@ -462,13 +566,66 @@ func (p *responsesStreamProxy) emitCompleted() error {
 			"type":         "response.output_item.done",
 			"response_id":  p.responseID,
 			"output_index": 0,
-			"item":         item,
+			"item":         messageItem,
 		}); err != nil {
 			return err
 		}
+		indexedOutputItems = append(indexedOutputItems, indexedOutputItem{
+			outputIndex: 0,
+			item:        messageItem,
+		})
 	}
 
-	toolItems := make([]interface{}, 0, len(p.toolCallOrder))
+	if p.reasoningStarted {
+		if err := p.writeEvent(map[string]interface{}{
+			"type":          "response.reasoning_summary_text.done",
+			"response_id":   p.responseID,
+			"item_id":       p.reasoningItemID,
+			"output_index":  p.reasoningOutputIndex,
+			"summary_index": 0,
+			"text":          reasoning,
+		}); err != nil {
+			return err
+		}
+		if err := p.writeEvent(map[string]interface{}{
+			"type":          "response.reasoning_summary_part.done",
+			"response_id":   p.responseID,
+			"item_id":       p.reasoningItemID,
+			"output_index":  p.reasoningOutputIndex,
+			"summary_index": 0,
+			"part": map[string]interface{}{
+				"type": "summary_text",
+				"text": reasoning,
+			},
+		}); err != nil {
+			return err
+		}
+
+		reasoningItem := map[string]interface{}{
+			"id":     p.reasoningItemID,
+			"type":   "reasoning",
+			"status": "completed",
+			"summary": []map[string]interface{}{
+				{
+					"type": "summary_text",
+					"text": reasoning,
+				},
+			},
+		}
+		if err := p.writeEvent(map[string]interface{}{
+			"type":         "response.output_item.done",
+			"response_id":  p.responseID,
+			"output_index": p.reasoningOutputIndex,
+			"item":         reasoningItem,
+		}); err != nil {
+			return err
+		}
+		indexedOutputItems = append(indexedOutputItems, indexedOutputItem{
+			outputIndex: p.reasoningOutputIndex,
+			item:        reasoningItem,
+		})
+	}
+
 	for _, key := range p.toolCallOrder {
 		st := p.toolCalls[key]
 		if st == nil || st.Done {
@@ -497,6 +654,7 @@ func (p *responsesStreamProxy) emitCompleted() error {
 			"response_id":  p.responseID,
 			"item_id":      st.ItemID,
 			"output_index": st.OutputIndex,
+			"name":         st.Name,
 			"arguments":    st.Arguments,
 		}); err != nil {
 			return err
@@ -520,7 +678,10 @@ func (p *responsesStreamProxy) emitCompleted() error {
 			return err
 		}
 
-		toolItems = append(toolItems, fcItem)
+		indexedOutputItems = append(indexedOutputItems, indexedOutputItem{
+			outputIndex: st.OutputIndex,
+			item:        fcItem,
+		})
 		st.Done = true
 		log.Debug().
 			Str("response_id", p.responseID).
@@ -530,11 +691,13 @@ func (p *responsesStreamProxy) emitCompleted() error {
 			Msg("responses stream proxy finalized tool call")
 	}
 
-	outputItems := make([]interface{}, 0, 1+len(toolItems))
-	if item != nil {
-		outputItems = append(outputItems, item)
+	sort.Slice(indexedOutputItems, func(i, j int) bool {
+		return indexedOutputItems[i].outputIndex < indexedOutputItems[j].outputIndex
+	})
+	outputItems := make([]interface{}, 0, len(indexedOutputItems))
+	for _, out := range indexedOutputItems {
+		outputItems = append(outputItems, out.item)
 	}
-	outputItems = append(outputItems, toolItems...)
 
 	resp := map[string]interface{}{
 		"id":          p.responseID,
@@ -545,6 +708,17 @@ func (p *responsesStreamProxy) emitCompleted() error {
 		"output_text": text,
 		"output":      outputItems,
 	}
+	if p.reasoningStarted {
+		resp["reasoning"] = map[string]interface{}{
+			"effort": nil,
+			"summary": []map[string]interface{}{
+				{
+					"type": "summary_text",
+					"text": reasoning,
+				},
+			},
+		}
+	}
 
 	if p.responseID == "" {
 		resp["id"] = responsesFallbackResponseID
@@ -552,6 +726,7 @@ func (p *responsesStreamProxy) emitCompleted() error {
 	if p.model == "" {
 		resp["model"] = responsesFallbackModel
 	}
+	p.completedResponse = resp
 
 	if err := p.writeEvent(map[string]interface{}{
 		"type":     "response.completed",
@@ -566,6 +741,7 @@ func (p *responsesStreamProxy) emitCompleted() error {
 func (p *responsesStreamProxy) writeEvent(event map[string]interface{}) error {
 	p.sendHeadersIfNeeded()
 	p.eventSeq++
+	event["sequence_number"] = p.eventSeq
 	event["event_id"] = fmt.Sprintf("%s%d", responsesEventIDPrefix, p.eventSeq)
 	b, err := json.Marshal(event)
 	if err != nil {

@@ -42,8 +42,9 @@ func (t *OllamaTranslator) BaseURL() string {
 
 type ollamaChatRequest struct {
 	Model    string                 `json:"model"`
-	Messages []ollamaMessage         `json:"messages"`
+	Messages []ollamaMessage        `json:"messages"`
 	Stream   bool                   `json:"stream"`
+	Think    interface{}            `json:"think,omitempty"`
 	Tools    []models.Tool          `json:"tools,omitempty"`
 	Format   interface{}            `json:"format,omitempty"`
 	Options  map[string]interface{} `json:"options,omitempty"`
@@ -121,7 +122,11 @@ func (t *OllamaTranslator) TranslateRequest(ctx context.Context, req *models.Uni
 	ollamaReq := ollamaChatRequest{
 		Model:    req.Model,
 		Messages: msgs,
-		Stream:   req.Stream,
+		// Ollama tool calling on /api/chat requires stream=false.
+		// We still expose streaming to clients by converting the final JSON
+		// response into a single streamed chunk at the gateway layer.
+		Stream:   req.Stream && len(req.Tools) == 0,
+		Think:    resolveOllamaThink(req, t.cfg),
 		Tools:    req.Tools,
 		Format:   format,
 		Options:  options,
@@ -255,6 +260,41 @@ func (t *OllamaTranslator) ParseResponse(resp *http.Response) (*models.UnifiedRe
 		}},
 		Usage: usage,
 	}, nil
+}
+
+func resolveOllamaThink(req *models.UnifiedRequest, cfg config.ProviderConfig) interface{} {
+	if req != nil {
+		if val, ok := normalizeOllamaThinkValue(req.ReasoningEffort); ok {
+			return val
+		}
+	}
+	if cfg.Extra != nil {
+		if raw := strings.TrimSpace(cfg.Extra["think"]); raw != "" {
+			if val, ok := normalizeOllamaThinkValue(raw); ok {
+				return val
+			}
+		}
+	}
+	return nil
+}
+
+func normalizeOllamaThinkValue(raw string) (interface{}, bool) {
+	v := strings.ToLower(strings.TrimSpace(raw))
+	switch v {
+	case "":
+		return nil, false
+	case "true", "1", "yes", "on":
+		return true, true
+	case "false", "0", "no", "off", "none":
+		return false, true
+	case "minimal":
+		// Ollama supports low/medium/high effort values.
+		return "low", true
+	case "low", "medium", "high":
+		return v, true
+	default:
+		return nil, false
+	}
 }
 
 func (t *OllamaTranslator) ParseEmbeddingsResponse(resp *http.Response) (*models.EmbeddingsResponse, error) {

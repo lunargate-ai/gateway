@@ -86,6 +86,7 @@ func (t *OpenAITranslator) BaseURL() string {
 
 func (t *OpenAITranslator) TranslateRequest(ctx context.Context, req *models.UnifiedRequest) (*http.Request, error) {
 	reqCopy := *req
+	reqCopy.Reasoning = nil
 	if reqCopy.Stream {
 		if reqCopy.StreamOptions == nil {
 			reqCopy.StreamOptions = &models.StreamOptions{}
@@ -370,6 +371,9 @@ func unifiedToResponsesPayload(req *models.UnifiedRequest) *models.ResponsesRequ
 	if len(instructions) > 0 {
 		out.Instructions = strings.Join(instructions, "\n")
 	}
+	if effort := strings.TrimSpace(req.ReasoningEffort); effort != "" {
+		out.Reasoning = &models.Reasoning{Effort: effort}
+	}
 	if req.MaxTokens != nil {
 		out.MaxOutputTokens = req.MaxTokens
 	}
@@ -397,6 +401,9 @@ func responsesResponseToUnified(resp *models.ResponsesResponse) *models.UnifiedR
 	message := &models.Message{Role: "assistant"}
 	if text := strings.TrimSpace(firstNonEmptyResponsesText(resp)); text != "" {
 		message.Content = text
+	}
+	if reasoning := strings.TrimSpace(firstNonEmptyResponsesReasoning(resp)); reasoning != "" {
+		message.ReasoningContent = reasoning
 	}
 
 	toolCalls := make([]models.ToolCall, 0)
@@ -469,6 +476,35 @@ func firstNonEmptyResponsesText(resp *models.ResponsesResponse) string {
 				if text := strings.TrimSpace(part.Text); text != "" {
 					parts = append(parts, text)
 				}
+			}
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+func firstNonEmptyResponsesReasoning(resp *models.ResponsesResponse) string {
+	if resp == nil {
+		return ""
+	}
+
+	parts := make([]string, 0, 2)
+	for i := range resp.Output {
+		item := resp.Output[i]
+		if item.Type != "reasoning" {
+			continue
+		}
+		for _, summary := range item.Summary {
+			if text := strings.TrimSpace(summary.Text); text != "" {
+				parts = append(parts, text)
+			}
+		}
+		for _, content := range item.Content {
+			partType := strings.TrimSpace(content.Type)
+			if partType != "reasoning_text" && partType != "summary_text" && partType != "text" {
+				continue
+			}
+			if text := strings.TrimSpace(content.Text); text != "" {
+				parts = append(parts, text)
 			}
 		}
 	}
@@ -562,11 +598,29 @@ func responsesEventToStreamChunk(data []byte) (*models.StreamChunk, error) {
 		default:
 			return nil, nil
 		}
-	case "response.reasoning_summary_text.delta", "response.reasoning_summary_text.done":
+	case "response.reasoning_summary_text.delta", "response.reasoning_summary_text.done",
+		"response.reasoning_text.delta", "response.reasoning_text.done":
 		text := interfaceToString(raw["delta"])
 		if text == "" {
 			text = interfaceToString(raw["text"])
 		}
+		if text == "" {
+			return nil, nil
+		}
+		return &models.StreamChunk{
+			ID:     responseID,
+			Object: "chat.completion.chunk",
+			Choices: []models.Choice{{
+				Index: 0,
+				Delta: &models.Message{ReasoningContent: text},
+			}},
+		}, nil
+	case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done":
+		part, _ := raw["part"].(map[string]interface{})
+		if part == nil {
+			return nil, nil
+		}
+		text := interfaceToString(part["text"])
 		if text == "" {
 			return nil, nil
 		}
