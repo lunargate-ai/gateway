@@ -13,4 +13,5 @@ data_sharing:
   enabled: true # disabled by default
   share_prompts: true # disabled by default
   share_responses: true # disabled by default
+  # Create this key in the "Gateways" section of https://app.lunargate.ai
   api_key: "${LUNARGATE_GATEWAY_API_KEY}"

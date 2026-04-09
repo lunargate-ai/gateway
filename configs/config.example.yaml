@@ -151,10 +151,11 @@ security:
   api_keys_enabled: false
   api_keys: []
 
-# Data Sharing - Controls what data the gateway sends to the SaaS backend.
+# Data Sharing - Controls what data the gateway sends to the LunarGate Dashboard on app.lunargate.ai.
 # By default, ONLY metrics are sent (zero data leakage mode).
 # Enable to forward prompts/responses for log inspection in the dashboard.
 # WARNING: Enabling this means prompt/response content leaves your infrastructure.
+# Create the gateway API key in the "Gateways" section of https://app.lunargate.ai
 data_sharing:
   enabled: false              # Master switch - must be true for any sharing
   share_prompts: false        # Forward user prompts to SaaS backend

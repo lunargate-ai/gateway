@@ -130,7 +130,7 @@ For a runnable client example, see [`gateway-examples/`](https://github.com/luna
 
 By default, LunarGate does not forward prompts or responses outside your infrastructure.
 
-If you want to connect the gateway to LunarGate observability, create a gateway in the LunarGate app and add the generated credentials to your environment:
+If you want to connect the gateway to LunarGate observability, create a gateway in the `Gateways` section of [app.lunargate.ai](https://app.lunargate.ai) and add the generated gateway API key to your environment:
 
 ```bash
 LUNARGATE_GATEWAY_API_KEY=lgw_your_gateway_api_key
