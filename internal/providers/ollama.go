@@ -12,6 +12,7 @@ import (
 
 	"github.com/lunargate-ai/gateway/internal/config"
 	"github.com/lunargate-ai/gateway/pkg/models"
+	"github.com/rs/zerolog/log"
 )
 
 type OllamaTranslator struct {
@@ -125,11 +126,11 @@ func (t *OllamaTranslator) TranslateRequest(ctx context.Context, req *models.Uni
 		// Ollama tool calling on /api/chat requires stream=false.
 		// We still expose streaming to clients by converting the final JSON
 		// response into a single streamed chunk at the gateway layer.
-		Stream:   req.Stream && len(req.Tools) == 0,
-		Think:    resolveOllamaThink(req, t.cfg),
-		Tools:    req.Tools,
-		Format:   format,
-		Options:  options,
+		Stream:  req.Stream && len(req.Tools) == 0,
+		Think:   resolveOllamaThink(req, t.cfg),
+		Tools:   req.Tools,
+		Format:  format,
+		Options: options,
 	}
 
 	body, err := json.Marshal(ollamaReq)
@@ -138,6 +139,20 @@ func (t *OllamaTranslator) TranslateRequest(ctx context.Context, req *models.Uni
 	}
 
 	endpoint := fmt.Sprintf("%s/api/chat", strings.TrimRight(strings.TrimSpace(t.cfg.BaseURL), "/"))
+	log.Debug().
+		Str("provider", "ollama").
+		Str("upstream_url", endpoint).
+		Str("model", ollamaReq.Model).
+		Bool("stream", ollamaReq.Stream).
+		Int("messages_count", len(ollamaReq.Messages)).
+		Strs("message_roles", ollamaMessageRoles(ollamaReq.Messages)).
+		Int("tools_count", len(ollamaReq.Tools)).
+		Strs("tool_names", ollamaToolNames(ollamaReq.Tools)).
+		Bool("has_think", ollamaReq.Think != nil).
+		Bool("has_format", ollamaReq.Format != nil).
+		RawJSON("upstream_payload", body).
+		Msg("sending chat request to ollama")
+
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create ollama http request: %w", err)
@@ -445,4 +460,26 @@ func mapOllamaDoneReason(reason string) *string {
 		mapped = r
 	}
 	return &mapped
+}
+
+func ollamaMessageRoles(messages []ollamaMessage) []string {
+	if len(messages) == 0 {
+		return nil
+	}
+	roles := make([]string, 0, len(messages))
+	for i := range messages {
+		roles = append(roles, strings.TrimSpace(messages[i].Role))
+	}
+	return roles
+}
+
+func ollamaToolNames(tools []models.Tool) []string {
+	if len(tools) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(tools))
+	for i := range tools {
+		names = append(names, strings.TrimSpace(tools[i].Function.Name))
+	}
+	return names
 }
