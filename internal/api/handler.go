@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/lunargate-ai/gateway/internal/config"
 	"github.com/lunargate-ai/gateway/internal/middleware"
 	"github.com/lunargate-ai/gateway/internal/modelid"
 	"github.com/lunargate-ai/gateway/internal/modelselect"
@@ -28,16 +29,16 @@ import (
 
 // Handler is the main API handler that orchestrates the request lifecycle.
 type Handler struct {
-	registry  *providers.Registry
-	router    *routing.Engine
-	fallback  *resilience.FallbackExecutor
-	cache     *middleware.Cache
-	streamer  *streaming.Handler
-	metrics   *observability.Metrics
-	collector *observability.CollectorClient
-	selector  *modelselect.Engine
-	store     *modelstore.Store
-	client    *http.Client
+	registry        *providers.Registry
+	router          *routing.Engine
+	fallback        *resilience.FallbackExecutor
+	cache           *middleware.Cache
+	streamer        *streaming.Handler
+	metrics         *observability.Metrics
+	collector       *observability.CollectorClient
+	selector        *modelselect.Engine
+	store           *modelstore.Store
+	providerClients *providerClientRegistry
 }
 
 type trackedResponseWriter struct {
@@ -93,13 +94,13 @@ func (w *capturedResponseWriter) Write(p []byte) (int, error) {
 	return w.body.Write(p)
 }
 
-func newProviderHTTPClient() *http.Client {
+func newProviderHTTPClient(timeout time.Duration) *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxIdleConns = 2048
 	transport.MaxIdleConnsPerHost = 1024
 	transport.IdleConnTimeout = 90 * time.Second
+	transport.ResponseHeaderTimeout = timeout
 	return &http.Client{
-		Timeout:   120 * time.Second,
 		Transport: transport,
 	}
 }
@@ -206,17 +207,24 @@ func NewHandler(
 	store *modelstore.Store,
 ) *Handler {
 	return &Handler{
-		registry:  registry,
-		router:    router,
-		fallback:  fallback,
-		cache:     cache,
-		streamer:  streamer,
-		metrics:   metrics,
-		collector: collector,
-		selector:  selector,
-		store:     store,
-		client:    newProviderHTTPClient(),
+		registry:        registry,
+		router:          router,
+		fallback:        fallback,
+		cache:           cache,
+		streamer:        streamer,
+		metrics:         metrics,
+		collector:       collector,
+		selector:        selector,
+		store:           store,
+		providerClients: newProviderClientRegistry(nil),
 	}
+}
+
+func (h *Handler) UpdateProviderConfigs(providerConfigs map[string]config.ProviderConfig) {
+	if h == nil || h.providerClients == nil {
+		return
+	}
+	h.providerClients.Update(providerConfigs)
 }
 
 // ChatCompletions handles POST /v1/chat/completions.
@@ -724,6 +732,20 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 					Str("request_id", requestID).
 					Dur("duration", duration).
 					Msg("streaming error")
+			} else if isUpstreamTTFTTimeout(streamErr) {
+				errCode = "upstream_timeout"
+				errMsg = "provider timed out waiting for first byte"
+				log.Error().Err(streamErr).
+					Str("request_id", requestID).
+					Dur("duration", duration).
+					Msg("streaming first-byte timeout")
+			} else if isUpstreamTotalTimeout(streamErr) {
+				errCode = "upstream_timeout"
+				errMsg = "provider timed out before full response completed"
+				log.Error().Err(streamErr).
+					Str("request_id", requestID).
+					Dur("duration", duration).
+					Msg("streaming total timeout")
 			} else {
 				log.Error().Err(streamErr).
 					Str("request_id", requestID).
@@ -923,6 +945,16 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			} else {
 				errMsg = err.Error()
 			}
+			metricErrType = respErrType
+		} else if isUpstreamTTFTTimeout(err) {
+			respErrType = "upstream_timeout"
+			collectorErrCode = respErrType
+			errMsg = "provider timed out waiting for first byte"
+			metricErrType = respErrType
+		} else if isUpstreamTotalTimeout(err) {
+			respErrType = "upstream_timeout"
+			collectorErrCode = respErrType
+			errMsg = "provider timed out before full response completed"
 			metricErrType = respErrType
 		}
 
@@ -1159,9 +1191,44 @@ func (h *Handler) callProvider(ctx context.Context, target routing.Target, req *
 		beforeUpstream()
 	}
 
-	resp, err := h.client.Do(httpReq)
+	clientCfg := providerClientConfig{
+		client:  newProviderHTTPClient(defaultUpstreamTimeout),
+		timeout: defaultUpstreamTimeout,
+		mode:    upstreamTimeoutModeTTFT,
+	}
+	if h.providerClients != nil {
+		if configuredClient, ok := h.providerClients.Get(target.Provider); ok {
+			clientCfg = configuredClient
+		}
+	}
+
+	startedAt := time.Now()
+	resp, err := clientCfg.client.Do(httpReq)
 	if err != nil {
+		if isHTTPTimeoutError(err) {
+			if clientCfg.mode == upstreamTimeoutModeTotal {
+				return nil, fmt.Errorf("%w: provider %s", errUpstreamTotalTimeout, target.Provider)
+			}
+			return nil, fmt.Errorf("%w: provider %s", errUpstreamTTFTTimeout, target.Provider)
+		}
 		return nil, fmt.Errorf("failed to call provider %s: %w", target.Provider, err)
+	}
+
+	remaining := clientCfg.timeout - time.Since(startedAt)
+	if transport, ok := clientCfg.client.Transport.(*http.Transport); ok && transport.ResponseHeaderTimeout > 0 {
+		remaining = transport.ResponseHeaderTimeout - time.Since(startedAt)
+	}
+	if remaining <= 0 {
+		resp.Body.Close()
+		if clientCfg.mode == upstreamTimeoutModeTotal {
+			return nil, fmt.Errorf("%w: provider %s", errUpstreamTotalTimeout, target.Provider)
+		}
+		return nil, fmt.Errorf("%w: provider %s", errUpstreamTTFTTimeout, target.Provider)
+	}
+	if clientCfg.mode == upstreamTimeoutModeTotal {
+		resp.Body = wrapBodyWithTotalTimeout(resp.Body, remaining)
+	} else {
+		resp.Body = wrapBodyWithTTFTTimeout(resp.Body, remaining)
 	}
 
 	// For non-streaming, check status code. For streaming, let the streamer handle it.

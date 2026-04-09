@@ -150,9 +150,44 @@ func (h *Handler) callEmbeddingsProvider(ctx context.Context, target routing.Tar
 		beforeUpstream()
 	}
 
-	resp, err := h.client.Do(httpReq)
+	clientCfg := providerClientConfig{
+		client:  newProviderHTTPClient(defaultUpstreamTimeout),
+		timeout: defaultUpstreamTimeout,
+		mode:    upstreamTimeoutModeTTFT,
+	}
+	if h.providerClients != nil {
+		if configuredClient, ok := h.providerClients.Get(target.Provider); ok {
+			clientCfg = configuredClient
+		}
+	}
+
+	startedAt := time.Now()
+	resp, err := clientCfg.client.Do(httpReq)
 	if err != nil {
+		if isHTTPTimeoutError(err) {
+			if clientCfg.mode == upstreamTimeoutModeTotal {
+				return nil, fmt.Errorf("%w: provider %s", errUpstreamTotalTimeout, target.Provider)
+			}
+			return nil, fmt.Errorf("%w: provider %s", errUpstreamTTFTTimeout, target.Provider)
+		}
 		return nil, fmt.Errorf("failed to call provider %s: %w", target.Provider, err)
+	}
+
+	remaining := clientCfg.timeout - time.Since(startedAt)
+	if transport, ok := clientCfg.client.Transport.(*http.Transport); ok && transport.ResponseHeaderTimeout > 0 {
+		remaining = transport.ResponseHeaderTimeout - time.Since(startedAt)
+	}
+	if remaining <= 0 {
+		resp.Body.Close()
+		if clientCfg.mode == upstreamTimeoutModeTotal {
+			return nil, fmt.Errorf("%w: provider %s", errUpstreamTotalTimeout, target.Provider)
+		}
+		return nil, fmt.Errorf("%w: provider %s", errUpstreamTTFTTimeout, target.Provider)
+	}
+	if clientCfg.mode == upstreamTimeoutModeTotal {
+		resp.Body = wrapBodyWithTotalTimeout(resp.Body, remaining)
+	} else {
+		resp.Body = wrapBodyWithTTFTTimeout(resp.Body, remaining)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return resp, nil
@@ -331,6 +366,20 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 				Str("request_id", requestID).
 				Dur("duration", duration).
 				Msg("embeddings request cancelled")
+		} else if isUpstreamTTFTTimeout(err) {
+			errCode = "upstream_timeout"
+			errMsg = "provider timed out waiting for first byte"
+			log.Error().Err(err).
+				Str("request_id", requestID).
+				Dur("duration", duration).
+				Msg("embeddings first-byte timeout")
+		} else if isUpstreamTotalTimeout(err) {
+			errCode = "upstream_timeout"
+			errMsg = "provider timed out before full response completed"
+			log.Error().Err(err).
+				Str("request_id", requestID).
+				Dur("duration", duration).
+				Msg("embeddings total timeout")
 		} else {
 			log.Error().Err(err).
 				Str("request_id", requestID).
@@ -347,6 +396,12 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 			errMsgForCollector := err.Error()
 			if errors.Is(err, context.Canceled) {
 				errMsgForCollector = "client disconnected"
+			} else if isUpstreamTTFTTimeout(err) {
+				errCodeForCollector = "upstream_timeout"
+				errMsgForCollector = "provider timed out waiting for first byte"
+			} else if isUpstreamTotalTimeout(err) {
+				errCodeForCollector = "upstream_timeout"
+				errMsgForCollector = "provider timed out before full response completed"
 			}
 			routeUsed := resolved.RouteName
 			targetIndex := resolved.Index
@@ -475,6 +530,16 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 			} else {
 				errMsg = err.Error()
 			}
+			metricErrType = respErrType
+		} else if isUpstreamTTFTTimeout(err) {
+			respErrType = "upstream_timeout"
+			collectorErrCode = respErrType
+			errMsg = "provider timed out waiting for first byte"
+			metricErrType = respErrType
+		} else if isUpstreamTotalTimeout(err) {
+			respErrType = "upstream_timeout"
+			collectorErrCode = respErrType
+			errMsg = "provider timed out before full response completed"
 			metricErrType = respErrType
 		}
 

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lunargate-ai/gateway/internal/config"
 	"github.com/lunargate-ai/gateway/internal/middleware"
@@ -222,6 +223,188 @@ func TestChatCompletions_SetsTimingHeaders(t *testing.T) {
 	}
 	if rec.Header().Get("X-LunarGate-Latency-Ms") == "" {
 		t.Fatalf("expected X-LunarGate-Latency-Ms header to be set")
+	}
+}
+
+func TestChatCompletions_TTFTTimeoutAfterHeaders(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		time.Sleep(150 * time.Millisecond)
+		_, _ = io.WriteString(w, `{"id":"cmpl-timeout","object":"chat.completion","created":1,"model":"gpt-4-turbo","choices":[{"index":0,"message":{"role":"assistant","content":"late"},"finish_reason":"stop"}]}`)
+	}))
+	defer upstream.Close()
+
+	providerID := "openai"
+	cfgProviders := map[string]config.ProviderConfig{
+		providerID: {Type: "openai", APIKey: "dummy", BaseURL: upstream.URL, Timeout: 50 * time.Millisecond},
+	}
+	reg := providers.NewRegistry(cfgProviders)
+	router := routing.NewEngine(config.RoutingConfig{
+		DefaultStrategy: "weighted",
+		Routes: []config.RouteConfig{{
+			Name:    "default",
+			Match:   config.MatchConfig{Path: "*"},
+			Targets: []config.TargetConfig{{Provider: providerID, Model: "gpt-4-turbo", Weight: 1}},
+		}},
+	})
+	retrier := resilience.NewRetrier(config.RetryConfig{Enabled: false})
+	cbm := resilience.NewCircuitBreakerManager()
+	fb := resilience.NewFallbackExecutor(retrier, cbm)
+	cache := middleware.NewCache(config.CacheConfig{Enabled: false})
+	streamer := streaming.NewHandler()
+	metrics := observability.NewMetricsWithRegisterer(prometheus.NewRegistry())
+	h := NewHandler(reg, router, fb, cache, streamer, metrics, nil, nil, nil)
+	h.UpdateProviderConfigs(cfgProviders)
+
+	payload := models.UnifiedRequest{Model: "gpt-4-turbo", Messages: []models.Message{{Role: "user", Content: "hi"}}}
+	b, _ := json.Marshal(payload)
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/v1/chat/completions", bytes.NewReader(b))
+	rec := httptest.NewRecorder()
+
+	h.ChatCompletions(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("expected status %d, got %d", http.StatusBadGateway, rec.Code)
+	}
+
+	var resp models.ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if resp.Error.Type != "upstream_timeout" {
+		t.Fatalf("expected error type %q, got %q", "upstream_timeout", resp.Error.Type)
+	}
+}
+
+func TestChatCompletions_TTFTTimeoutClearsAfterFirstByte(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		_, _ = io.WriteString(w, `{`)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		time.Sleep(150 * time.Millisecond)
+		_, _ = io.WriteString(w, `"id":"cmpl-ok","object":"chat.completion","created":1,"model":"gpt-4-turbo","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}`)
+	}))
+	defer upstream.Close()
+
+	providerID := "openai"
+	cfgProviders := map[string]config.ProviderConfig{
+		providerID: {Type: "openai", APIKey: "dummy", BaseURL: upstream.URL, Timeout: 50 * time.Millisecond},
+	}
+	reg := providers.NewRegistry(cfgProviders)
+	router := routing.NewEngine(config.RoutingConfig{
+		DefaultStrategy: "weighted",
+		Routes: []config.RouteConfig{{
+			Name:    "default",
+			Match:   config.MatchConfig{Path: "*"},
+			Targets: []config.TargetConfig{{Provider: providerID, Model: "gpt-4-turbo", Weight: 1}},
+		}},
+	})
+	retrier := resilience.NewRetrier(config.RetryConfig{Enabled: false})
+	cbm := resilience.NewCircuitBreakerManager()
+	fb := resilience.NewFallbackExecutor(retrier, cbm)
+	cache := middleware.NewCache(config.CacheConfig{Enabled: false})
+	streamer := streaming.NewHandler()
+	metrics := observability.NewMetricsWithRegisterer(prometheus.NewRegistry())
+	h := NewHandler(reg, router, fb, cache, streamer, metrics, nil, nil, nil)
+	h.UpdateProviderConfigs(cfgProviders)
+
+	payload := models.UnifiedRequest{Model: "gpt-4-turbo", Messages: []models.Message{{Role: "user", Content: "hi"}}}
+	b, _ := json.Marshal(payload)
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/v1/chat/completions", bytes.NewReader(b))
+	rec := httptest.NewRecorder()
+
+	h.ChatCompletions(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d body=%s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	var resp models.UnifiedResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if len(resp.Choices) != 1 || resp.Choices[0].Message == nil {
+		t.Fatalf("expected one response choice with a message, got %#v", resp.Choices)
+	}
+	if got := resp.Choices[0].Message.Content; got != "hello" {
+		t.Fatalf("expected content %q, got %#v", "hello", got)
+	}
+}
+
+func TestChatCompletions_TotalTimeoutCutsAfterFirstByte(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		_, _ = io.WriteString(w, `{`)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		time.Sleep(150 * time.Millisecond)
+		_, _ = io.WriteString(w, `"id":"cmpl-total-timeout","object":"chat.completion","created":1,"model":"gpt-4-turbo","choices":[{"index":0,"message":{"role":"assistant","content":"too late"},"finish_reason":"stop"}]}`)
+	}))
+	defer upstream.Close()
+
+	providerID := "openai"
+	cfgProviders := map[string]config.ProviderConfig{
+		providerID: {
+			Type:        "openai",
+			APIKey:      "dummy",
+			BaseURL:     upstream.URL,
+			Timeout:     50 * time.Millisecond,
+			TimeoutMode: "total",
+		},
+	}
+	reg := providers.NewRegistry(cfgProviders)
+	router := routing.NewEngine(config.RoutingConfig{
+		DefaultStrategy: "weighted",
+		Routes: []config.RouteConfig{{
+			Name:    "default",
+			Match:   config.MatchConfig{Path: "*"},
+			Targets: []config.TargetConfig{{Provider: providerID, Model: "gpt-4-turbo", Weight: 1}},
+		}},
+	})
+	retrier := resilience.NewRetrier(config.RetryConfig{Enabled: false})
+	cbm := resilience.NewCircuitBreakerManager()
+	fb := resilience.NewFallbackExecutor(retrier, cbm)
+	cache := middleware.NewCache(config.CacheConfig{Enabled: false})
+	streamer := streaming.NewHandler()
+	metrics := observability.NewMetricsWithRegisterer(prometheus.NewRegistry())
+	h := NewHandler(reg, router, fb, cache, streamer, metrics, nil, nil, nil)
+	h.UpdateProviderConfigs(cfgProviders)
+
+	payload := models.UnifiedRequest{Model: "gpt-4-turbo", Messages: []models.Message{{Role: "user", Content: "hi"}}}
+	b, _ := json.Marshal(payload)
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/v1/chat/completions", bytes.NewReader(b))
+	rec := httptest.NewRecorder()
+
+	h.ChatCompletions(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("expected status %d, got %d", http.StatusBadGateway, rec.Code)
+	}
+
+	var resp models.ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if resp.Error.Type != "upstream_timeout" {
+		t.Fatalf("expected error type %q, got %q", "upstream_timeout", resp.Error.Type)
+	}
+	if resp.Error.Message != "provider timed out before full response completed" {
+		t.Fatalf("expected total-timeout message, got %q", resp.Error.Message)
 	}
 }
 

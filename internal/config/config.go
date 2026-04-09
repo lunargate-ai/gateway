@@ -51,6 +51,8 @@ type ProviderConfig struct {
 	DefaultModel string               `mapstructure:"default_model"`
 	Organization string               `mapstructure:"organization"`
 	APIVersion   string               `mapstructure:"api_version"`
+	Timeout      time.Duration        `mapstructure:"timeout"`
+	TimeoutMode  string               `mapstructure:"timeout_mode"`
 	Extra        map[string]string    `mapstructure:"extra"`
 	Models       ProviderModelsConfig `mapstructure:"models"`
 }

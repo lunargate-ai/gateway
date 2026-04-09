@@ -75,6 +75,8 @@ func main() {
 	collectorClient := observability.NewCollectorClient(cfg.DataSharing, version)
 	selector := modelselect.NewEngine(cfg.ModelSelect)
 	store := modelstore.NewStore(registry, cfg.Providers)
+	handler := api.NewHandler(registry, routingEngine, fallbackExec, cache, streamer, metrics, collectorClient, selector, store)
+	handler.UpdateProviderConfigs(cfg.Providers)
 	remoteControlBaseURL := "http://" + localLoopbackAddress(cfg.Server)
 	modelIDs := func(ctx context.Context) []string {
 		var ids []string
@@ -139,6 +141,7 @@ func main() {
 		routingEngine.UpdateConfig(newCfg.Routing)
 		if registry.UpdateProvidersConfig(newCfg.Providers) {
 			store.UpdateProvidersConfig(newCfg.Providers)
+			handler.UpdateProviderConfigs(newCfg.Providers)
 		}
 		rateLimiter.UpdateConfig(newCfg.RateLimit)
 		cache.UpdateConfig(newCfg.Cache)
@@ -160,7 +163,6 @@ func main() {
 	cfgManager.WatchChanges()
 
 	// --- Create API Handler & Router ---
-	handler := api.NewHandler(registry, routingEngine, fallbackExec, cache, streamer, metrics, collectorClient, selector, store)
 	router := api.NewRouter(handler, rateLimiter, healthChecker)
 
 	// --- Start HTTP Server ---
