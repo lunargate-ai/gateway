@@ -177,6 +177,19 @@ func requestContextWithRetryPolicy(r *http.Request) context.Context {
 	return ctx
 }
 
+func upstreamFailureFromError(err error) (int, string, string, bool) {
+	var statusErr *resilience.RetryableStatusError
+	if !errors.As(err, &statusErr) || statusErr == nil || statusErr.StatusCode <= 0 {
+		return 0, "", "", false
+	}
+
+	errCode := "upstream_error"
+	if statusErr.StatusCode == http.StatusTooManyRequests {
+		errCode = "rate_limit_error"
+	}
+	return statusErr.StatusCode, errCode, statusErr.Error(), true
+}
+
 func (h *Handler) observeCircuitBreakerState(provider string, state string) {
 	if h == nil || h.metrics == nil {
 		return
@@ -463,6 +476,16 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				Str("request_id", requestID).
 				Dur("duration", duration).
 				Msg("request cancelled")
+		} else if upstreamStatus, upstreamErrCode, upstreamErrMsg, ok := upstreamFailureFromError(err); ok {
+			status = upstreamStatus
+			errCode = upstreamErrCode
+			errMsg = upstreamErrMsg
+			log.Warn().
+				Err(err).
+				Str("request_id", requestID).
+				Int("status_code", status).
+				Dur("duration", duration).
+				Msg("upstream provider failure after retries")
 		} else {
 			log.Error().Err(err).
 				Str("request_id", requestID).

@@ -102,6 +102,66 @@ func TestChatCompletions_ProviderErrorPassthrough(t *testing.T) {
 	}
 }
 
+func TestChatCompletions_RetryExhausted429PreservesUpstreamStatus(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"too many requests","type":"rate_limit_error"}}`))
+	}))
+	defer upstream.Close()
+
+	providerID := "openai"
+	cfgProviders := map[string]config.ProviderConfig{
+		providerID: {Type: "openai", APIKey: "dummy", BaseURL: upstream.URL},
+	}
+	reg := providers.NewRegistry(cfgProviders)
+
+	router := routing.NewEngine(config.RoutingConfig{
+		DefaultStrategy: "weighted",
+		Routes: []config.RouteConfig{
+			{
+				Name:    "default",
+				Match:   config.MatchConfig{Path: "*"},
+				Targets: []config.TargetConfig{{Provider: providerID, Model: "gpt-4-turbo", Weight: 1}},
+			},
+		},
+	})
+
+	retrier := resilience.NewRetrier(config.RetryConfig{
+		Enabled:         true,
+		MaxAttempts:     1,
+		RetryableErrors: []int{http.StatusTooManyRequests},
+	})
+	cbm := resilience.NewCircuitBreakerManager()
+	fb := resilience.NewFallbackExecutor(retrier, cbm)
+	cache := middleware.NewCache(config.CacheConfig{Enabled: false})
+	streamer := streaming.NewHandler()
+	metrics := observability.NewMetricsWithRegisterer(prometheus.NewRegistry())
+	h := NewHandler(reg, router, fb, cache, streamer, metrics, nil, nil, nil)
+
+	payload := models.UnifiedRequest{Model: "gpt-4-turbo", Messages: []models.Message{{Role: "user", Content: "hi"}}}
+	b, _ := json.Marshal(payload)
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/v1/chat/completions", bytes.NewReader(b))
+	rec := httptest.NewRecorder()
+
+	h.ChatCompletions(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected status %d, got %d", http.StatusTooManyRequests, rec.Code)
+	}
+
+	var resp models.ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if resp.Error.Type != "rate_limit_error" {
+		t.Fatalf("expected error type %q, got %q", "rate_limit_error", resp.Error.Type)
+	}
+	if resp.Error.Message != "provider returned status 429" {
+		t.Fatalf("expected error message %q, got %q", "provider returned status 429", resp.Error.Message)
+	}
+}
+
 func TestChatCompletions_NoRetryDisablesPerTargetRetriesAndStillFallsBack(t *testing.T) {
 	primaryCalls := 0
 	primaryUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

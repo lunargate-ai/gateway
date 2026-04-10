@@ -18,6 +18,16 @@ type Retrier struct {
 	cfg atomic.Value
 }
 
+// RetryableStatusError captures retryable upstream HTTP status codes so callers
+// can preserve the original status when retries are exhausted.
+type RetryableStatusError struct {
+	StatusCode int
+}
+
+func (e *RetryableStatusError) Error() string {
+	return fmt.Sprintf("provider returned status %d", e.StatusCode)
+}
+
 // NewRetrier creates a new retrier from config.
 func NewRetrier(cfg config.RetryConfig) *Retrier {
 	r := &Retrier{}
@@ -64,7 +74,7 @@ func (r *Retrier) Do(ctx context.Context, fn DoFunc) (*http.Response, int, error
 		if err != nil {
 			lastErr = err
 		} else if resp != nil {
-			lastErr = fmt.Errorf("provider returned status %d", resp.StatusCode)
+			lastErr = &RetryableStatusError{StatusCode: resp.StatusCode}
 			// Close the body of retryable responses to avoid leaking
 			resp.Body.Close()
 		}
