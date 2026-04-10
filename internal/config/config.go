@@ -173,8 +173,36 @@ type LoggingConfig struct {
 }
 
 type SecurityConfig struct {
+	Enabled  bool               `mapstructure:"enabled"`
+	Provider string             `mapstructure:"provider"`
+	APIKey   APIKeyAuthConfig   `mapstructure:"api_key"`
+	External ExternalAuthConfig `mapstructure:"external"`
+
+	// Deprecated compatibility fields. Prefer `security.enabled`,
+	// `security.provider`, and `security.api_key.*`.
 	APIKeysEnabled bool     `mapstructure:"api_keys_enabled"`
 	APIKeys        []string `mapstructure:"api_keys"`
+}
+
+type APIKeyAuthConfig struct {
+	Header       string             `mapstructure:"header"`
+	Prefix       string             `mapstructure:"prefix"`
+	AllowXAPIKey bool               `mapstructure:"allow_x_api_key"`
+	Keys         []APIKeyCredential `mapstructure:"keys"`
+}
+
+type APIKeyCredential struct {
+	Name  string `mapstructure:"name"`
+	Value string `mapstructure:"value"`
+}
+
+type ExternalAuthConfig struct {
+	Type             string        `mapstructure:"type"`
+	JWKSURL          string        `mapstructure:"jwks_url"`
+	IntrospectionURL string        `mapstructure:"introspection_url"`
+	Issuer           string        `mapstructure:"issuer"`
+	Audience         []string      `mapstructure:"audience"`
+	Timeout          time.Duration `mapstructure:"timeout"`
 }
 
 // DataSharingConfig controls what request/response data the gateway forwards
@@ -252,6 +280,13 @@ func (m *Manager) setDefaults() {
 	m.v.SetDefault("logging.level", "info")
 	m.v.SetDefault("logging.format", "console")
 
+	m.v.SetDefault("security.enabled", false)
+	m.v.SetDefault("security.provider", "none")
+	m.v.SetDefault("security.api_key.header", "Authorization")
+	m.v.SetDefault("security.api_key.prefix", "Bearer")
+	m.v.SetDefault("security.api_key.allow_x_api_key", true)
+	m.v.SetDefault("security.external.timeout", "5s")
+
 	m.v.SetDefault("model_selection.enabled", false)
 	m.v.SetDefault("model_selection.override_user_model", false)
 	m.v.SetDefault("model_selection.output_headers.complexity", "x-lunargate-complexity")
@@ -287,6 +322,10 @@ func (m *Manager) load() error {
 	}
 
 	expandConfigEnv(cfg)
+	normalizeSecurityConfig(cfg)
+	if err := validateConfig(cfg); err != nil {
+		return fmt.Errorf("invalid config: %w", err)
+	}
 
 	cfg.DataSharing.BackendURL = expandEnv(cfg.DataSharing.BackendURL)
 	cfg.DataSharing.BackendURL = strings.TrimRight(strings.TrimSpace(cfg.DataSharing.BackendURL), "/")
@@ -300,6 +339,100 @@ func (m *Manager) load() error {
 
 	m.current.Store(cfg)
 	return nil
+}
+
+func normalizeSecurityConfig(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+
+	securityCfg := &cfg.Security
+
+	if securityCfg.APIKeysEnabled {
+		securityCfg.Enabled = true
+	}
+
+	securityCfg.Provider = strings.ToLower(strings.TrimSpace(securityCfg.Provider))
+	if securityCfg.Provider == "" {
+		switch {
+		case len(securityCfg.APIKey.Keys) > 0 || len(securityCfg.APIKeys) > 0:
+			securityCfg.Provider = "api_key"
+		default:
+			securityCfg.Provider = "none"
+		}
+	}
+	if securityCfg.Provider == "none" && (securityCfg.APIKeysEnabled || len(securityCfg.APIKeys) > 0) {
+		securityCfg.Provider = "api_key"
+	}
+
+	if len(securityCfg.APIKey.Keys) == 0 && len(securityCfg.APIKeys) > 0 {
+		securityCfg.APIKey.Keys = make([]APIKeyCredential, 0, len(securityCfg.APIKeys))
+		for idx, value := range securityCfg.APIKeys {
+			securityCfg.APIKey.Keys = append(securityCfg.APIKey.Keys, APIKeyCredential{
+				Name:  fmt.Sprintf("legacy-key-%d", idx+1),
+				Value: value,
+			})
+		}
+	}
+
+	if strings.TrimSpace(securityCfg.APIKey.Header) == "" {
+		securityCfg.APIKey.Header = "Authorization"
+	}
+	if strings.EqualFold(strings.TrimSpace(securityCfg.APIKey.Header), "Authorization") &&
+		strings.TrimSpace(securityCfg.APIKey.Prefix) == "" {
+		securityCfg.APIKey.Prefix = "Bearer"
+	}
+
+	for idx := range securityCfg.APIKey.Keys {
+		key := &securityCfg.APIKey.Keys[idx]
+		key.Name = strings.TrimSpace(key.Name)
+		key.Value = strings.TrimSpace(key.Value)
+		if key.Name == "" {
+			key.Name = fmt.Sprintf("key-%d", idx+1)
+		}
+	}
+
+	if securityCfg.Provider == "api_key" && len(securityCfg.APIKey.Keys) > 0 {
+		securityCfg.Enabled = true
+	}
+}
+
+func validateConfig(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+
+	securityCfg := cfg.Security
+	provider := strings.ToLower(strings.TrimSpace(securityCfg.Provider))
+	if provider == "" {
+		provider = "none"
+	}
+
+	if !securityCfg.Enabled && provider != "api_key" {
+		return nil
+	}
+
+	switch provider {
+	case "none":
+		return nil
+	case "api_key":
+		if len(securityCfg.APIKey.Keys) == 0 {
+			return fmt.Errorf("security.api_key.keys must contain at least one key when security.provider is api_key")
+		}
+		for idx, key := range securityCfg.APIKey.Keys {
+			if strings.TrimSpace(key.Value) == "" {
+				return fmt.Errorf("security.api_key.keys[%d].value must not be empty", idx)
+			}
+		}
+		return nil
+	case "external":
+		if !securityCfg.Enabled {
+			return nil
+		}
+		return fmt.Errorf("security.provider=external is reserved for future inbound auth integrations and is not implemented yet")
+	default:
+		return fmt.Errorf("unsupported security.provider %q", securityCfg.Provider)
+	}
 }
 
 // expandEnv replaces ${VAR} patterns with environment variable values.

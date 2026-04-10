@@ -148,8 +148,13 @@ logging:
 
 # Security
 security:
-  api_keys_enabled: false
-  api_keys: []
+  enabled: false
+  # Optional: enable inbound API-key auth for /v1/*
+  # provider: "api_key"
+  # api_key:
+  #   keys:
+  #     - name: "dashboard"
+  #       value: "${LUNARGATE_CLIENT_API_KEY}"
 
 # Data Sharing - Controls what data the gateway sends to the LunarGate Dashboard on app.lunargate.ai.
 # By default, ONLY metrics are sent (zero data leakage mode).

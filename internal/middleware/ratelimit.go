@@ -11,14 +11,15 @@ import (
 	"time"
 
 	"github.com/lunargate-ai/gateway/internal/config"
+	"github.com/lunargate-ai/gateway/internal/security"
 	"github.com/rs/zerolog/log"
 )
 
 // TokenBucket implements a simple in-memory token bucket rate limiter.
 type TokenBucket struct {
-	mu       sync.Mutex
-	tokens   float64
-	maxTokens float64
+	mu         sync.Mutex
+	tokens     float64
+	maxTokens  float64
 	refillRate float64 // tokens per second
 	lastRefill time.Time
 }
@@ -54,9 +55,9 @@ func (tb *TokenBucket) allow() (bool, float64) {
 
 // RateLimiter is a middleware that limits request rates using token bucket algorithm.
 type RateLimiter struct {
-	mu      sync.RWMutex
-	buckets map[string]*bucketEntry
-	cfg     config.RateLimitConfig
+	mu         sync.RWMutex
+	buckets    map[string]*bucketEntry
+	cfg        config.RateLimitConfig
 	maxBuckets int
 	bucketTTL  time.Duration
 }
@@ -193,6 +194,10 @@ func hashKey(s string) string {
 }
 
 func extractRateLimitKey(r *http.Request) string {
+	if info, ok := security.AuthInfoFromContext(r.Context()); ok && strings.TrimSpace(info.Subject) != "" {
+		return "subject:" + hashKey(info.Subject)
+	}
+
 	// Prefer API key header, then IP
 	if key := strings.TrimSpace(r.Header.Get("X-API-Key")); key != "" {
 		return "key:" + hashKey(key)

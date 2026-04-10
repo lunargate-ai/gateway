@@ -101,3 +101,94 @@ routing:
 		t.Fatalf("provider normalize_developer_role = false, want true")
 	}
 }
+
+func TestNewManager_NormalizesSecurityAPIKeyConfig(t *testing.T) {
+	t.Setenv("CLIENT_API_KEY", "lg_client_test")
+
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	configBody := `providers:
+  openai:
+    api_key: "test-key"
+routing:
+  routes:
+    - name: "default"
+      targets:
+        - provider: openai
+security:
+  enabled: true
+  provider: "api_key"
+  api_key:
+    header: "Authorization"
+    prefix: "Bearer"
+    allow_x_api_key: true
+    keys:
+      - name: "dashboard"
+        value: "${CLIENT_API_KEY}"
+`
+	if err := os.WriteFile(configPath, []byte(configBody), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	manager, err := NewManager(configPath)
+	if err != nil {
+		t.Fatalf("NewManager returned error: %v", err)
+	}
+
+	cfg := manager.Get()
+	if !cfg.Security.Enabled {
+		t.Fatalf("security.enabled = false, want true")
+	}
+	if cfg.Security.Provider != "api_key" {
+		t.Fatalf("security.provider = %q, want %q", cfg.Security.Provider, "api_key")
+	}
+	if cfg.Security.APIKey.Header != "Authorization" {
+		t.Fatalf("security.api_key.header = %q, want %q", cfg.Security.APIKey.Header, "Authorization")
+	}
+	if len(cfg.Security.APIKey.Keys) != 1 {
+		t.Fatalf("security.api_key.keys length = %d, want 1", len(cfg.Security.APIKey.Keys))
+	}
+	if cfg.Security.APIKey.Keys[0].Value != "lg_client_test" {
+		t.Fatalf("security.api_key.keys[0].value = %q, want %q", cfg.Security.APIKey.Keys[0].Value, "lg_client_test")
+	}
+}
+
+func TestNewManager_LegacySecurityAPIKeysRemainSupported(t *testing.T) {
+	t.Setenv("LEGACY_GATEWAY_KEY", "lg_legacy_test")
+
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	configBody := `providers:
+  openai:
+    api_key: "test-key"
+routing:
+  routes:
+    - name: "default"
+      targets:
+        - provider: openai
+security:
+  api_keys_enabled: true
+  api_keys:
+    - "${LEGACY_GATEWAY_KEY}"
+`
+	if err := os.WriteFile(configPath, []byte(configBody), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	manager, err := NewManager(configPath)
+	if err != nil {
+		t.Fatalf("NewManager returned error: %v", err)
+	}
+
+	cfg := manager.Get()
+	if !cfg.Security.Enabled {
+		t.Fatalf("security.enabled = false, want true")
+	}
+	if cfg.Security.Provider != "api_key" {
+		t.Fatalf("security.provider = %q, want %q", cfg.Security.Provider, "api_key")
+	}
+	if len(cfg.Security.APIKey.Keys) != 1 {
+		t.Fatalf("security.api_key.keys length = %d, want 1", len(cfg.Security.APIKey.Keys))
+	}
+	if cfg.Security.APIKey.Keys[0].Value != "lg_legacy_test" {
+		t.Fatalf("security.api_key.keys[0].value = %q, want %q", cfg.Security.APIKey.Keys[0].Value, "lg_legacy_test")
+	}
+}

@@ -9,9 +9,18 @@ routing:
         - provider: openai
           model: gpt-5.2
 
-data_sharing:  
-  enabled: true # disabled by default
-  share_prompts: true # disabled by default
-  share_responses: true # disabled by default
-  # Create this key in the "Gateways" section of https://app.lunargate.ai
-  api_key: "${LUNARGATE_GATEWAY_API_KEY}"
+# Optional: enable inbound API-key auth for /v1/*
+# security:
+#   enabled: true
+#   provider: "api_key"
+#   api_key:
+#     keys:
+#       - value: "${LUNARGATE_CLIENT_API_KEY}"
+
+# Optional: connect to LunarGate Dashboard observability
+# data_sharing:
+#   enabled: true
+#   share_prompts: true
+#   share_responses: true
+#   # Create this key in the "Gateways" section of https://app.lunargate.ai
+#   api_key: "${LUNARGATE_GATEWAY_API_KEY}"

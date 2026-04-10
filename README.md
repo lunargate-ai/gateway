@@ -151,9 +151,9 @@ You can keep `share_prompts` and `share_responses` off if you want metrics-only 
 
 ## Security
 
-Inbound client authentication is not implemented yet.
+Basic inbound API-key authentication is available via the `security` section in `config.yaml`.
 
-Do not expose the gateway directly to the public internet without an auth-enforcing edge in front of it.
+For now, treat that as a solid first layer for trusted internal clients, not as a finished public multi-tenant edge. If the gateway is internet-facing, keep an auth-enforcing proxy, API gateway, or service mesh in front of it.
 
 ## License
 

@@ -1,15 +1,16 @@
 package api
 
 import (
-	"github.com/lunargate-ai/gateway/internal/health"
-	"github.com/lunargate-ai/gateway/internal/middleware"
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
+	"github.com/lunargate-ai/gateway/internal/health"
+	"github.com/lunargate-ai/gateway/internal/middleware"
+	"github.com/lunargate-ai/gateway/internal/security"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // NewRouter creates and configures the chi router with all routes and middleware.
-func NewRouter(handler *Handler, rateLimiter *middleware.RateLimiter, healthChecker *health.Checker) *chi.Mux {
+func NewRouter(handler *Handler, authManager *security.Manager, rateLimiter *middleware.RateLimiter, healthChecker *health.Checker) *chi.Mux {
 	r := chi.NewRouter()
 
 	// Global middleware
@@ -24,6 +25,9 @@ func NewRouter(handler *Handler, rateLimiter *middleware.RateLimiter, healthChec
 
 	// OpenAI-compatible API routes
 	r.Route("/v1", func(r chi.Router) {
+		if authManager != nil {
+			r.Use(authManager.Middleware)
+		}
 		r.Use(rateLimiter.Middleware)
 		r.Post("/chat/completions", handler.ChatCompletions)
 		r.Post("/responses", handler.Responses)

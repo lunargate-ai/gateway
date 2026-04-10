@@ -23,6 +23,7 @@ import (
 	"github.com/lunargate-ai/gateway/internal/remotecontrol"
 	"github.com/lunargate-ai/gateway/internal/resilience"
 	"github.com/lunargate-ai/gateway/internal/routing"
+	"github.com/lunargate-ai/gateway/internal/security"
 	"github.com/lunargate-ai/gateway/internal/streaming"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -69,6 +70,10 @@ func main() {
 	fallbackExec := resilience.NewFallbackExecutor(retrier, cbManager)
 	cache := middleware.NewCache(cfg.Cache)
 	rateLimiter := middleware.NewRateLimiter(cfg.RateLimit)
+	authManager, err := security.NewManager(cfg.Security)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to initialize inbound auth")
+	}
 	streamer := streaming.NewHandler()
 	metrics := observability.NewMetrics()
 	healthChecker := health.NewChecker(version)
@@ -131,6 +136,7 @@ func main() {
 		routingChanged := !reflect.DeepEqual(oldCfg.Routing, newCfg.Routing)
 		modelSelectChanged := !reflect.DeepEqual(oldCfg.ModelSelect, newCfg.ModelSelect)
 		dataSharingChanged := !reflect.DeepEqual(oldCfg.DataSharing, newCfg.DataSharing)
+		securityChanged := !reflect.DeepEqual(oldCfg.Security, newCfg.Security)
 		serverChanged := !reflect.DeepEqual(oldCfg.Server, newCfg.Server)
 
 		if serverChanged {
@@ -148,6 +154,11 @@ func main() {
 		retrier.UpdateConfig(newCfg.Retry)
 		selector.UpdateConfig(newCfg.ModelSelect)
 		collectorClient.UpdateConfig(newCfg.DataSharing)
+		if securityChanged {
+			if err := authManager.UpdateConfig(newCfg.Security); err != nil {
+				log.Error().Err(err).Msg("failed to reconcile inbound auth config; keeping previous auth state")
+			}
+		}
 
 		if dataSharingChanged {
 			reconcileRemoteControl(newCfg)
@@ -158,12 +169,12 @@ func main() {
 			remoteControlMu.Unlock()
 			logRemoteControlStatus(newCfg, clientSnapshot)
 		}
-		log.Info().Msg("hot-reload: routing, providers, retry, cache, rate limit, model selection, collector, and remote control reconciled")
+		log.Info().Msg("hot-reload: routing, providers, retry, cache, rate limit, inbound auth, model selection, collector, and remote control reconciled")
 	})
 	cfgManager.WatchChanges()
 
 	// --- Create API Handler & Router ---
-	router := api.NewRouter(handler, rateLimiter, healthChecker)
+	router := api.NewRouter(handler, authManager, rateLimiter, healthChecker)
 
 	// --- Start HTTP Server ---
 	srv := &http.Server{
