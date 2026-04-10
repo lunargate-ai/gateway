@@ -68,3 +68,36 @@ data_sharing:
 		t.Fatalf("data_sharing api_key = %q, want %q", cfg.DataSharing.APIKey, "lgw_test")
 	}
 }
+
+func TestNewManager_ParsesProviderCompatibilityFields(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	configBody := `providers:
+  deepseek:
+    type: "openai"
+    api_key: "test-key"
+    base_url: "https://api.deepseek.com/v1"
+    compatibility_profile: "deepseek"
+    normalize_developer_role: true
+routing:
+  routes:
+    - name: "default"
+      targets:
+        - provider: deepseek
+`
+	if err := os.WriteFile(configPath, []byte(configBody), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	manager, err := NewManager(configPath)
+	if err != nil {
+		t.Fatalf("NewManager returned error: %v", err)
+	}
+
+	provider := manager.Get().Providers["deepseek"]
+	if provider.CompatibilityProfile != "deepseek" {
+		t.Fatalf("provider compatibility_profile = %q, want %q", provider.CompatibilityProfile, "deepseek")
+	}
+	if !provider.NormalizeDeveloperRole {
+		t.Fatalf("provider normalize_developer_role = false, want true")
+	}
+}

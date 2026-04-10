@@ -99,6 +99,12 @@ func (t *OllamaTranslator) TranslateRequest(ctx context.Context, req *models.Uni
 		msgs = append(msgs, ollamaMessage{Role: m.Role, Content: messageContentToString(m.Content)})
 	}
 
+	selectedTools, toolChoiceInstruction, toolChoiceMode, err := resolveOllamaToolChoice(req.Tools, req.ToolChoice)
+	if err != nil {
+		return nil, err
+	}
+	msgs = applyOllamaToolChoiceInstruction(msgs, toolChoiceInstruction)
+
 	options := make(map[string]interface{}, 4)
 	if req.Temperature != nil {
 		options["temperature"] = *req.Temperature
@@ -126,9 +132,9 @@ func (t *OllamaTranslator) TranslateRequest(ctx context.Context, req *models.Uni
 		// Ollama tool calling on /api/chat requires stream=false.
 		// We still expose streaming to clients by converting the final JSON
 		// response into a single streamed chunk at the gateway layer.
-		Stream:  req.Stream && len(req.Tools) == 0,
+		Stream:  req.Stream && len(selectedTools) == 0,
 		Think:   resolveOllamaThink(req, t.cfg),
-		Tools:   req.Tools,
+		Tools:   selectedTools,
 		Format:  format,
 		Options: options,
 	}
@@ -148,6 +154,7 @@ func (t *OllamaTranslator) TranslateRequest(ctx context.Context, req *models.Uni
 		Strs("message_roles", ollamaMessageRoles(ollamaReq.Messages)).
 		Int("tools_count", len(ollamaReq.Tools)).
 		Strs("tool_names", ollamaToolNames(ollamaReq.Tools)).
+		Str("tool_choice_mode", toolChoiceMode).
 		Bool("has_think", ollamaReq.Think != nil).
 		Bool("has_format", ollamaReq.Format != nil).
 		RawJSON("upstream_payload", body).
@@ -460,6 +467,159 @@ func mapOllamaDoneReason(reason string) *string {
 		mapped = r
 	}
 	return &mapped
+}
+
+func resolveOllamaToolChoice(tools []models.Tool, choice interface{}) ([]models.Tool, string, string, error) {
+	mode, functionName, err := parseOllamaToolChoice(choice)
+	if err != nil {
+		return nil, "", "", err
+	}
+	if mode == "" {
+		mode = "auto"
+	}
+
+	switch mode {
+	case "auto":
+		return tools, "", mode, nil
+	case "none":
+		return nil, "", mode, nil
+	case "required":
+		if len(tools) == 0 {
+			return nil, "", "", &ProviderError{
+				StatusCode: 400,
+				Message:    "tool_choice=required requires at least one tool",
+				Type:       "invalid_request_error",
+				Provider:   "ollama",
+			}
+		}
+		return tools, "You must call one of the available tools before responding to the user. Do not answer directly without a tool call.", mode, nil
+	case "function":
+		if len(tools) == 0 {
+			return nil, "", "", &ProviderError{
+				StatusCode: 400,
+				Message:    "tool_choice=function requires at least one tool",
+				Type:       "invalid_request_error",
+				Provider:   "ollama",
+			}
+		}
+		filtered := make([]models.Tool, 0, 1)
+		for i := range tools {
+			if strings.TrimSpace(tools[i].Function.Name) == functionName {
+				filtered = append(filtered, tools[i])
+			}
+		}
+		if len(filtered) == 0 {
+			return nil, "", "", &ProviderError{
+				StatusCode: 400,
+				Message:    fmt.Sprintf("tool_choice references unknown tool %q", functionName),
+				Type:       "invalid_request_error",
+				Provider:   "ollama",
+			}
+		}
+		instruction := fmt.Sprintf("You must call the function %q before responding to the user. Do not answer directly without a tool call.", functionName)
+		return filtered, instruction, mode + ":" + functionName, nil
+	default:
+		return nil, "", "", &ProviderError{
+			StatusCode: 400,
+			Message:    fmt.Sprintf("unsupported tool_choice %q for ollama", mode),
+			Type:       "invalid_request_error",
+			Provider:   "ollama",
+		}
+	}
+}
+
+func parseOllamaToolChoice(choice interface{}) (mode string, functionName string, err error) {
+	if choice == nil {
+		return "auto", "", nil
+	}
+	if s, ok := choice.(string); ok {
+		switch strings.TrimSpace(strings.ToLower(s)) {
+		case "", "auto":
+			return "auto", "", nil
+		case "none":
+			return "none", "", nil
+		case "required", "any":
+			return "required", "", nil
+		default:
+			return "", "", &ProviderError{
+				StatusCode: 400,
+				Message:    fmt.Sprintf("unsupported tool_choice %q for ollama", s),
+				Type:       "invalid_request_error",
+				Provider:   "ollama",
+			}
+		}
+	}
+
+	var obj struct {
+		Type     string `json:"type"`
+		Function *struct {
+			Name string `json:"name"`
+		} `json:"function"`
+	}
+	b, marshalErr := json.Marshal(choice)
+	if marshalErr != nil {
+		return "", "", &ProviderError{
+			StatusCode: 400,
+			Message:    "invalid tool_choice payload",
+			Type:       "invalid_request_error",
+			Provider:   "ollama",
+		}
+	}
+	if unmarshalErr := json.Unmarshal(b, &obj); unmarshalErr != nil {
+		return "", "", &ProviderError{
+			StatusCode: 400,
+			Message:    "invalid tool_choice payload",
+			Type:       "invalid_request_error",
+			Provider:   "ollama",
+		}
+	}
+
+	switch strings.TrimSpace(strings.ToLower(obj.Type)) {
+	case "", "auto":
+		return "auto", "", nil
+	case "none":
+		return "none", "", nil
+	case "required", "any":
+		return "required", "", nil
+	case "function":
+		if obj.Function == nil || strings.TrimSpace(obj.Function.Name) == "" {
+			return "", "", &ProviderError{
+				StatusCode: 400,
+				Message:    "tool_choice.function.name is required",
+				Type:       "invalid_request_error",
+				Provider:   "ollama",
+			}
+		}
+		return "function", strings.TrimSpace(obj.Function.Name), nil
+	default:
+		return "", "", &ProviderError{
+			StatusCode: 400,
+			Message:    fmt.Sprintf("unsupported tool_choice type %q for ollama", obj.Type),
+			Type:       "invalid_request_error",
+			Provider:   "ollama",
+		}
+	}
+}
+
+func applyOllamaToolChoiceInstruction(messages []ollamaMessage, instruction string) []ollamaMessage {
+	if strings.TrimSpace(instruction) == "" {
+		return messages
+	}
+
+	out := append([]ollamaMessage(nil), messages...)
+	for i := range out {
+		if strings.TrimSpace(out[i].Role) != "system" {
+			continue
+		}
+		if strings.TrimSpace(out[i].Content) == "" {
+			out[i].Content = instruction
+		} else {
+			out[i].Content += "\n\nTool-use requirement:\n" + instruction
+		}
+		return out
+	}
+
+	return append([]ollamaMessage{{Role: "system", Content: instruction}}, out...)
 }
 
 func ollamaMessageRoles(messages []ollamaMessage) []string {

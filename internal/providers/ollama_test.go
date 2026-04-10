@@ -3,7 +3,9 @@ package providers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/lunargate-ai/gateway/internal/config"
@@ -155,5 +157,155 @@ func TestOllamaTranslator_TranslateRequest_KeepsUpstreamStreamingWithoutTools(t 
 	}
 	if !stream {
 		t.Fatalf("expected upstream stream=true when no tools are present, got false")
+	}
+}
+
+func TestOllamaTranslator_TranslateRequest_ToolChoiceNoneOmitsTools(t *testing.T) {
+	translator := NewOllamaTranslator(config.ProviderConfig{
+		BaseURL:      "http://localhost:11434",
+		DefaultModel: "gemma3",
+	})
+
+	req, err := translator.TranslateRequest(context.Background(), &models.UnifiedRequest{
+		Model:      "gemma3",
+		Messages:   []models.Message{{Role: "user", Content: "hello"}},
+		ToolChoice: "none",
+		Tools: []models.Tool{{
+			Type: "function",
+			Function: models.ToolFunction{
+				Name: "get_weather",
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	payload := decodeOllamaRequestBody(t, req.Body)
+	if _, ok := payload["tools"]; ok {
+		t.Fatalf("expected tools to be omitted for tool_choice=none, got %#v", payload["tools"])
+	}
+}
+
+func TestOllamaTranslator_TranslateRequest_ToolChoiceRequiredAddsInstruction(t *testing.T) {
+	translator := NewOllamaTranslator(config.ProviderConfig{
+		BaseURL:      "http://localhost:11434",
+		DefaultModel: "gemma3",
+	})
+
+	req, err := translator.TranslateRequest(context.Background(), &models.UnifiedRequest{
+		Model:      "gemma3",
+		ToolChoice: "required",
+		Messages:   []models.Message{{Role: "system", Content: "You are helpful."}, {Role: "user", Content: "hello"}},
+		Tools: []models.Tool{{
+			Type: "function",
+			Function: models.ToolFunction{
+				Name: "get_weather",
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	payload := decodeOllamaRequestBody(t, req.Body)
+	messages, ok := payload["messages"].([]interface{})
+	if !ok || len(messages) == 0 {
+		t.Fatalf("expected messages array, got %#v", payload["messages"])
+	}
+	first, _ := messages[0].(map[string]interface{})
+	content, _ := first["content"].(string)
+	if !strings.Contains(content, "You must call one of the available tools") {
+		t.Fatalf("expected required tool instruction in system prompt, got %q", content)
+	}
+}
+
+func TestOllamaTranslator_TranslateRequest_ToolChoiceFunctionFiltersToolsAndAddsInstruction(t *testing.T) {
+	translator := NewOllamaTranslator(config.ProviderConfig{
+		BaseURL:      "http://localhost:11434",
+		DefaultModel: "gemma3",
+	})
+
+	req, err := translator.TranslateRequest(context.Background(), &models.UnifiedRequest{
+		Model: "gemma3",
+		ToolChoice: map[string]interface{}{
+			"type": "function",
+			"function": map[string]interface{}{
+				"name": "exec_command",
+			},
+		},
+		Messages: []models.Message{{Role: "user", Content: "hello"}},
+		Tools: []models.Tool{
+			{
+				Type: "function",
+				Function: models.ToolFunction{
+					Name: "exec_command",
+				},
+			},
+			{
+				Type: "function",
+				Function: models.ToolFunction{
+					Name: "write_stdin",
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	payload := decodeOllamaRequestBody(t, req.Body)
+	tools, ok := payload["tools"].([]interface{})
+	if !ok || len(tools) != 1 {
+		t.Fatalf("expected exactly one filtered tool, got %#v", payload["tools"])
+	}
+	tool, _ := tools[0].(map[string]interface{})
+	function, _ := tool["function"].(map[string]interface{})
+	if got, _ := function["name"].(string); got != "exec_command" {
+		t.Fatalf("expected filtered tool exec_command, got %q", got)
+	}
+	messages, _ := payload["messages"].([]interface{})
+	first, _ := messages[0].(map[string]interface{})
+	content, _ := first["content"].(string)
+	if !strings.Contains(content, `You must call the function "exec_command"`) {
+		t.Fatalf("expected forced tool instruction in system prompt, got %q", content)
+	}
+}
+
+func TestOllamaTranslator_TranslateRequest_ToolChoiceFunctionUnknownToolReturnsProviderError(t *testing.T) {
+	translator := NewOllamaTranslator(config.ProviderConfig{
+		BaseURL:      "http://localhost:11434",
+		DefaultModel: "gemma3",
+	})
+
+	_, err := translator.TranslateRequest(context.Background(), &models.UnifiedRequest{
+		Model: "gemma3",
+		ToolChoice: map[string]interface{}{
+			"type": "function",
+			"function": map[string]interface{}{
+				"name": "does_not_exist",
+			},
+		},
+		Messages: []models.Message{{Role: "user", Content: "hello"}},
+		Tools: []models.Tool{{
+			Type: "function",
+			Function: models.ToolFunction{
+				Name: "exec_command",
+			},
+		}},
+	})
+	if err == nil {
+		t.Fatal("expected error for unknown forced tool, got nil")
+	}
+
+	var providerErr *ProviderError
+	if !errors.As(err, &providerErr) {
+		t.Fatalf("expected ProviderError, got %T", err)
+	}
+	if providerErr.StatusCode != 400 {
+		t.Fatalf("expected status 400, got %d", providerErr.StatusCode)
+	}
+	if providerErr.Type != "invalid_request_error" {
+		t.Fatalf("expected invalid_request_error, got %q", providerErr.Type)
 	}
 }

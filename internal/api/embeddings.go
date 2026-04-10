@@ -515,7 +515,8 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 		collectorErrCode := "provider_parse_error"
 		errMsg := "failed to parse provider response: " + err.Error()
 		metricErrType := "parse_error"
-		if pe, ok := err.(*providers.ProviderError); ok {
+		var pe *providers.ProviderError
+		if errors.As(err, &pe) {
 			if pe.StatusCode != 0 {
 				status = pe.StatusCode
 			}

@@ -85,7 +85,7 @@ func (t *OpenAITranslator) BaseURL() string {
 }
 
 func (t *OpenAITranslator) TranslateRequest(ctx context.Context, req *models.UnifiedRequest) (*http.Request, error) {
-	reqCopy := *req
+	reqCopy := normalizeOpenAICompatibleRequestForProvider(*req, t.cfg)
 	reqCopy.Reasoning = nil
 	if reqCopy.Stream {
 		if reqCopy.StreamOptions == nil {
@@ -293,6 +293,67 @@ func (t *OpenAITranslator) ParseStreamChunk(data []byte) (*models.StreamChunk, e
 	}
 
 	return &chunk, nil
+}
+
+func normalizeOpenAICompatibleRequestForProvider(req models.UnifiedRequest, cfg config.ProviderConfig) models.UnifiedRequest {
+	if !shouldNormalizeDeveloperRole(cfg) {
+		return req
+	}
+
+	if len(req.Messages) == 0 {
+		return req
+	}
+
+	req.Messages = append([]models.Message(nil), req.Messages...)
+	for i := range req.Messages {
+		if strings.EqualFold(strings.TrimSpace(req.Messages[i].Role), "developer") {
+			req.Messages[i].Role = "system"
+		}
+	}
+
+	return req
+}
+
+func shouldNormalizeDeveloperRole(cfg config.ProviderConfig) bool {
+	profile := strings.ToLower(strings.TrimSpace(cfg.CompatibilityProfile))
+	if profile == "" {
+		profile = strings.ToLower(strings.TrimSpace(providerExtraValue(cfg, "compatibility_profile")))
+	}
+	if profile == "deepseek" {
+		return true
+	}
+
+	if cfg.NormalizeDeveloperRole {
+		return true
+	}
+
+	if enabled, ok := providerExtraBool(cfg, "normalize_developer_role"); ok {
+		return enabled
+	}
+
+	return false
+}
+
+func providerExtraValue(cfg config.ProviderConfig, key string) string {
+	if cfg.Extra == nil {
+		return ""
+	}
+	return cfg.Extra[key]
+}
+
+func providerExtraBool(cfg config.ProviderConfig, key string) (bool, bool) {
+	raw := strings.TrimSpace(providerExtraValue(cfg, key))
+	if raw == "" {
+		return false, false
+	}
+	switch strings.ToLower(raw) {
+	case "1", "true", "yes", "on":
+		return true, true
+	case "0", "false", "no", "off":
+		return false, true
+	default:
+		return false, false
+	}
 }
 
 func unifiedToResponsesPayload(req *models.UnifiedRequest) *models.ResponsesRequest {

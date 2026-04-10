@@ -151,6 +151,194 @@ func TestOpenAITranslator_ResponsesUpstreamMapsReasoningEffort(t *testing.T) {
 	}
 }
 
+func TestOpenAITranslator_DeepSeekChatCompletionsNormalizesDeveloperRoleToSystem(t *testing.T) {
+	translator := NewOpenAITranslator(config.ProviderConfig{
+		Type:                 "openai",
+		APIKey:               "dummy",
+		BaseURL:              "https://api.deepseek.com/v1",
+		CompatibilityProfile: "deepseek",
+	})
+
+	req, err := translator.TranslateRequest(context.Background(), &models.UnifiedRequest{
+		Model: "deepseek-chat",
+		Messages: []models.Message{
+			{Role: "developer", Content: "You are a coding agent."},
+			{Role: "user", Content: "hello"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("failed to read request body: %v", err)
+	}
+
+	var payload models.UnifiedRequest
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("failed to unmarshal request payload: %v", err)
+	}
+
+	if len(payload.Messages) != 2 {
+		t.Fatalf("expected two messages, got %d", len(payload.Messages))
+	}
+	if got := payload.Messages[0].Role; got != "system" {
+		t.Fatalf("expected deepseek developer role to normalize to system, got %q", got)
+	}
+}
+
+func TestOpenAITranslator_DeepSeekResponsesNormalizesDeveloperRoleIntoInstructions(t *testing.T) {
+	translator := NewOpenAITranslator(config.ProviderConfig{
+		Type:                 "openai",
+		APIKey:               "dummy",
+		BaseURL:              "https://api.deepseek.com/v1",
+		CompatibilityProfile: "deepseek",
+	})
+
+	ctx := WithUpstreamRequestType(context.Background(), "responses")
+	req, err := translator.TranslateRequest(ctx, &models.UnifiedRequest{
+		Model: "deepseek-chat",
+		Messages: []models.Message{
+			{Role: "developer", Content: "Act only through tools."},
+			{Role: "user", Content: "hi"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("failed to read request body: %v", err)
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("failed to unmarshal request payload: %v", err)
+	}
+
+	if got, _ := payload["instructions"].(string); got != "Act only through tools." {
+		t.Fatalf("expected deepseek developer prompt to move into instructions, got %q", got)
+	}
+
+	input, ok := payload["input"].([]interface{})
+	if !ok {
+		t.Fatalf("expected responses payload to contain input array")
+	}
+	for _, raw := range input {
+		item, _ := raw.(map[string]interface{})
+		if item == nil {
+			continue
+		}
+		if got, _ := item["role"].(string); got == "developer" {
+			t.Fatalf("did not expect developer role in deepseek responses payload")
+		}
+	}
+}
+
+func TestOpenAITranslator_OpenAIChatCompletionsPreservesDeveloperRole(t *testing.T) {
+	translator := NewOpenAITranslator(config.ProviderConfig{
+		APIKey:  "dummy",
+		BaseURL: "https://api.openai.com/v1",
+	})
+
+	req, err := translator.TranslateRequest(context.Background(), &models.UnifiedRequest{
+		Model: "gpt-5.4",
+		Messages: []models.Message{
+			{Role: "developer", Content: "You are a coding agent."},
+			{Role: "user", Content: "hello"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("failed to read request body: %v", err)
+	}
+
+	var payload models.UnifiedRequest
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("failed to unmarshal request payload: %v", err)
+	}
+
+	if len(payload.Messages) != 2 {
+		t.Fatalf("expected two messages, got %d", len(payload.Messages))
+	}
+	if got := payload.Messages[0].Role; got != "developer" {
+		t.Fatalf("expected openai developer role to be preserved, got %q", got)
+	}
+}
+
+func TestOpenAITranslator_ExplicitNormalizeDeveloperRoleToggle(t *testing.T) {
+	translator := NewOpenAITranslator(config.ProviderConfig{
+		Type:                   "openai",
+		APIKey:                 "dummy",
+		BaseURL:                "https://api.example.test/v1",
+		NormalizeDeveloperRole: true,
+	})
+
+	req, err := translator.TranslateRequest(context.Background(), &models.UnifiedRequest{
+		Model: "test-model",
+		Messages: []models.Message{
+			{Role: "developer", Content: "normalize me"},
+			{Role: "user", Content: "hello"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("failed to read request body: %v", err)
+	}
+
+	var payload models.UnifiedRequest
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("failed to unmarshal request payload: %v", err)
+	}
+	if got := payload.Messages[0].Role; got != "system" {
+		t.Fatalf("expected normalize_developer_role=true to normalize role, got %q", got)
+	}
+}
+
+func TestOpenAITranslator_ProfileOverridesNormalizeDeveloperRoleFalse(t *testing.T) {
+	translator := NewOpenAITranslator(config.ProviderConfig{
+		Type:                   "openai",
+		APIKey:                 "dummy",
+		BaseURL:                "https://api.deepseek.com/v1",
+		CompatibilityProfile:   "deepseek",
+		NormalizeDeveloperRole: false,
+	})
+
+	req, err := translator.TranslateRequest(context.Background(), &models.UnifiedRequest{
+		Model: "deepseek-chat",
+		Messages: []models.Message{
+			{Role: "developer", Content: "normalize me"},
+			{Role: "user", Content: "hello"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("failed to read request body: %v", err)
+	}
+
+	var payload models.UnifiedRequest
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("failed to unmarshal request payload: %v", err)
+	}
+	if got := payload.Messages[0].Role; got != "system" {
+		t.Fatalf("expected compatibility_profile=deepseek to force normalization, got %q", got)
+	}
+}
+
 func TestOpenAITranslator_ResponsesUpstreamFunctionCallIDsAreFCAndCallIDIsPreserved(t *testing.T) {
 	translator := NewOpenAITranslator(config.ProviderConfig{
 		APIKey:  "dummy",

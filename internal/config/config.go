@@ -45,16 +45,18 @@ func (s ServerConfig) Address() string {
 }
 
 type ProviderConfig struct {
-	Type         string               `mapstructure:"type"`
-	APIKey       string               `mapstructure:"api_key"`
-	BaseURL      string               `mapstructure:"base_url"`
-	DefaultModel string               `mapstructure:"default_model"`
-	Organization string               `mapstructure:"organization"`
-	APIVersion   string               `mapstructure:"api_version"`
-	Timeout      time.Duration        `mapstructure:"timeout"`
-	TimeoutMode  string               `mapstructure:"timeout_mode"`
-	Extra        map[string]string    `mapstructure:"extra"`
-	Models       ProviderModelsConfig `mapstructure:"models"`
+	Type                   string               `mapstructure:"type"`
+	APIKey                 string               `mapstructure:"api_key"`
+	BaseURL                string               `mapstructure:"base_url"`
+	DefaultModel           string               `mapstructure:"default_model"`
+	Organization           string               `mapstructure:"organization"`
+	APIVersion             string               `mapstructure:"api_version"`
+	Timeout                time.Duration        `mapstructure:"timeout"`
+	TimeoutMode            string               `mapstructure:"timeout_mode"`
+	CompatibilityProfile   string               `mapstructure:"compatibility_profile"`
+	NormalizeDeveloperRole bool                 `mapstructure:"normalize_developer_role"`
+	Extra                  map[string]string    `mapstructure:"extra"`
+	Models                 ProviderModelsConfig `mapstructure:"models"`
 }
 
 type ProviderModelsConfig struct {

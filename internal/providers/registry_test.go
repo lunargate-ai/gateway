@@ -67,3 +67,37 @@ func TestRegistry_UpdateProvidersConfig_PreservesExistingRegistryOnInvalidReload
 		t.Fatalf("expected original base URL to remain, got %q", got)
 	}
 }
+
+func TestRegistry_RegistersCustomOpenAICompatibleProvider(t *testing.T) {
+	reg := NewRegistry(map[string]config.ProviderConfig{
+		"deepseek": {
+			Type:                 "openai",
+			APIKey:               "dummy",
+			BaseURL:              "https://api.deepseek.com/v1",
+			CompatibilityProfile: "deepseek",
+		},
+	})
+
+	providerType, ok := reg.Type("deepseek")
+	if !ok {
+		t.Fatalf("expected deepseek provider type to be registered")
+	}
+	if providerType != "openai" {
+		t.Fatalf("expected provider type openai, got %q", providerType)
+	}
+
+	translatorAny, ok := reg.Get("deepseek")
+	if !ok {
+		t.Fatalf("expected deepseek translator to be registered")
+	}
+	translator, ok := translatorAny.(*OpenAITranslator)
+	if !ok {
+		t.Fatalf("expected custom provider to use OpenAI-compatible translator, got %T", translatorAny)
+	}
+	if got := translator.Name(); got != "openai" {
+		t.Fatalf("expected translator name openai, got %q", got)
+	}
+	if got := translator.BaseURL(); got != "https://api.deepseek.com/v1" {
+		t.Fatalf("expected deepseek default base URL, got %q", got)
+	}
+}
