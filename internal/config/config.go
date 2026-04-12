@@ -49,6 +49,9 @@ type ProviderConfig struct {
 	APIKey                 string               `mapstructure:"api_key"`
 	BaseURL                string               `mapstructure:"base_url"`
 	DefaultModel           string               `mapstructure:"default_model"`
+	Temperature            *float64             `mapstructure:"temperature"`
+	TopP                   *float64             `mapstructure:"top_p"`
+	TopK                   *int                 `mapstructure:"top_k"`
 	Organization           string               `mapstructure:"organization"`
 	APIVersion             string               `mapstructure:"api_version"`
 	Timeout                time.Duration        `mapstructure:"timeout"`

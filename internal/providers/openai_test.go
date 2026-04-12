@@ -49,6 +49,42 @@ func TestOpenAITranslator_StreamingRequestIncludesUsage(t *testing.T) {
 	}
 }
 
+func TestOpenAITranslator_UsesProviderDefaultSamplingOptions(t *testing.T) {
+	defaultTemperature := 1.0
+	defaultTopP := 0.95
+	translator := NewOpenAITranslator(config.ProviderConfig{
+		APIKey:      "dummy",
+		BaseURL:     "https://api.openai.com/v1",
+		Temperature: &defaultTemperature,
+		TopP:        &defaultTopP,
+	})
+
+	req, err := translator.TranslateRequest(context.Background(), &models.UnifiedRequest{
+		Model:    "gpt-5.4",
+		Messages: []models.Message{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("failed to read request body: %v", err)
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("failed to unmarshal request payload: %v", err)
+	}
+
+	if got, ok := payload["temperature"].(float64); !ok || got != 1.0 {
+		t.Fatalf("expected temperature=1.0 in upstream payload, got %#v", payload["temperature"])
+	}
+	if got, ok := payload["top_p"].(float64); !ok || got != 0.95 {
+		t.Fatalf("expected top_p=0.95 in upstream payload, got %#v", payload["top_p"])
+	}
+}
+
 func TestOpenAITranslator_ResponsesUpstreamUsesResponsesEndpoint(t *testing.T) {
 	translator := NewOpenAITranslator(config.ProviderConfig{
 		APIKey:  "dummy",

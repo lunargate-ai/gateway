@@ -296,6 +296,15 @@ func (t *OpenAITranslator) ParseStreamChunk(data []byte) (*models.StreamChunk, e
 }
 
 func normalizeOpenAICompatibleRequestForProvider(req models.UnifiedRequest, cfg config.ProviderConfig) models.UnifiedRequest {
+	if req.Temperature == nil && cfg.Temperature != nil {
+		v := *cfg.Temperature
+		req.Temperature = &v
+	}
+	if req.TopP == nil && cfg.TopP != nil {
+		v := *cfg.TopP
+		req.TopP = &v
+	}
+
 	if !shouldNormalizeDeveloperRole(cfg) {
 		return req
 	}

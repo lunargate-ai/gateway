@@ -55,8 +55,8 @@ type anthropicRequest struct {
 	TopP          *float64           `json:"top_p,omitempty"`
 	Stream        bool               `json:"stream,omitempty"`
 	StopSequences []string           `json:"stop_sequences,omitempty"`
-	Tools         []anthropicTool     `json:"tools,omitempty"`
-	ToolChoice    interface{}         `json:"tool_choice,omitempty"`
+	Tools         []anthropicTool    `json:"tools,omitempty"`
+	ToolChoice    interface{}        `json:"tool_choice,omitempty"`
 }
 
 type anthropicMessage struct {
@@ -65,13 +65,13 @@ type anthropicMessage struct {
 }
 
 type anthropicResponse struct {
-	ID           string               `json:"id"`
-	Type         string               `json:"type"`
-	Role         string               `json:"role"`
-	Content      []anthropicContentBlock `json:"content"`
-	Model        string               `json:"model"`
-	StopReason   *string              `json:"stop_reason"`
-	Usage        anthropicUsage       `json:"usage"`
+	ID         string                  `json:"id"`
+	Type       string                  `json:"type"`
+	Role       string                  `json:"role"`
+	Content    []anthropicContentBlock `json:"content"`
+	Model      string                  `json:"model"`
+	StopReason *string                 `json:"stop_reason"`
+	Usage      anthropicUsage          `json:"usage"`
 }
 
 type anthropicContentBlock struct {
@@ -146,14 +146,24 @@ func (t *AnthropicTranslator) TranslateRequest(ctx context.Context, req *models.
 	if req.MaxTokens != nil {
 		maxTokens = *req.MaxTokens
 	}
+	temperature := req.Temperature
+	if temperature == nil && t.cfg.Temperature != nil {
+		v := *t.cfg.Temperature
+		temperature = &v
+	}
+	topP := req.TopP
+	if topP == nil && t.cfg.TopP != nil {
+		v := *t.cfg.TopP
+		topP = &v
+	}
 
 	anthropicReq := anthropicRequest{
 		Model:       req.Model,
 		MaxTokens:   maxTokens,
 		Messages:    messages,
 		System:      systemPrompt,
-		Temperature: req.Temperature,
-		TopP:        req.TopP,
+		Temperature: temperature,
+		TopP:        topP,
 		Stream:      req.Stream,
 		Tools:       mapOpenAIToolsToAnthropic(req.Tools),
 		ToolChoice:  mapOpenAIToolChoiceToAnthropic(req.ToolChoice),

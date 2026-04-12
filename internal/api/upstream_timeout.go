@@ -159,11 +159,13 @@ func (b *timeoutBody) Close() error {
 type providerClientRegistry struct {
 	mu      sync.RWMutex
 	clients map[string]providerClientConfig
+	configs map[string]config.ProviderConfig
 }
 
 func newProviderClientRegistry(providerConfigs map[string]config.ProviderConfig) *providerClientRegistry {
 	return &providerClientRegistry{
 		clients: buildProviderClients(providerConfigs),
+		configs: cloneProviderConfigs(providerConfigs),
 	}
 }
 
@@ -174,9 +176,28 @@ func (r *providerClientRegistry) Get(providerID string) (providerClientConfig, b
 	return cfg, ok
 }
 
+func (r *providerClientRegistry) Config(providerID string) (config.ProviderConfig, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	cfg, ok := r.configs[providerID]
+	return cfg, ok
+}
+
 func (r *providerClientRegistry) Update(providerConfigs map[string]config.ProviderConfig) {
 	clients := buildProviderClients(providerConfigs)
 	r.mu.Lock()
 	r.clients = clients
+	r.configs = cloneProviderConfigs(providerConfigs)
 	r.mu.Unlock()
+}
+
+func cloneProviderConfigs(providerConfigs map[string]config.ProviderConfig) map[string]config.ProviderConfig {
+	if len(providerConfigs) == 0 {
+		return map[string]config.ProviderConfig{}
+	}
+	out := make(map[string]config.ProviderConfig, len(providerConfigs))
+	for providerID, providerCfg := range providerConfigs {
+		out[providerID] = providerCfg
+	}
+	return out
 }

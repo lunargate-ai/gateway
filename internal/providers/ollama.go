@@ -105,12 +105,21 @@ func (t *OllamaTranslator) TranslateRequest(ctx context.Context, req *models.Uni
 	}
 	msgs = applyOllamaToolChoiceInstruction(msgs, toolChoiceInstruction)
 
-	options := make(map[string]interface{}, 4)
+	options := make(map[string]interface{}, 5)
 	if req.Temperature != nil {
 		options["temperature"] = *req.Temperature
+	} else if t.cfg.Temperature != nil {
+		options["temperature"] = *t.cfg.Temperature
 	}
 	if req.TopP != nil {
 		options["top_p"] = *req.TopP
+	} else if t.cfg.TopP != nil {
+		options["top_p"] = *t.cfg.TopP
+	}
+	if req.TopK != nil {
+		options["top_k"] = *req.TopK
+	} else if t.cfg.TopK != nil {
+		options["top_k"] = *t.cfg.TopK
 	}
 	if req.MaxTokens != nil {
 		options["num_predict"] = *req.MaxTokens
@@ -129,11 +138,11 @@ func (t *OllamaTranslator) TranslateRequest(ctx context.Context, req *models.Uni
 	ollamaReq := ollamaChatRequest{
 		Model:    req.Model,
 		Messages: msgs,
-		Stream:  req.Stream,
-		Think:   resolveOllamaThink(req, t.cfg),
-		Tools:   selectedTools,
-		Format:  format,
-		Options: options,
+		Stream:   req.Stream,
+		Think:    resolveOllamaThink(req, t.cfg),
+		Tools:    selectedTools,
+		Format:   format,
+		Options:  options,
 	}
 
 	body, err := json.Marshal(ollamaReq)

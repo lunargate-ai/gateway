@@ -157,6 +157,56 @@ func parseUnifiedRequest(w http.ResponseWriter, r *http.Request, captureBody boo
 	return body, &req, true
 }
 
+type collectorInferenceParameters struct {
+	Temperature *float64
+	TopP        *float64
+	TopK        *int
+}
+
+func (p collectorInferenceParameters) hasAny() bool {
+	return p.Temperature != nil || p.TopP != nil || p.TopK != nil
+}
+
+func buildCollectorRequestLogPayload(body []byte, params collectorInferenceParameters) interface{} {
+	var reqAny interface{}
+	if len(body) > 0 {
+		_ = json.Unmarshal(body, &reqAny)
+	}
+	if !params.hasAny() {
+		return reqAny
+	}
+
+	var requestObj map[string]interface{}
+	if existing, ok := reqAny.(map[string]interface{}); ok && existing != nil {
+		requestObj = existing
+	} else {
+		requestObj = map[string]interface{}{}
+		if reqAny != nil {
+			requestObj["request_raw"] = reqAny
+		}
+	}
+
+	meta := map[string]interface{}{}
+	if existingMeta, ok := requestObj["_lunargate"].(map[string]interface{}); ok && existingMeta != nil {
+		meta = existingMeta
+	}
+
+	inference := map[string]interface{}{}
+	if params.Temperature != nil {
+		inference["temperature"] = *params.Temperature
+	}
+	if params.TopP != nil {
+		inference["top_p"] = *params.TopP
+	}
+	if params.TopK != nil {
+		inference["top_k"] = *params.TopK
+	}
+	meta["inference_parameters"] = inference
+	requestObj["_lunargate"] = meta
+
+	return requestObj
+}
+
 func setTimingHeaders(w http.ResponseWriter, totalMS int64, overheadMS int64) {
 	if totalMS >= 0 {
 		w.Header().Set("X-LunarGate-Latency-Ms", strconv.FormatInt(totalMS, 10))
@@ -397,6 +447,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	resolvedSampling := h.resolveCollectorInferenceParameters(resolved.Target.Provider, &req)
 
 	noCache := r.Header.Get("X-LunarGate-No-Cache") == "true"
 	if !req.Stream && !noCache && h.cache.Enabled() {
@@ -435,7 +486,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		Msg("routing request")
 
 	if h.collector != nil {
-		traceTags := h.enrichCollectorTags(headers, resolved.Target.Provider, req.Model, req.Stream)
+		traceTags := h.enrichCollectorTagsWithInference(headers, resolved.Target.Provider, req.Model, req.Stream, resolvedSampling)
 		startEvt := []observability.Event{{
 			Type: "trace",
 			Data: observability.TraceEventData{
@@ -463,6 +514,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	requestCtx := requestContextWithRetryPolicy(r)
 	resp, usedTarget, fallbackUsed, retryCount, cbState, err := h.fallback.Execute(requestCtx, resolved.Target, resolved.Fallbacks, executeFunc)
 	h.observeCircuitBreakerState(usedTarget.Provider, cbState)
+	usedSampling := h.resolveCollectorInferenceParameters(usedTarget.Provider, &req)
 	if err != nil {
 		duration := time.Since(startTime)
 		status := http.StatusBadGateway
@@ -534,13 +586,12 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 					FallbackUsed:         fallbackUsed,
 					RetryCount:           retryCount,
 					CircuitBreakerState:  &cbState,
-					Tags:                 h.enrichCollectorTags(headers, usedTarget.Provider, req.Model, req.Stream),
+					Tags:                 h.enrichCollectorTagsWithInference(headers, usedTarget.Provider, req.Model, req.Stream, usedSampling),
 				},
 			}}
 
 			if h.collector.SharePrompts() {
-				var reqAny interface{}
-				_ = json.Unmarshal(body, &reqAny)
+				reqAny := buildCollectorRequestLogPayload(body, usedSampling)
 				events = append(events, observability.Event{
 					Type: "request_log",
 					Data: observability.RequestLogEventData{
@@ -559,7 +610,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 						RetryCount:   retryCount,
 						ErrorCode:    &errCodeForCollector,
 						ErrorMessage: &errMsgForCollector,
-						Tags:         h.enrichCollectorTags(headers, usedTarget.Provider, req.Model, req.Stream),
+						Tags:         h.enrichCollectorTagsWithInference(headers, usedTarget.Provider, req.Model, req.Stream, usedSampling),
 						Request:      reqAny,
 					},
 				})
@@ -858,14 +909,14 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 					FallbackUsed:         fallbackUsed,
 					RetryCount:           retryCount,
 					CircuitBreakerState:  &cbState,
-					Tags:                 h.enrichCollectorTags(headers, usedTarget.Provider, usedModelCanonical, req.Stream),
+					Tags:                 h.enrichCollectorTagsWithInference(headers, usedTarget.Provider, usedModelCanonical, req.Stream, usedSampling),
 				},
 			}}
 
 			if h.collector.SharePrompts() || h.collector.ShareResponses() {
 				var reqObj interface{}
 				if h.collector.SharePrompts() {
-					_ = json.Unmarshal(body, &reqObj)
+					reqObj = buildCollectorRequestLogPayload(body, usedSampling)
 				}
 
 				var respObj interface{}
@@ -928,7 +979,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 						RetryCount:   retryCount,
 						ErrorCode:    errCodePtr,
 						ErrorMessage: errMsgPtr,
-						Tags:         h.enrichCollectorTags(headers, usedTarget.Provider, usedModelCanonical, req.Stream),
+						Tags:         h.enrichCollectorTagsWithInference(headers, usedTarget.Provider, usedModelCanonical, req.Stream, usedSampling),
 						Request:      reqObj,
 						Response:     respObj,
 					},
@@ -1025,13 +1076,12 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 					FallbackUsed:         fallbackUsed,
 					RetryCount:           retryCount,
 					CircuitBreakerState:  &cbState,
-					Tags:                 h.enrichCollectorTags(headers, usedTarget.Provider, usedModelCanonical, req.Stream),
+					Tags:                 h.enrichCollectorTagsWithInference(headers, usedTarget.Provider, usedModelCanonical, req.Stream, usedSampling),
 				},
 			}}
 
 			if h.collector.SharePrompts() {
-				var reqAny interface{}
-				_ = json.Unmarshal(body, &reqAny)
+				reqAny := buildCollectorRequestLogPayload(body, usedSampling)
 				events = append(events, observability.Event{
 					Type: "request_log",
 					Data: observability.RequestLogEventData{
@@ -1050,7 +1100,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 						RetryCount:   retryCount,
 						ErrorCode:    &errCode,
 						ErrorMessage: &errMsg,
-						Tags:         h.enrichCollectorTags(headers, usedTarget.Provider, usedModelCanonical, req.Stream),
+						Tags:         h.enrichCollectorTagsWithInference(headers, usedTarget.Provider, usedModelCanonical, req.Stream, usedSampling),
 						Request:      reqAny,
 					},
 				})
@@ -1125,7 +1175,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				FallbackUsed:         fallbackUsed,
 				RetryCount:           retryCount,
 				CircuitBreakerState:  &cbState,
-				Tags:                 h.enrichCollectorTags(headers, usedTarget.Provider, usedModelCanonical, req.Stream),
+				Tags:                 h.enrichCollectorTagsWithInference(headers, usedTarget.Provider, usedModelCanonical, req.Stream, usedSampling),
 			},
 		}}
 
@@ -1133,7 +1183,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			var reqObj interface{}
 			var respObj interface{}
 			if h.collector.SharePrompts() {
-				_ = json.Unmarshal(body, &reqObj)
+				reqObj = buildCollectorRequestLogPayload(body, usedSampling)
 			}
 			if h.collector.ShareResponses() {
 				respBytes, _ := json.Marshal(unified)
@@ -1155,7 +1205,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 					CacheHit:     cacheHit,
 					FallbackUsed: fallbackUsed,
 					RetryCount:   retryCount,
-					Tags:         h.enrichCollectorTags(headers, usedTarget.Provider, req.Model, req.Stream),
+					Tags:         h.enrichCollectorTagsWithInference(headers, usedTarget.Provider, req.Model, req.Stream, usedSampling),
 					Request:      reqObj,
 					Response:     respObj,
 				},
@@ -1313,6 +1363,52 @@ func (h *Handler) enrichCollectorTags(headers map[string]string, provider string
 		}
 	}
 	return tags
+}
+
+func (h *Handler) enrichCollectorTagsWithInference(headers map[string]string, provider string, model string, stream bool, params collectorInferenceParameters) map[string]string {
+	tags := h.enrichCollectorTags(headers, provider, model, stream)
+	if params.Temperature != nil {
+		tags["x-lunargate-inference-temperature"] = strconv.FormatFloat(*params.Temperature, 'f', -1, 64)
+	}
+	if params.TopP != nil {
+		tags["x-lunargate-inference-top-p"] = strconv.FormatFloat(*params.TopP, 'f', -1, 64)
+	}
+	if params.TopK != nil {
+		tags["x-lunargate-inference-top-k"] = strconv.Itoa(*params.TopK)
+	}
+	return tags
+}
+
+func (h *Handler) resolveCollectorInferenceParameters(provider string, req *models.UnifiedRequest) collectorInferenceParameters {
+	params := collectorInferenceParameters{}
+	if req != nil {
+		params.Temperature = req.Temperature
+		params.TopP = req.TopP
+		params.TopK = req.TopK
+	}
+
+	if h == nil || h.providerClients == nil {
+		return params
+	}
+	providerCfg, ok := h.providerClients.Config(provider)
+	if !ok {
+		return params
+	}
+	if params.Temperature == nil && providerCfg.Temperature != nil {
+		v := *providerCfg.Temperature
+		params.Temperature = &v
+	}
+	if params.TopP == nil && providerCfg.TopP != nil {
+		v := *providerCfg.TopP
+		params.TopP = &v
+	}
+	if params.TopK == nil && providerCfg.TopK != nil {
+		if providerType, typeOK := h.registry.Type(provider); typeOK && strings.EqualFold(providerType, "ollama") {
+			v := *providerCfg.TopK
+			params.TopK = &v
+		}
+	}
+	return params
 }
 
 func (h *Handler) executeChatCompletionsUnified(r *http.Request) (int, http.Header, *models.UnifiedResponse, []byte, error) {

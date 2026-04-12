@@ -28,6 +28,19 @@ func decodeOllamaRequestBody(t *testing.T, reqBody io.Reader) map[string]interfa
 	return payload
 }
 
+func decodeOllamaOptions(t *testing.T, payload map[string]interface{}) map[string]interface{} {
+	t.Helper()
+	raw, ok := payload["options"]
+	if !ok {
+		t.Fatalf("expected options in payload, got %#v", payload)
+	}
+	opts, ok := raw.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected options object, got %#v", raw)
+	}
+	return opts
+}
+
 func TestOllamaTranslator_TranslateRequest_MapsReasoningEffortToThink(t *testing.T) {
 	translator := NewOllamaTranslator(config.ProviderConfig{
 		BaseURL:      "http://localhost:11434",
@@ -96,6 +109,74 @@ func TestOllamaTranslator_TranslateRequest_UsesProviderDefaultThink(t *testing.T
 	think, ok := payload["think"].(bool)
 	if !ok || !think {
 		t.Fatalf("expected think=true from provider extra, got %#v", payload["think"])
+	}
+}
+
+func TestOllamaTranslator_TranslateRequest_MapsSamplingOptions(t *testing.T) {
+	translator := NewOllamaTranslator(config.ProviderConfig{
+		BaseURL:      "http://localhost:11434",
+		DefaultModel: "gemma3",
+	})
+
+	temperature := 1.0
+	topP := 0.95
+	topK := 64
+	req, err := translator.TranslateRequest(context.Background(), &models.UnifiedRequest{
+		Model:       "gemma3",
+		Messages:    []models.Message{{Role: "user", Content: "hi"}},
+		Temperature: &temperature,
+		TopP:        &topP,
+		TopK:        &topK,
+	})
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	payload := decodeOllamaRequestBody(t, req.Body)
+	options := decodeOllamaOptions(t, payload)
+
+	if got, ok := options["temperature"].(float64); !ok || got != 1.0 {
+		t.Fatalf("expected options.temperature=1.0, got %#v", options["temperature"])
+	}
+	if got, ok := options["top_p"].(float64); !ok || got != 0.95 {
+		t.Fatalf("expected options.top_p=0.95, got %#v", options["top_p"])
+	}
+	if got, ok := options["top_k"].(float64); !ok || got != 64 {
+		t.Fatalf("expected options.top_k=64, got %#v", options["top_k"])
+	}
+}
+
+func TestOllamaTranslator_TranslateRequest_UsesProviderDefaultSamplingOptions(t *testing.T) {
+	defaultTemperature := 1.0
+	defaultTopP := 0.95
+	defaultTopK := 64
+	translator := NewOllamaTranslator(config.ProviderConfig{
+		BaseURL:      "http://localhost:11434",
+		DefaultModel: "gemma3",
+		Temperature:  &defaultTemperature,
+		TopP:         &defaultTopP,
+		TopK:         &defaultTopK,
+	})
+
+	req, err := translator.TranslateRequest(context.Background(), &models.UnifiedRequest{
+		Model:    "gemma3",
+		Messages: []models.Message{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	payload := decodeOllamaRequestBody(t, req.Body)
+	options := decodeOllamaOptions(t, payload)
+
+	if got, ok := options["temperature"].(float64); !ok || got != 1.0 {
+		t.Fatalf("expected provider default options.temperature=1.0, got %#v", options["temperature"])
+	}
+	if got, ok := options["top_p"].(float64); !ok || got != 0.95 {
+		t.Fatalf("expected provider default options.top_p=0.95, got %#v", options["top_p"])
+	}
+	if got, ok := options["top_k"].(float64); !ok || got != 64 {
+		t.Fatalf("expected provider default options.top_k=64, got %#v", options["top_k"])
 	}
 }
 

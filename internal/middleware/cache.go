@@ -49,6 +49,8 @@ func GenerateKey(req *models.UnifiedRequest) string {
 		Model      string           `json:"model"`
 		Messages   []models.Message `json:"messages"`
 		Temp       *float64         `json:"temperature,omitempty"`
+		TopP       *float64         `json:"top_p,omitempty"`
+		TopK       *int             `json:"top_k,omitempty"`
 		MaxTok     *int             `json:"max_tokens,omitempty"`
 		Tools      []models.Tool    `json:"tools,omitempty"`
 		ToolChoice interface{}      `json:"tool_choice,omitempty"`
@@ -56,6 +58,8 @@ func GenerateKey(req *models.UnifiedRequest) string {
 		Model:      req.Model,
 		Messages:   req.Messages,
 		Temp:       req.Temperature,
+		TopP:       req.TopP,
+		TopK:       req.TopK,
 		MaxTok:     req.MaxTokens,
 		Tools:      req.Tools,
 		ToolChoice: req.ToolChoice,

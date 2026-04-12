@@ -102,6 +102,43 @@ routing:
 	}
 }
 
+func TestNewManager_ParsesProviderSamplingDefaults(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	configBody := `providers:
+  ollama:
+    type: "ollama"
+    base_url: "http://localhost:11434"
+    default_model: "gemma4:26b"
+    temperature: 1.0
+    top_p: 0.95
+    top_k: 64
+routing:
+  routes:
+    - name: "default"
+      targets:
+        - provider: ollama
+`
+	if err := os.WriteFile(configPath, []byte(configBody), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	manager, err := NewManager(configPath)
+	if err != nil {
+		t.Fatalf("NewManager returned error: %v", err)
+	}
+
+	provider := manager.Get().Providers["ollama"]
+	if provider.Temperature == nil || *provider.Temperature != 1.0 {
+		t.Fatalf("provider temperature = %#v, want 1.0", provider.Temperature)
+	}
+	if provider.TopP == nil || *provider.TopP != 0.95 {
+		t.Fatalf("provider top_p = %#v, want 0.95", provider.TopP)
+	}
+	if provider.TopK == nil || *provider.TopK != 64 {
+		t.Fatalf("provider top_k = %#v, want 64", provider.TopK)
+	}
+}
+
 func TestNewManager_NormalizesSecurityAPIKeyConfig(t *testing.T) {
 	t.Setenv("CLIENT_API_KEY", "lg_client_test")
 
