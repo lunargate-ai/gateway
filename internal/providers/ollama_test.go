@@ -99,7 +99,7 @@ func TestOllamaTranslator_TranslateRequest_UsesProviderDefaultThink(t *testing.T
 	}
 }
 
-func TestOllamaTranslator_TranslateRequest_DisablesUpstreamStreamingWhenToolsArePresent(t *testing.T) {
+func TestOllamaTranslator_TranslateRequest_KeepsUpstreamStreamingWhenToolsArePresent(t *testing.T) {
 	translator := NewOllamaTranslator(config.ProviderConfig{
 		BaseURL:      "http://localhost:11434",
 		DefaultModel: "gemma3",
@@ -129,8 +129,8 @@ func TestOllamaTranslator_TranslateRequest_DisablesUpstreamStreamingWhenToolsAre
 	if !ok {
 		t.Fatalf("expected boolean stream flag, got %#v", payload["stream"])
 	}
-	if stream {
-		t.Fatalf("expected upstream stream=false when tools are present, got true")
+	if !stream {
+		t.Fatalf("expected upstream stream=true when tools are present, got false")
 	}
 }
 

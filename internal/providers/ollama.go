@@ -129,10 +129,7 @@ func (t *OllamaTranslator) TranslateRequest(ctx context.Context, req *models.Uni
 	ollamaReq := ollamaChatRequest{
 		Model:    req.Model,
 		Messages: msgs,
-		// Ollama tool calling on /api/chat requires stream=false.
-		// We still expose streaming to clients by converting the final JSON
-		// response into a single streamed chunk at the gateway layer.
-		Stream:  req.Stream && len(selectedTools) == 0,
+		Stream:  req.Stream,
 		Think:   resolveOllamaThink(req, t.cfg),
 		Tools:   selectedTools,
 		Format:  format,
