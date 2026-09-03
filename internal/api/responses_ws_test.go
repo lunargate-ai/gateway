@@ -77,6 +77,76 @@ func TestResponsesWebSocket_ResponseCreateStreamsEvents(t *testing.T) {
 	}
 }
 
+func TestResponsesWebSocket_OriginPolicy(t *testing.T) {
+	h := &Handler{}
+	server := httptest.NewServer(http.HandlerFunc(h.ResponsesWebSocket))
+	defer server.Close()
+
+	host := strings.TrimPrefix(server.URL, "http://")
+	tests := []struct {
+		name       string
+		origin     string
+		wantStatus int
+	}{
+		{name: "cli without origin", wantStatus: http.StatusSwitchingProtocols},
+		{name: "same origin http", origin: "http://" + host, wantStatus: http.StatusSwitchingProtocols},
+		{name: "same origin https", origin: "https://" + host, wantStatus: http.StatusSwitchingProtocols},
+		{name: "same origin ws", origin: "ws://" + host, wantStatus: http.StatusSwitchingProtocols},
+		{name: "same origin wss", origin: "wss://" + host, wantStatus: http.StatusSwitchingProtocols},
+		{name: "cross origin host", origin: "https://attacker.example", wantStatus: http.StatusForbidden},
+		{name: "cross origin port", origin: "http://127.0.0.1:1", wantStatus: http.StatusForbidden},
+		{name: "opaque browser origin", origin: "null", wantStatus: http.StatusForbidden},
+		{name: "unsupported scheme", origin: "file://" + host, wantStatus: http.StatusForbidden},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			headers := make(http.Header)
+			if tc.origin != "" {
+				headers.Set("Origin", tc.origin)
+			}
+
+			wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+			conn, resp, err := websocket.DefaultDialer.Dial(wsURL, headers)
+			if conn != nil {
+				_ = conn.Close()
+			}
+			status := 0
+			if resp != nil {
+				status = resp.StatusCode
+				_ = resp.Body.Close()
+			}
+
+			if tc.wantStatus == http.StatusSwitchingProtocols {
+				if err != nil {
+					t.Fatalf("same-origin websocket handshake failed: %v", err)
+				}
+				if status != tc.wantStatus {
+					t.Fatalf("handshake status = %d, want %d", status, tc.wantStatus)
+				}
+				return
+			}
+
+			if err == nil {
+				t.Fatal("cross-origin websocket handshake unexpectedly succeeded")
+			}
+			if status != tc.wantStatus {
+				t.Fatalf("handshake status = %d, want %d", status, tc.wantStatus)
+			}
+		})
+	}
+}
+
+func TestCheckResponsesWebSocketOrigin_NormalizesDefaultPorts(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "http://example.com:80/v1/responses", nil)
+	req.Host = "example.com:80"
+	req.Header.Set("Origin", "http://EXAMPLE.COM")
+
+	if !checkResponsesWebSocketOrigin(req) {
+		t.Fatal("expected equivalent default port and case-insensitive host to be accepted")
+	}
+}
+
 func TestResponsesWebSocket_RejectsUnknownEventType(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -185,6 +255,54 @@ func TestResponsesWebSocket_MapsUpstreamError(t *testing.T) {
 	}
 	if status, _ := event["status"].(float64); int(status) != http.StatusBadRequest {
 		t.Fatalf("expected websocket error status 400, got %v", event["status"])
+	}
+}
+
+func TestResponsesWebSocket_DoesNotCacheFailedStream(t *testing.T) {
+	var upstreamCalls int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&upstreamCalls, 1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"id\":\"chatcmpl-partial\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"mock-gpt\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n")
+	}))
+	defer upstream.Close()
+
+	h := newResponsesWebSocketTestHandler(upstream.URL)
+	server := httptest.NewServer(http.HandlerFunc(h.ResponsesWebSocket))
+	defer server.Close()
+	conn := mustDialResponsesWebSocket(t, server.URL)
+	defer conn.Close()
+
+	sendResponsesWebSocketJSON(t, conn, map[string]interface{}{
+		"type":  "response.create",
+		"model": "lunargate/auto",
+		"input": "Say hi",
+	})
+	events := readResponsesWebSocketEventsUntilTerminal(t, conn)
+	if !hasResponsesWebSocketEventType(events, "response.failed") {
+		t.Fatalf("expected response.failed, got %v", eventTypes(events))
+	}
+	failedResponseID := extractTerminalResponseID(events, "response.failed")
+	if failedResponseID == "" {
+		t.Fatal("expected failed response ID")
+	}
+
+	sendResponsesWebSocketJSON(t, conn, map[string]interface{}{
+		"type":                 "response.create",
+		"model":                "lunargate/auto",
+		"input":                "Continue",
+		"previous_response_id": failedResponseID,
+	})
+	event := readResponsesWebSocketEvent(t, conn)
+	if got, _ := event["type"].(string); got != "error" {
+		t.Fatalf("expected continuation rejection, got %q", got)
+	}
+	errObj, _ := event["error"].(map[string]interface{})
+	if code, _ := errObj["code"].(string); code != "previous_response_not_found" {
+		t.Fatalf("error code = %q, want previous_response_not_found", code)
+	}
+	if got := atomic.LoadInt32(&upstreamCalls); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1", got)
 	}
 }
 
@@ -552,8 +670,12 @@ func eventTypes(events []map[string]interface{}) []string {
 }
 
 func extractCompletedResponseID(events []map[string]interface{}) string {
+	return extractTerminalResponseID(events, "response.completed")
+}
+
+func extractTerminalResponseID(events []map[string]interface{}, terminalType string) string {
 	for _, event := range events {
-		if typ, _ := event["type"].(string); typ != "response.completed" {
+		if typ, _ := event["type"].(string); typ != terminalType {
 			continue
 		}
 		response, _ := event["response"].(map[string]interface{})

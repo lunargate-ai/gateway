@@ -1,21 +1,47 @@
 package remotecontrol
 
 import (
+	"context"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/lunargate-ai/gateway/internal/config"
 )
 
-func TestNewClientRequiresOnlyAPIKeyForRemoteControl(t *testing.T) {
+func TestNewClientRequiresDataSharingMasterSwitch(t *testing.T) {
 	client := NewClient(
+		config.GeneralConfig{
+			BackendURL: "https://api.lunargate.ai/v1",
+			APIKey:     "lgw_test",
+		},
 		config.DataSharingConfig{
 			RemoteControl: true,
-			BackendURL:    "https://api.lunargate.ai/v1",
-			APIKey:        "lgw_test",
 		},
+		config.SecurityConfig{},
+		"test",
+		"http://127.0.0.1:8080",
+		nil,
+		nil,
+	)
+	if client != nil {
+		t.Fatal("expected remote control client to remain disabled by data_sharing.enabled")
+	}
+}
+
+func TestNewClientRequiresOnlyAPIKeyWhenDataSharingEnabled(t *testing.T) {
+	client := NewClient(
+		config.GeneralConfig{
+			BackendURL: "https://api.lunargate.ai/v1",
+			APIKey:     "lgw_test",
+		},
+		config.DataSharingConfig{
+			Enabled:       true,
+			RemoteControl: true,
+		},
+		config.SecurityConfig{},
 		"test",
 		"http://127.0.0.1:8080",
 		nil,
@@ -28,11 +54,15 @@ func TestNewClientRequiresOnlyAPIKeyForRemoteControl(t *testing.T) {
 
 func TestClientWebsocketURLDoesNotRequireGatewayIDQuery(t *testing.T) {
 	client := NewClient(
-		config.DataSharingConfig{
-			RemoteControl: true,
-			BackendURL:    "https://api.lunargate.ai/v1",
-			APIKey:        "lgw_test",
+		config.GeneralConfig{
+			BackendURL: "https://api.lunargate.ai/v1",
+			APIKey:     "lgw_test",
 		},
+		config.DataSharingConfig{
+			Enabled:       true,
+			RemoteControl: true,
+		},
+		config.SecurityConfig{},
 		"test",
 		"http://127.0.0.1:8080",
 		nil,
@@ -48,6 +78,56 @@ func TestClientWebsocketURLDoesNotRequireGatewayIDQuery(t *testing.T) {
 	}
 	if strings.Contains(wsURL, "gateway_id=") {
 		t.Fatalf("expected websocket URL without gateway_id query, got %q", wsURL)
+	}
+}
+
+func TestExecuteSandboxUsesConfiguredInboundAPIKey(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-Gateway-Key"); got != "Token local-test-key" {
+			t.Errorf("X-Gateway-Key = %q, want configured credential", got)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl_test"}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(
+		config.GeneralConfig{
+			BackendURL: "https://api.lunargate.ai/v1",
+			APIKey:     "lgw_test",
+		},
+		config.DataSharingConfig{Enabled: true, RemoteControl: true},
+		config.SecurityConfig{
+			Enabled:  true,
+			Provider: "api_key",
+			APIKey: config.APIKeyAuthConfig{
+				Header: "X-Gateway-Key",
+				Prefix: "Token",
+				Keys: []config.APIKeyCredential{
+					{Name: "sandbox", Value: "local-test-key"},
+				},
+			},
+		},
+		"test",
+		server.URL,
+		nil,
+		nil,
+	)
+	if client == nil {
+		t.Fatal("expected remote control client")
+	}
+
+	status, _, _, err := client.executeSandbox(context.Background(), sandboxExecuteMessage{
+		Target:  sandboxTarget{Mode: "model", Value: "openai/gpt-test"},
+		Request: map[string]interface{}{"messages": []interface{}{}},
+	})
+	if err != nil {
+		t.Fatalf("executeSandbox returned error: %v", err)
+	}
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want %d", status, http.StatusOK)
 	}
 }
 

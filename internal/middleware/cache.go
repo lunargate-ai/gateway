@@ -1,9 +1,11 @@
 package middleware
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,28 +46,23 @@ func NewCache(cfg config.CacheConfig) *Cache {
 
 // GenerateKey creates a deterministic cache key from a request.
 func GenerateKey(req *models.UnifiedRequest) string {
-	// Create a normalized version of the request for hashing
-	normalized := struct {
-		Model      string           `json:"model"`
-		Messages   []models.Message `json:"messages"`
-		Temp       *float64         `json:"temperature,omitempty"`
-		TopP       *float64         `json:"top_p,omitempty"`
-		TopK       *int             `json:"top_k,omitempty"`
-		MaxTok     *int             `json:"max_tokens,omitempty"`
-		Tools      []models.Tool    `json:"tools,omitempty"`
-		ToolChoice interface{}      `json:"tool_choice,omitempty"`
-	}{
-		Model:      req.Model,
-		Messages:   req.Messages,
-		Temp:       req.Temperature,
-		TopP:       req.TopP,
-		TopK:       req.TopK,
-		MaxTok:     req.MaxTokens,
-		Tools:      req.Tools,
-		ToolChoice: req.ToolChoice,
+	return GenerateKeyForTarget(req, "", "")
+}
+
+// GenerateKeyForTarget includes the complete client document and the resolved
+// upstream contract. Unknown additive API fields therefore cannot collide in
+// cache with a request that the native provider observes differently.
+func GenerateKeyForTarget(req *models.UnifiedRequest, provider string, upstreamRequestType string) string {
+	if req == nil {
+		return ""
 	}
 
-	data, err := json.Marshal(normalized)
+	data, err := json.Marshal(cacheKeyMaterial{
+		Raw:                 canonicalJSONDocument(req.RawJSON),
+		Normalized:          req,
+		Provider:            strings.TrimSpace(provider),
+		UpstreamRequestType: strings.ToLower(strings.TrimSpace(upstreamRequestType)),
+	})
 	if err != nil {
 		return ""
 	}
@@ -75,27 +72,44 @@ func GenerateKey(req *models.UnifiedRequest) string {
 }
 
 func GenerateEmbeddingsKey(req *models.EmbeddingsRequest) string {
-	normalized := struct {
-		Model          string      `json:"model"`
-		Input          interface{} `json:"input"`
-		EncodingFormat string      `json:"encoding_format,omitempty"`
-		Dimensions     *int        `json:"dimensions,omitempty"`
-		User           string      `json:"user,omitempty"`
-	}{
-		Model:          req.Model,
-		Input:          req.Input,
-		EncodingFormat: req.EncodingFormat,
-		Dimensions:     req.Dimensions,
-		User:           req.User,
+	return GenerateEmbeddingsKeyForTarget(req, "", "")
+}
+
+func GenerateEmbeddingsKeyForTarget(req *models.EmbeddingsRequest, provider string, upstreamRequestType string) string {
+	if req == nil {
+		return ""
 	}
 
-	data, err := json.Marshal(normalized)
+	data, err := json.Marshal(cacheKeyMaterial{
+		Raw:                 canonicalJSONDocument(req.RawJSON),
+		Normalized:          req,
+		Provider:            strings.TrimSpace(provider),
+		UpstreamRequestType: strings.ToLower(strings.TrimSpace(upstreamRequestType)),
+	})
 	if err != nil {
 		return ""
 	}
 
 	hash := sha256.Sum256(data)
 	return fmt.Sprintf("%x", hash[:16])
+}
+
+type cacheKeyMaterial struct {
+	Raw                 interface{} `json:"raw,omitempty"`
+	Normalized          interface{} `json:"normalized"`
+	Provider            string      `json:"provider,omitempty"`
+	UpstreamRequestType string      `json:"upstream_request_type,omitempty"`
+}
+
+func canonicalJSONDocument(raw json.RawMessage) interface{} {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil
+	}
+	var document interface{}
+	if err := json.Unmarshal(raw, &document); err != nil {
+		return string(raw)
+	}
+	return document
 }
 
 // Get looks up a cached response. Returns nil if not found or expired.

@@ -90,6 +90,12 @@ type RequestLogEventData struct {
 type collectorItem struct {
 	requestID string
 	payload   []byte
+	identity  collectorIdentity
+}
+
+type collectorIdentity struct {
+	backendURL string
+	apiKey     string
 }
 
 type collectorRuntimeConfig struct {
@@ -117,7 +123,7 @@ type CollectorClient struct {
 	lastLogAt  time.Time
 }
 
-func NewCollectorClient(cfg config.DataSharingConfig, gatewayVersion string) *CollectorClient {
+func NewCollectorClient(general config.GeneralConfig, cfg config.DataSharingConfig, gatewayVersion string) *CollectorClient {
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &CollectorClient{
 		gatewayVersion: gatewayVersion,
@@ -127,7 +133,7 @@ func NewCollectorClient(cfg config.DataSharingConfig, gatewayVersion string) *Co
 		queue:  make(chan collectorItem, 1000),
 		ctx:    ctx,
 		cancel: cancel,
-		cfg:    normalizeCollectorConfig(cfg),
+		cfg:    normalizeCollectorConfig(general, cfg),
 	}
 
 	c.wg.Add(1)
@@ -135,9 +141,9 @@ func NewCollectorClient(cfg config.DataSharingConfig, gatewayVersion string) *Co
 	return c
 }
 
-func normalizeCollectorConfig(cfg config.DataSharingConfig) collectorRuntimeConfig {
-	backendURL := strings.TrimSpace(cfg.BackendURL)
-	apiKey := strings.TrimSpace(cfg.APIKey)
+func normalizeCollectorConfig(general config.GeneralConfig, cfg config.DataSharingConfig) collectorRuntimeConfig {
+	backendURL := strings.TrimSpace(general.BackendURL)
+	apiKey := strings.TrimSpace(general.APIKey)
 
 	return collectorRuntimeConfig{
 		enabled:        cfg.Enabled && backendURL != "" && apiKey != "",
@@ -157,12 +163,12 @@ func (c *CollectorClient) snapshot() collectorRuntimeConfig {
 }
 
 // UpdateConfig hot-reloads collector behavior without restarting the process.
-func (c *CollectorClient) UpdateConfig(cfg config.DataSharingConfig) {
+func (c *CollectorClient) UpdateConfig(general config.GeneralConfig, cfg config.DataSharingConfig) {
 	if c == nil {
 		return
 	}
 	c.mu.Lock()
-	c.cfg = normalizeCollectorConfig(cfg)
+	c.cfg = normalizeCollectorConfig(general, cfg)
 	c.mu.Unlock()
 	log.Info().Bool("enabled", c.Enabled()).Msg("collector config updated")
 }
@@ -226,7 +232,14 @@ func (c *CollectorClient) Enqueue(ctx context.Context, requestID string, events 
 		return
 	}
 
-	item := collectorItem{requestID: requestID, payload: b}
+	item := collectorItem{
+		requestID: requestID,
+		payload:   b,
+		identity: collectorIdentity{
+			backendURL: cfg.backendURL,
+			apiKey:     cfg.apiKey,
+		},
+	}
 	select {
 	case <-c.ctx.Done():
 		return
@@ -265,7 +278,7 @@ func (c *CollectorClient) sendWithRetry(ctx context.Context, item collectorItem)
 		if ctx.Err() != nil {
 			return
 		}
-		if err := c.send(ctx, item.payload); err == nil {
+		if err := c.send(ctx, item); err == nil {
 			return
 		} else {
 			lastErr = err
@@ -287,23 +300,27 @@ func (c *CollectorClient) sendWithRetry(ctx context.Context, item collectorItem)
 	}
 }
 
-func (c *CollectorClient) send(ctx context.Context, payload []byte) error {
+func (c *CollectorClient) send(ctx context.Context, item collectorItem) error {
 	cfg := c.snapshot()
 	if !cfg.enabled {
 		return nil
 	}
+	if cfg.backendURL != item.identity.backendURL || cfg.apiKey != item.identity.apiKey {
+		log.Debug().Str("request_id", item.requestID).Msg("collector target changed, dropping queued payload")
+		return nil
+	}
 
-	collectorURL, err := url.JoinPath(cfg.backendURL, "collector")
+	collectorURL, err := url.JoinPath(item.identity.backendURL, "collector")
 	if err != nil {
 		return err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", collectorURL, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, "POST", collectorURL, bytes.NewReader(item.payload))
 	if err != nil {
 		return err
 	}
 
-	req.Header.Set("Authorization", "Bearer "+cfg.apiKey)
+	req.Header.Set("Authorization", "Bearer "+item.identity.apiKey)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
@@ -376,7 +393,7 @@ func (c *CollectorClient) logSendError(requestID string, err error) {
 		if statusErr.detail != "" {
 			event = event.Str("detail", statusErr.detail)
 		}
-		event.Msg("collector authentication rejected by lunargate.ai; go to app.lunargate.ai and check data_sharing.api_key")
+		event.Msg("collector authentication rejected by lunargate.ai; go to app.lunargate.ai and check general.api_key")
 		return
 	}
 

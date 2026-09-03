@@ -64,3 +64,45 @@ func TestFallbackExecutor_NoFallbacks_PreservesRetryMetadataOnFailure(t *testing
 	}
 }
 
+func TestFallbackExecutor_WithFallbackDisabledStaysOnPrimary(t *testing.T) {
+	retrier := NewRetrier(config.RetryConfig{
+		Enabled:         true,
+		MaxAttempts:     3,
+		RetryableErrors: []int{http.StatusInternalServerError},
+	})
+	fallback := NewFallbackExecutor(retrier, NewCircuitBreakerManager())
+	primary := routing.Target{Provider: "primary", Model: "model-a"}
+	backup := routing.Target{Provider: "backup", Model: "model-b"}
+	primaryCalls := 0
+	backupCalls := 0
+	ctx := WithFallbackDisabled(WithRetryDisabled(context.Background()))
+
+	_, usedTarget, fallbackUsed, retryCount, _, err := fallback.Execute(
+		ctx,
+		primary,
+		[]routing.Target{backup},
+		func(_ context.Context, target routing.Target) (*http.Response, error) {
+			if target.Provider == "primary" {
+				primaryCalls++
+			} else {
+				backupCalls++
+			}
+			return &http.Response{
+				StatusCode: http.StatusInternalServerError,
+				Body:       io.NopCloser(strings.NewReader(`{"error":"ambiguous"}`)),
+			}, nil
+		},
+	)
+	if err == nil {
+		t.Fatal("expected primary failure")
+	}
+	if primaryCalls != 1 || backupCalls != 0 {
+		t.Fatalf("calls primary=%d backup=%d, want 1/0", primaryCalls, backupCalls)
+	}
+	if usedTarget != primary || fallbackUsed {
+		t.Fatalf("usedTarget=%#v fallbackUsed=%v", usedTarget, fallbackUsed)
+	}
+	if retryCount != 1 {
+		t.Fatalf("retryCount=%d, want 1", retryCount)
+	}
+}

@@ -1,14 +1,91 @@
 package observability
 
 import (
+	"context"
 	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/lunargate-ai/gateway/internal/config"
 )
 
+func TestCollectorClient_DropsQueuedPayloadAfterIdentityChange(t *testing.T) {
+	var firstRequests int
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		firstRequests++
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer first.Close()
+
+	var secondAuthorizations []string
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondAuthorizations = append(secondAuthorizations, r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer second.Close()
+
+	client := &CollectorClient{
+		gatewayVersion: "test",
+		httpClient:     &http.Client{Timeout: time.Second},
+		queue:          make(chan collectorItem, 2),
+		ctx:            context.Background(),
+		cfg: normalizeCollectorConfig(config.GeneralConfig{
+			APIKey:     "shared-secret",
+			BackendURL: first.URL,
+		}, config.DataSharingConfig{Enabled: true}),
+	}
+
+	client.Enqueue(context.Background(), "queued-before-reload", []Event{{Type: "metric"}})
+	queuedBeforeReload := <-client.queue
+
+	client.UpdateConfig(config.GeneralConfig{
+		APIKey:     "shared-secret",
+		BackendURL: second.URL,
+	}, config.DataSharingConfig{Enabled: true})
+
+	if err := client.send(context.Background(), queuedBeforeReload); err != nil {
+		t.Fatalf("send queued payload after reload: %v", err)
+	}
+	if firstRequests != 0 || len(secondAuthorizations) != 0 {
+		t.Fatalf("queued payload was sent after backend change: first=%d second=%d", firstRequests, len(secondAuthorizations))
+	}
+
+	client.Enqueue(context.Background(), "queued-after-reload", []Event{{Type: "metric"}})
+	queuedAfterReload := <-client.queue
+	if err := client.send(context.Background(), queuedAfterReload); err != nil {
+		t.Fatalf("send payload queued after reload: %v", err)
+	}
+	if len(secondAuthorizations) != 1 || secondAuthorizations[0] != "Bearer shared-secret" {
+		t.Fatalf("second collector authorizations = %q, want shared credential", secondAuthorizations)
+	}
+
+	client.Enqueue(context.Background(), "queued-before-key-reload", []Event{{Type: "metric"}})
+	queuedBeforeKeyReload := <-client.queue
+	client.UpdateConfig(config.GeneralConfig{
+		APIKey:     "replacement-secret",
+		BackendURL: second.URL,
+	}, config.DataSharingConfig{Enabled: true})
+
+	if err := client.send(context.Background(), queuedBeforeKeyReload); err != nil {
+		t.Fatalf("send queued payload after credential reload: %v", err)
+	}
+	if len(secondAuthorizations) != 1 {
+		t.Fatalf("queued payload was sent after credential change: second=%d", len(secondAuthorizations))
+	}
+
+	client.Enqueue(context.Background(), "queued-after-key-reload", []Event{{Type: "metric"}})
+	queuedAfterKeyReload := <-client.queue
+	if err := client.send(context.Background(), queuedAfterKeyReload); err != nil {
+		t.Fatalf("send payload queued after credential reload: %v", err)
+	}
+	if len(secondAuthorizations) != 2 || secondAuthorizations[1] != "Bearer replacement-secret" {
+		t.Fatalf("second collector authorizations = %q, want replacement credential", secondAuthorizations)
+	}
+}
+
 func TestCollectorClient_UpdateConfig_TogglesEnabledState(t *testing.T) {
-	client := NewCollectorClient(config.DataSharingConfig{}, "test")
+	client := NewCollectorClient(config.GeneralConfig{}, config.DataSharingConfig{}, "test")
 	defer client.Stop()
 
 	if client.Enabled() {
@@ -18,12 +95,13 @@ func TestCollectorClient_UpdateConfig_TogglesEnabledState(t *testing.T) {
 		t.Fatalf("expected prompts sharing to be disabled")
 	}
 
-	client.UpdateConfig(config.DataSharingConfig{
+	client.UpdateConfig(config.GeneralConfig{
+		APIKey:     "secret",
+		BackendURL: "https://example.com/v1",
+	}, config.DataSharingConfig{
 		Enabled:        true,
 		SharePrompts:   true,
 		ShareResponses: true,
-		BackendURL:     "https://example.com/v1",
-		APIKey:         "secret",
 		GatewayLat:     "10.0",
 		GatewayLon:     "20.0",
 	})

@@ -105,7 +105,10 @@ func (e *Engine) EnrichHeaders(req *models.UnifiedRequest, headers map[string]st
 		}
 	}
 
-	hasTools := req != nil && (len(req.Tools) > 0 || req.ToolChoice != nil)
+	hasTools := false
+	if req != nil {
+		hasTools = len(req.Tools) > 0 && requestContainsToolIntent(req)
+	}
 	requiresJSON := false
 	if req != nil && req.ResponseFormat != nil {
 		t := strings.TrimSpace(req.ResponseFormat.Type)
@@ -133,13 +136,42 @@ func (e *Engine) EnrichHeaders(req *models.UnifiedRequest, headers map[string]st
 		if k := strings.TrimSpace(cfg.OutputHeaders.Skill); k != "" && strings.TrimSpace(skill) != "" {
 			headers[strings.ToLower(k)] = skill
 		}
-		// Add tools requirement header for routing
+		// Add the tools requirement header whenever the request may use tools.
+		// Only an explicit tool_choice=none opts out of tool-capable routing.
 		if hasTools {
 			headers["x-lunargate-requires-tools"] = "true"
 		}
 	}
 
 	return complexity, skill
+}
+
+func requestContainsToolIntent(req *models.UnifiedRequest) bool {
+	if req == nil {
+		return false
+	}
+	if len(req.Tools) == 0 {
+		return false
+	}
+	for _, msg := range req.Messages {
+		if len(msg.ToolCalls) > 0 {
+			return true
+		}
+		if strings.EqualFold(strings.TrimSpace(msg.Role), "tool") && strings.TrimSpace(msg.ToolCallID) != "" {
+			return true
+		}
+	}
+	switch v := req.ToolChoice.(type) {
+	case nil:
+		return true
+	case string:
+		s := strings.ToLower(strings.TrimSpace(v))
+		return s != "none"
+	case map[string]interface{}:
+		return true
+	default:
+		return true
+	}
 }
 
 func classifyComplexityScore(cfg config.ModelSelectionComplexityScoringConfig, userChars int, userText []string, hasTools bool) int {

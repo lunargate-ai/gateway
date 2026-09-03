@@ -101,3 +101,33 @@ func TestRegistry_RegistersCustomOpenAICompatibleProvider(t *testing.T) {
 		t.Fatalf("expected deepseek default base URL, got %q", got)
 	}
 }
+
+func TestRegistry_CapabilitiesAreExplicitAndCopied(t *testing.T) {
+	reg := NewRegistry(map[string]config.ProviderConfig{
+		"openai": {
+			Type: "openai",
+			Capabilities: config.ProviderCapabilities{
+				ResponsesLifecycle: true,
+				HostedTools:        []string{"web_search"},
+			},
+		},
+	})
+
+	capabilities, ok := reg.Capabilities("openai")
+	if !ok {
+		t.Fatal("expected provider capabilities")
+	}
+	if !capabilities.ResponsesLifecycle {
+		t.Fatal("responses lifecycle capability was not preserved")
+	}
+	capabilities.HostedTools[0] = "mutated"
+
+	again, ok := reg.Capabilities("openai")
+	if !ok || len(again.HostedTools) != 1 || again.HostedTools[0] != "web_search" {
+		t.Fatalf("registry capability slice was aliased: %#v", again.HostedTools)
+	}
+
+	if missing, ok := reg.Capabilities("missing"); ok || missing.ResponsesLifecycle || len(missing.HostedTools) != 0 {
+		t.Fatalf("missing provider capabilities = %#v, %v", missing, ok)
+	}
+}

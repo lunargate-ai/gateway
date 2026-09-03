@@ -3,11 +3,12 @@ package models
 import "encoding/json"
 
 type EmbeddingsRequest struct {
-	Model          string      `json:"model"`
-	Input          interface{} `json:"input"`
-	EncodingFormat string      `json:"encoding_format,omitempty"`
-	Dimensions     *int        `json:"dimensions,omitempty"`
-	User           string      `json:"user,omitempty"`
+	RawJSON        json.RawMessage `json:"-"`
+	Model          string          `json:"model"`
+	Input          interface{}     `json:"input"`
+	EncodingFormat string          `json:"encoding_format,omitempty"`
+	Dimensions     *int            `json:"dimensions,omitempty"`
+	User           string          `json:"user,omitempty"`
 }
 
 type EmbeddingsResponse struct {

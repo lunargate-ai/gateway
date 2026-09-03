@@ -11,6 +11,7 @@ require (
 	github.com/rs/zerolog v1.33.0
 	github.com/sony/gobreaker v1.0.0
 	github.com/spf13/viper v1.19.0
+	golang.org/x/mod v0.17.0
 )
 
 require (

@@ -47,16 +47,17 @@ func (t *AnthropicTranslator) BaseURL() string {
 // --- Anthropic-specific request/response types ---
 
 type anthropicRequest struct {
-	Model         string             `json:"model"`
-	MaxTokens     int                `json:"max_tokens"`
-	Messages      []anthropicMessage `json:"messages"`
-	System        string             `json:"system,omitempty"`
-	Temperature   *float64           `json:"temperature,omitempty"`
-	TopP          *float64           `json:"top_p,omitempty"`
-	Stream        bool               `json:"stream,omitempty"`
-	StopSequences []string           `json:"stop_sequences,omitempty"`
-	Tools         []anthropicTool    `json:"tools,omitempty"`
-	ToolChoice    interface{}        `json:"tool_choice,omitempty"`
+	Model         string                  `json:"model"`
+	MaxTokens     int                     `json:"max_tokens"`
+	Messages      []anthropicMessage      `json:"messages"`
+	System        []anthropicContentBlock `json:"system,omitempty"`
+	Temperature   *float64                `json:"temperature,omitempty"`
+	TopP          *float64                `json:"top_p,omitempty"`
+	TopK          *int                    `json:"top_k,omitempty"`
+	Stream        bool                    `json:"stream,omitempty"`
+	StopSequences []string                `json:"stop_sequences,omitempty"`
+	Tools         []anthropicTool         `json:"tools,omitempty"`
+	ToolChoice    interface{}             `json:"tool_choice,omitempty"`
 }
 
 type anthropicMessage struct {
@@ -108,19 +109,18 @@ type anthropicErrorResponse struct {
 // --- Interface implementation ---
 
 func (t *AnthropicTranslator) TranslateRequest(ctx context.Context, req *models.UnifiedRequest) (*http.Request, error) {
-	var systemPrompt string
+	var systemPrompt []anthropicContentBlock
 	var messages []anthropicMessage
 
 	for _, msg := range req.Messages {
-		// Anthropic uses top-level system prompt.
-		if msg.Role == "system" {
-			if s := contentToString(msg.Content); s != "" {
-				if systemPrompt == "" {
-					systemPrompt = s
-				} else {
-					systemPrompt += "\n" + s
-				}
+		// Anthropic represents both OpenAI instruction roles in its top-level
+		// system field. Keep each source content segment distinct and ordered.
+		if msg.Role == "system" || msg.Role == "developer" {
+			blocks, err := openAIInstructionToAnthropicBlocks(&msg)
+			if err != nil {
+				return nil, fmt.Errorf("failed to translate %s instruction to anthropic blocks: %w", msg.Role, err)
 			}
+			systemPrompt = append(systemPrompt, blocks...)
 			continue
 		}
 
@@ -156,6 +156,11 @@ func (t *AnthropicTranslator) TranslateRequest(ctx context.Context, req *models.
 		v := *t.cfg.TopP
 		topP = &v
 	}
+	topK := req.TopK
+	if topK == nil && t.cfg.TopK != nil {
+		v := *t.cfg.TopK
+		topK = &v
+	}
 
 	anthropicReq := anthropicRequest{
 		Model:       req.Model,
@@ -164,6 +169,7 @@ func (t *AnthropicTranslator) TranslateRequest(ctx context.Context, req *models.
 		System:      systemPrompt,
 		Temperature: temperature,
 		TopP:        topP,
+		TopK:        topK,
 		Stream:      req.Stream,
 		Tools:       mapOpenAIToolsToAnthropic(req.Tools),
 		ToolChoice:  mapOpenAIToolChoiceToAnthropic(req.ToolChoice),
@@ -199,6 +205,24 @@ func (t *AnthropicTranslator) TranslateRequest(ctx context.Context, req *models.
 	httpReq.Header.Set("anthropic-version", t.cfg.APIVersion)
 
 	return httpReq, nil
+}
+
+func openAIInstructionToAnthropicBlocks(msg *models.Message) ([]anthropicContentBlock, error) {
+	blocks, err := openAIMessageToAnthropicBlocks(msg)
+	if err != nil {
+		return nil, err
+	}
+
+	instructions := make([]anthropicContentBlock, 0, len(blocks))
+	for _, block := range blocks {
+		if block.Type != "text" {
+			return nil, fmt.Errorf("unsupported %s instruction content block %q", msg.Role, block.Type)
+		}
+		if block.Text != "" {
+			instructions = append(instructions, block)
+		}
+	}
+	return instructions, nil
 }
 
 func (t *AnthropicTranslator) ParseResponse(resp *http.Response) (*models.UnifiedResponse, error) {

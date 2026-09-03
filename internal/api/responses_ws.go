@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -19,9 +21,65 @@ import (
 var responsesWebSocketUpgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
-	CheckOrigin: func(_ *http.Request) bool {
+	CheckOrigin:     checkResponsesWebSocketOrigin,
+}
+
+func checkResponsesWebSocketOrigin(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		// Non-browser clients generally omit Origin and authenticate using the
+		// regular API credentials enforced by the route middleware.
 		return true
-	},
+	}
+
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return false
+	}
+
+	scheme := strings.ToLower(strings.TrimSpace(parsed.Scheme))
+	switch scheme {
+	case "http", "https", "ws", "wss":
+	default:
+		return false
+	}
+
+	originHost, ok := canonicalWebSocketOriginHost(parsed.Host, scheme)
+	if !ok {
+		return false
+	}
+	requestHost, ok := canonicalWebSocketOriginHost(r.Host, scheme)
+	if !ok {
+		return false
+	}
+
+	return originHost == requestHost
+}
+
+func canonicalWebSocketOriginHost(rawHost string, scheme string) (string, bool) {
+	parsed, err := url.Parse("//" + strings.TrimSpace(rawHost))
+	if err != nil || parsed.User != nil || parsed.Hostname() == "" {
+		return "", false
+	}
+
+	hostname := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
+	port := parsed.Port()
+	if port == "" {
+		switch scheme {
+		case "http", "ws":
+			port = "80"
+		case "https", "wss":
+			port = "443"
+		default:
+			return "", false
+		}
+	}
+
+	return net.JoinHostPort(hostname, port), true
 }
 
 type responsesWebSocketSession struct {
@@ -739,9 +797,21 @@ func (p *responsesWebSocketProxy) captureEventState(payload []byte) {
 	if err := json.Unmarshal(payload, &raw); err != nil {
 		return
 	}
-	if parseJSONStringRaw(raw["type"]) != "response.completed" {
+	eventType := parseJSONStringRaw(raw["type"])
+	if eventType == "response.failed" || eventType == "response.incomplete" || eventType == "error" {
+		p.done = true
+		p.terminalError = &responsesWebSocketEventError{
+			status:  http.StatusBadGateway,
+			errType: "provider_error",
+			code:    "upstream_stream_error",
+			message: "response stream did not complete successfully",
+		}
 		return
 	}
+	if eventType != "response.completed" {
+		return
+	}
+	p.done = true
 	var response map[string]interface{}
 	if err := json.Unmarshal(raw["response"], &response); err != nil {
 		return

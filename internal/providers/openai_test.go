@@ -49,6 +49,106 @@ func TestOpenAITranslator_StreamingRequestIncludesUsage(t *testing.T) {
 	}
 }
 
+func TestOpenAITranslator_PreservesCompleteNativeChatPayload(t *testing.T) {
+	translator := NewOpenAITranslator(config.ProviderConfig{
+		APIKey:  "dummy",
+		BaseURL: "https://api.openai.com/v1",
+	})
+
+	raw := json.RawMessage(`{
+		"model":"gpt-5.4",
+		"messages":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}],
+		"response_format":{"type":"json_schema","json_schema":{"name":"answer","strict":true,"schema":{"type":"object"}}},
+		"tools":[{"type":"function","function":{"name":"lookup","strict":true,"parameters":{"type":"object"}}}],
+		"modalities":["text","audio"],
+		"audio":{"voice":"alloy","format":"wav"},
+		"metadata":{"trace":"abc"},
+		"stream":true,
+		"stream_options":{"include_obfuscation":true},
+		"future_openai_field":{"kept":true},
+		"top_k":20
+	}`)
+	req, err := translator.TranslateRequest(context.Background(), &models.UnifiedRequest{
+		RawJSON: raw,
+		Model:   "gpt-5.4",
+		Stream:  true,
+		Messages: []models.Message{{
+			Role:    "user",
+			Content: []interface{}{map[string]interface{}{"type": "text", "text": "hi"}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("read request body: %v", err)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("decode request body: %v", err)
+	}
+	for _, key := range []string{"response_format", "tools", "modalities", "audio", "metadata", "future_openai_field"} {
+		if _, ok := payload[key]; !ok {
+			t.Fatalf("native field %q was lost: %s", key, body)
+		}
+	}
+	if payload["top_k"] != float64(20) {
+		t.Fatalf("raw field was silently changed before compatibility validation: %s", body)
+	}
+	streamOptions, ok := payload["stream_options"].(map[string]interface{})
+	if !ok || streamOptions["include_usage"] != true || streamOptions["include_obfuscation"] != true {
+		t.Fatalf("stream_options were not merged losslessly: %#v", payload["stream_options"])
+	}
+	messages := payload["messages"].([]interface{})
+	message := messages[0].(map[string]interface{})
+	parts := message["content"].([]interface{})
+	part := parts[0].(map[string]interface{})
+	if part["type"] != "text" {
+		t.Fatalf("content part type = %#v, want text", part["type"])
+	}
+	tool := payload["tools"].([]interface{})[0].(map[string]interface{})
+	function := tool["function"].(map[string]interface{})
+	if function["strict"] != true {
+		t.Fatalf("tool strict flag was lost: %#v", function)
+	}
+}
+
+func TestOpenAITranslator_PreservesCompleteNativeChatResponse(t *testing.T) {
+	translator := NewOpenAITranslator(config.ProviderConfig{})
+	body := `{
+		"id":"chatcmpl_123",
+		"object":"chat.completion",
+		"created":123,
+		"model":"gpt-5.4",
+		"service_tier":"priority",
+		"choices":[{"index":0,"message":{"role":"assistant","content":"hello","refusal":null,"annotations":[{"type":"url_citation"}]},"finish_reason":"stop"}],
+		"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3,"prompt_tokens_details":{"cached_tokens":1}},
+		"future_openai_field":{"kept":true}
+	}`
+	response, err := translator.ParseResponse(&http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(body)),
+	})
+	if err != nil {
+		t.Fatalf("ParseResponse returned error: %v", err)
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal(response.RawJSON, &raw); err != nil {
+		t.Fatalf("decode preserved response: %v", err)
+	}
+	for _, key := range []string{"service_tier", "future_openai_field"} {
+		if _, ok := raw[key]; !ok {
+			t.Fatalf("response field %q was lost", key)
+		}
+	}
+	usage := raw["usage"].(map[string]interface{})
+	if _, ok := usage["prompt_tokens_details"]; !ok {
+		t.Fatalf("usage details were lost: %#v", usage)
+	}
+}
+
 func TestOpenAITranslator_UsesProviderDefaultSamplingOptions(t *testing.T) {
 	defaultTemperature := 1.0
 	defaultTopP := 0.95
@@ -82,6 +182,37 @@ func TestOpenAITranslator_UsesProviderDefaultSamplingOptions(t *testing.T) {
 	}
 	if got, ok := payload["top_p"].(float64); !ok || got != 0.95 {
 		t.Fatalf("expected top_p=0.95 in upstream payload, got %#v", payload["top_p"])
+	}
+}
+
+func TestOpenAITranslator_StripsTopKFromUpstreamPayload(t *testing.T) {
+	topK := 20
+	translator := NewOpenAITranslator(config.ProviderConfig{
+		APIKey:  "dummy",
+		BaseURL: "https://api.openai.com/v1",
+	})
+
+	req, err := translator.TranslateRequest(context.Background(), &models.UnifiedRequest{
+		Model:    "gpt-5.4-mini",
+		TopK:     &topK,
+		Messages: []models.Message{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("failed to read request body: %v", err)
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("failed to unmarshal request payload: %v", err)
+	}
+
+	if _, ok := payload["top_k"]; ok {
+		t.Fatalf("expected top_k to be omitted from OpenAI upstream payload, got %#v", payload["top_k"])
 	}
 }
 
@@ -150,6 +281,40 @@ func TestOpenAITranslator_ResponsesUpstreamPreservesPreviousResponseID(t *testin
 	}
 	if got, _ := payload["previous_response_id"].(string); got != "resp_prev_123" {
 		t.Fatalf("expected previous_response_id to be preserved, got %q", got)
+	}
+}
+
+func TestOpenAITranslator_ResponsesUpstreamPreservesStoreFalse(t *testing.T) {
+	store := false
+	translator := NewOpenAITranslator(config.ProviderConfig{
+		APIKey:  "dummy",
+		BaseURL: "https://api.openai.com/v1",
+	})
+
+	ctx := WithUpstreamRequestType(context.Background(), "responses")
+	req, err := translator.TranslateRequest(ctx, &models.UnifiedRequest{
+		Model:    "gpt-5.3-codex",
+		Store:    &store,
+		Messages: []models.Message{{Role: "user", Content: "hello"}},
+	})
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("failed to read request body: %v", err)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("failed to unmarshal request payload: %v", err)
+	}
+	got, present := payload["store"]
+	if !present {
+		t.Fatal("expected store field in upstream responses payload")
+	}
+	if value, ok := got.(bool); !ok || value {
+		t.Fatalf("store = %#v, want false", got)
 	}
 }
 
@@ -536,9 +701,18 @@ func TestOpenAITranslator_ParseStreamChunk_ResponsesEvents(t *testing.T) {
 		t.Fatalf("expected delta content hello, got %q", got)
 	}
 
-	doneChunk, doneErr := translator.ParseStreamChunk([]byte(`{"type":"response.completed","response":{"id":"resp_1"}}`))
+	doneChunk, doneErr := translator.ParseStreamChunk([]byte(`{"type":"response.completed","response":{"id":"resp_1","created_at":123,"model":"gpt-5.3-codex","usage":{"input_tokens":17,"output_tokens":9,"total_tokens":26}}}`))
 	if doneErr != ErrStreamDone {
 		t.Fatalf("expected ErrStreamDone, got chunk=%v err=%v", doneChunk, doneErr)
+	}
+	if doneChunk == nil || doneChunk.Usage == nil {
+		t.Fatalf("expected terminal chunk with usage, got %#v", doneChunk)
+	}
+	if doneChunk.ID != "resp_1" || doneChunk.Model != "gpt-5.3-codex" || doneChunk.Created != 123 {
+		t.Fatalf("unexpected terminal metadata: %#v", doneChunk)
+	}
+	if doneChunk.Usage.PromptTokens != 17 || doneChunk.Usage.CompletionTokens != 9 || doneChunk.Usage.TotalTokens != 26 {
+		t.Fatalf("unexpected terminal usage: %#v", doneChunk.Usage)
 	}
 }
 

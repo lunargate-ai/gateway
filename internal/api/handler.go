@@ -129,31 +129,25 @@ func parseUnifiedRequest(w http.ResponseWriter, r *http.Request, captureBody boo
 	defer r.Body.Close()
 
 	var req models.UnifiedRequest
-	var body []byte
-
-	if captureBody {
-		var err error
-		body, err = io.ReadAll(r.Body)
-		if err != nil {
-			writeRequestReadError(w, err)
-			return nil, nil, false
-		}
-		if err := decodeJSONStrict(bytes.NewReader(body), &req); err != nil {
-			writeRequestDecodeError(w, err)
-			return nil, nil, false
-		}
-	} else {
-		if err := decodeJSONStrict(r.Body, &req); err != nil {
-			writeRequestDecodeError(w, err)
-			return nil, nil, false
-		}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeRequestReadError(w, err)
+		return nil, nil, false
 	}
+	if err := decodeJSONStrict(bytes.NewReader(body), &req); err != nil {
+		writeRequestDecodeError(w, err)
+		return nil, nil, false
+	}
+	req.RawJSON = append(json.RawMessage(nil), body...)
 
 	if err := models.NormalizeUnifiedRequest(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid tool/function calling payload", "invalid_request_error")
 		return nil, nil, false
 	}
 
+	if !captureBody {
+		return nil, &req, true
+	}
 	return body, &req, true
 }
 
@@ -222,7 +216,10 @@ func setTimingHeaders(w http.ResponseWriter, totalMS int64, overheadMS int64) {
 func requestContextWithRetryPolicy(r *http.Request) context.Context {
 	ctx := r.Context()
 	if strings.EqualFold(strings.TrimSpace(r.Header.Get("X-LunarGate-No-Retry")), "true") {
-		return resilience.WithRetryDisabled(ctx)
+		ctx = resilience.WithRetryDisabled(ctx)
+	}
+	if strings.EqualFold(strings.TrimSpace(r.Header.Get("X-LunarGate-No-Fallback")), "true") {
+		ctx = resilience.WithFallbackDisabled(ctx)
 	}
 	return ctx
 }
@@ -314,6 +311,8 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	explicitProvider := strings.TrimSpace(r.Header.Get("X-LunarGate-Provider"))
 	explicitModel := strings.TrimSpace(r.Header.Get("X-LunarGate-Model"))
+	autoSelection := strings.EqualFold(strings.TrimSpace(req.Model), "lunargate/auto") ||
+		strings.EqualFold(explicitModel, "lunargate/auto")
 	if explicitModel != "" {
 		if p, m, ok := modelid.SplitCanonical(explicitModel); ok {
 			explicitProvider = p
@@ -336,7 +335,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if strings.EqualFold(strings.TrimSpace(req.Model), "lunargate/auto") {
+	if autoSelection {
 		req.Model = ""
 		if strings.EqualFold(strings.TrimSpace(explicitProvider), "lunargate") {
 			explicitProvider = ""
@@ -346,6 +345,12 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	userSpecifiedModel := strings.TrimSpace(req.Model) != ""
 
 	headers := extractHeaders(r)
+	if autoSelection {
+		delete(headers, "x-lunargate-model")
+		if explicitProvider == "" {
+			delete(headers, "x-lunargate-provider")
+		}
+	}
 	requestType := strings.TrimSpace(headers["x-lunargate-request-type"])
 	if requestType == "" {
 		requestType = "chat_completions"
@@ -394,10 +399,25 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		resolved, err = h.router.Resolve(r.Context(), resolvePath, headers)
 	}
 	if err != nil {
+		var unavailable *routing.RequestedTargetUnavailableError
+		if errors.As(err, &unavailable) {
+			writeRequestedTargetUnavailable(w, unavailable)
+			return
+		}
 		log.Error().Err(err).Str("request_id", requestID).Msg("failed to resolve route")
 		writeError(w, http.StatusBadGateway, "no route matched for this request", "routing_error")
 		return
 	}
+	if err := h.validateChatCompatibility(resolved.Target.Provider, &req); err != nil {
+		var compatibilityErr *models.CompatibilityError
+		if errors.As(err, &compatibilityErr) {
+			writeCompatibilityError(w, compatibilityErr)
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
+		return
+	}
+	resolved.Fallbacks = h.compatibleChatFallbacks(resolved.Fallbacks, &req)
 	w.Header().Set("X-LunarGate-Route", resolved.RouteName)
 	if upstreamRequestType := strings.TrimSpace(resolved.Target.UpstreamRequestType); upstreamRequestType != "" {
 		headers["x-lunargate-request-type"] = upstreamRequestType
@@ -408,6 +428,8 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if p, m, ok := modelid.SplitCanonical(req.Model); ok {
 		requestedProvider = strings.TrimSpace(p)
 		requestedModelRaw = strings.TrimSpace(m)
+	} else {
+		requestedModelRaw = strings.TrimSpace(req.Model)
 	}
 
 	overrideUserModel := false
@@ -449,9 +471,9 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	resolvedSampling := h.resolveCollectorInferenceParameters(resolved.Target.Provider, &req)
 
-	noCache := r.Header.Get("X-LunarGate-No-Cache") == "true"
+	noCache := r.Header.Get("X-LunarGate-No-Cache") == "true" || (req.Store != nil && !*req.Store)
 	if !req.Stream && !noCache && h.cache.Enabled() {
-		cacheKey := middleware.GenerateKey(&req)
+		cacheKey := middleware.GenerateKeyForTarget(&req, resolved.Target.Provider, resolved.Target.UpstreamRequestType)
 		if cached := h.cache.Get(cacheKey); cached != nil {
 			h.metrics.CacheHits.WithLabelValues("hit").Inc()
 			cacheHit = true
@@ -460,7 +482,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("X-LunarGate-Provider", resolved.Target.Provider)
 			w.Header().Set("X-LunarGate-Model", req.Model)
 			setTimingHeaders(w, durationMS, durationMS)
-			writeJSON(w, http.StatusOK, cached)
+			writeAPIJSON(w, http.StatusOK, cached)
 			return
 		}
 		h.metrics.CacheHits.WithLabelValues("miss").Inc()
@@ -782,6 +804,9 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		var errMsgPtr *string
 
 		if streamErr != nil {
+			if recorder, ok := w.(interface{ RecordStreamError(error) }); ok {
+				recorder.RecordStreamError(streamErr)
+			}
 			status = http.StatusBadGateway
 			errCode := "streaming_error"
 			errMsg := streamErr.Error()
@@ -1112,7 +1137,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// Cache the response
 	if !noCache && h.cache.Enabled() {
-		cacheKey := middleware.GenerateKey(&req)
+		cacheKey := middleware.GenerateKeyForTarget(&req, usedTarget.Provider, usedTarget.UpstreamRequestType)
 		h.cache.Set(cacheKey, unified)
 	}
 
@@ -1215,7 +1240,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		h.collector.Enqueue(r.Context(), requestID, events)
 	}
 
-	writeJSON(w, http.StatusOK, unified)
+	writeAPIJSON(w, http.StatusOK, unified)
 	return
 }
 
@@ -1252,10 +1277,12 @@ func (h *Handler) callProvider(ctx context.Context, target routing.Target, req *
 		ctx = providers.WithUpstreamRequestType(ctx, upstreamRequestType)
 	}
 
-	// Override model with the target's model if the request model matches a generic name
+	// Each route target owns the concrete upstream model. This is especially
+	// important for fallbacks, which may use a different provider and model than
+	// the primary target selected for the original request.
 	reqCopy := *req
-	if reqCopy.Model == "" && target.Model != "" {
-		reqCopy.Model = target.Model
+	if strings.TrimSpace(target.Model) != "" {
+		reqCopy.Model = strings.TrimSpace(target.Model)
 	}
 	reqCopy.Model = modelid.ModelName(reqCopy.Model)
 
@@ -1441,12 +1468,70 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	}
 }
 
+func writeAPIJSON(w http.ResponseWriter, status int, v interface{}) {
+	var raw json.RawMessage
+	switch response := v.(type) {
+	case *models.UnifiedResponse:
+		if response != nil {
+			raw = response.RawJSON
+		}
+	case models.UnifiedResponse:
+		raw = response.RawJSON
+	}
+	if len(bytes.TrimSpace(raw)) == 0 || !json.Valid(raw) {
+		writeJSON(w, status, v)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if _, err := w.Write(raw); err != nil {
+		log.Error().Err(err).Msg("failed to write raw JSON response")
+	}
+}
+
 func writeError(w http.ResponseWriter, status int, message string, errType string) {
+	writeErrorDetail(w, status, message, errType, nil, nil)
+}
+
+func writeErrorDetail(w http.ResponseWriter, status int, message string, errType string, param *string, code *string) {
 	resp := models.ErrorResponse{
 		Error: models.ErrorDetail{
 			Message: message,
 			Type:    errType,
+			Param:   param,
+			Code:    code,
 		},
 	}
 	writeJSON(w, status, resp)
+}
+
+func writeCompatibilityError(w http.ResponseWriter, compatibilityErr *models.CompatibilityError) {
+	if compatibilityErr == nil {
+		writeError(w, http.StatusBadRequest, "unsupported provider feature", "invalid_request_error")
+		return
+	}
+	param := strings.TrimSpace(compatibilityErr.Field)
+	code := "unsupported_feature"
+	writeErrorDetail(
+		w,
+		http.StatusBadRequest,
+		compatibilityErr.Error(),
+		"invalid_request_error",
+		&param,
+		&code,
+	)
+}
+
+func writeRequestedTargetUnavailable(w http.ResponseWriter, unavailable *routing.RequestedTargetUnavailableError) {
+	param := "provider"
+	code := "provider_not_found"
+	message := "requested provider is not available for this route"
+	if unavailable != nil && strings.TrimSpace(unavailable.Model) != "" {
+		param = "model"
+		code = "model_not_found"
+		message = unavailable.Error()
+	} else if unavailable != nil {
+		message = unavailable.Error()
+	}
+	writeErrorDetail(w, http.StatusBadRequest, message, "invalid_request_error", &param, &code)
 }

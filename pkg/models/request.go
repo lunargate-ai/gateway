@@ -11,6 +11,10 @@ import (
 // UnifiedRequest represents an OpenAI-compatible chat completion request.
 // All provider translators convert FROM this format to their native format.
 type UnifiedRequest struct {
+	// RawJSON preserves the complete client document for native-compatible
+	// forwarding and exact cache semantics. It is never serialized by the
+	// typed compatibility model itself.
+	RawJSON            json.RawMessage `json:"-"`
 	Model              string          `json:"model"`
 	Messages           []Message       `json:"messages"`
 	Temperature        *float64        `json:"temperature,omitempty"`
@@ -33,6 +37,7 @@ type UnifiedRequest struct {
 	ReasoningEffort    string          `json:"reasoning_effort,omitempty"`
 	Reasoning          *Reasoning      `json:"reasoning,omitempty"`
 	Seed               *int            `json:"seed,omitempty"`
+	Store              *bool           `json:"store,omitempty"`
 	PreviousResponseID string          `json:"previous_response_id,omitempty"`
 }
 

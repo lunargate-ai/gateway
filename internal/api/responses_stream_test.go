@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,6 +10,37 @@ import (
 
 	"github.com/lunargate-ai/gateway/pkg/models"
 )
+
+func TestResponsesStreamProxy_EmitsFailedInsteadOfCompletedAfterStreamError(t *testing.T) {
+	rec := httptest.NewRecorder()
+	proxy := newResponsesStreamProxy(rec)
+	partial := "data: {\"id\":\"resp_partial\",\"object\":\"chat.completion.chunk\",\"created\":123,\"model\":\"gpt\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n"
+	if _, err := proxy.Write([]byte(partial)); err != nil {
+		t.Fatalf("write partial chunk: %v", err)
+	}
+	proxy.RecordStreamError(errors.New("upstream closed early"))
+	if err := proxy.finalize(); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+
+	events := decodeSSEEvents(t, rec.Body.String())
+	foundFailed := false
+	for _, event := range events {
+		switch event["type"] {
+		case "response.completed":
+			t.Fatal("truncated stream must not emit response.completed")
+		case "response.failed":
+			foundFailed = true
+			response, _ := event["response"].(map[string]interface{})
+			if response["status"] != "failed" {
+				t.Fatalf("failed response status = %#v", response["status"])
+			}
+		}
+	}
+	if !foundFailed {
+		t.Fatal("expected response.failed event")
+	}
+}
 
 func TestResponsesStreamProxy_ToolCallIDsStayStableAcrossCallAndFC(t *testing.T) {
 	rec := httptest.NewRecorder()
@@ -183,6 +215,72 @@ func TestResponsesStreamProxy_ErrorPassthroughKeepsContentType(t *testing.T) {
 	if !strings.Contains(body, `"invalid_request_error"`) {
 		t.Fatalf("expected passthrough error payload, got %q", body)
 	}
+}
+
+func TestResponsesStreamProxy_IncludesUsageInCompletedResponse(t *testing.T) {
+	rec := httptest.NewRecorder()
+	proxy := newResponsesStreamProxy(rec)
+
+	chunk := "data: {\"id\":\"resp_usage\",\"object\":\"chat.completion.chunk\",\"created\":123,\"model\":\"gpt-5.3-codex\",\"choices\":[],\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":9,\"total_tokens\":26}}\n\n"
+	if _, err := proxy.Write([]byte(chunk)); err != nil {
+		t.Fatalf("write usage chunk: %v", err)
+	}
+	if _, err := proxy.Write([]byte("data: [DONE]\n\n")); err != nil {
+		t.Fatalf("write done chunk: %v", err)
+	}
+	if err := proxy.finalize(); err != nil {
+		t.Fatalf("finalize error: %v", err)
+	}
+
+	events := decodeSSEEvents(t, rec.Body.String())
+	for _, event := range events {
+		if event["type"] != "response.completed" {
+			continue
+		}
+		response, _ := event["response"].(map[string]interface{})
+		usage, _ := response["usage"].(map[string]interface{})
+		if usage == nil {
+			t.Fatal("expected response.completed usage")
+		}
+		if usage["input_tokens"] != float64(17) || usage["output_tokens"] != float64(9) || usage["total_tokens"] != float64(26) {
+			t.Fatalf("unexpected usage: %#v", usage)
+		}
+		return
+	}
+	t.Fatal("expected response.completed event")
+}
+
+func TestResponsesStreamProxy_MergesSplitUsageAcrossChunks(t *testing.T) {
+	rec := httptest.NewRecorder()
+	proxy := newResponsesStreamProxy(rec)
+
+	chunks := []string{
+		"data: {\"id\":\"resp_usage\",\"object\":\"chat.completion.chunk\",\"created\":123,\"model\":\"claude\",\"choices\":[],\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":0,\"total_tokens\":17}}\n\n",
+		"data: {\"id\":\"resp_usage\",\"object\":\"chat.completion.chunk\",\"created\":123,\"model\":\"claude\",\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":9,\"total_tokens\":0}}\n\n",
+		"data: [DONE]\n\n",
+	}
+	for _, chunk := range chunks {
+		if _, err := proxy.Write([]byte(chunk)); err != nil {
+			t.Fatalf("write chunk: %v", err)
+		}
+	}
+	if err := proxy.finalize(); err != nil {
+		t.Fatalf("finalize error: %v", err)
+	}
+
+	events := decodeSSEEvents(t, rec.Body.String())
+	for _, event := range events {
+		if event["type"] != "response.completed" {
+			continue
+		}
+		response, _ := event["response"].(map[string]interface{})
+		usage, _ := response["usage"].(map[string]interface{})
+		if usage["input_tokens"] != float64(17) || usage["output_tokens"] != float64(9) || usage["total_tokens"] != float64(26) {
+			t.Fatalf("unexpected merged usage: %#v", usage)
+		}
+		return
+	}
+	t.Fatal("expected response.completed event")
 }
 
 func TestResponsesStreamProxy_EventOrderingWithTextAndToolCall(t *testing.T) {

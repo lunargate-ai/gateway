@@ -357,3 +357,38 @@ func TestUnifiedResponseToResponses_PreservesReasoningAsOutputItem(t *testing.T)
 		t.Fatalf("expected preserved reasoning text, got %q", reasoningItem.Summary[0].Text)
 	}
 }
+
+func TestResponsesToUnifiedRequest_PreservesStore(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		store *bool
+	}{
+		{name: "omitted"},
+		{name: "false", store: boolPointer(false)},
+		{name: "true", store: boolPointer(true)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			unified, err := ResponsesToUnifiedRequest(&ResponsesRequest{
+				Model: "gpt-5.3-codex",
+				Input: "hello",
+				Store: tc.store,
+			})
+			if err != nil {
+				t.Fatalf("ResponsesToUnifiedRequest returned error: %v", err)
+			}
+			if unified.Store == nil {
+				if tc.store != nil {
+					t.Fatalf("Store = nil, want %v", *tc.store)
+				}
+				return
+			}
+			if tc.store == nil || *unified.Store != *tc.store {
+				t.Fatalf("Store = %v, want %v", *unified.Store, tc.store)
+			}
+		})
+	}
+}
+
+func boolPointer(value bool) *bool {
+	return &value
+}

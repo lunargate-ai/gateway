@@ -87,12 +87,6 @@ func (t *OpenAITranslator) BaseURL() string {
 func (t *OpenAITranslator) TranslateRequest(ctx context.Context, req *models.UnifiedRequest) (*http.Request, error) {
 	reqCopy := normalizeOpenAICompatibleRequestForProvider(*req, t.cfg)
 	reqCopy.Reasoning = nil
-	if reqCopy.Stream {
-		if reqCopy.StreamOptions == nil {
-			reqCopy.StreamOptions = &models.StreamOptions{}
-		}
-		reqCopy.StreamOptions.IncludeUsage = true
-	}
 
 	upstreamRequestType := strings.TrimSpace(UpstreamRequestTypeFromContext(ctx))
 	bodyPayload := interface{}(&reqCopy)
@@ -102,7 +96,13 @@ func (t *OpenAITranslator) TranslateRequest(ctx context.Context, req *models.Uni
 		bodyPayload = unifiedToResponsesPayload(&reqCopy)
 	}
 
-	body, err := json.Marshal(bodyPayload)
+	var body []byte
+	var err error
+	if strings.EqualFold(upstreamRequestType, "responses") {
+		body, err = json.Marshal(bodyPayload)
+	} else {
+		body, err = openAIChatRequestBody(&reqCopy, t.cfg)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal openai request: %w", err)
 	}
@@ -119,6 +119,101 @@ func (t *OpenAITranslator) TranslateRequest(ctx context.Context, req *models.Uni
 	}
 
 	return httpReq, nil
+}
+
+func openAIChatRequestBody(req *models.UnifiedRequest, cfg config.ProviderConfig) ([]byte, error) {
+	if req == nil {
+		return nil, fmt.Errorf("request is required")
+	}
+
+	if len(bytes.TrimSpace(req.RawJSON)) == 0 {
+		requestCopy := *req
+		if requestCopy.Stream {
+			if requestCopy.StreamOptions == nil {
+				requestCopy.StreamOptions = &models.StreamOptions{}
+			}
+			requestCopy.StreamOptions.IncludeUsage = true
+		}
+		return json.Marshal(&requestCopy)
+	}
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(req.RawJSON, &payload); err != nil {
+		return nil, fmt.Errorf("decode preserved chat request: %w", err)
+	}
+	if payload == nil {
+		return nil, fmt.Errorf("chat request must be a JSON object")
+	}
+
+	setRawJSONValue(payload, "model", req.Model)
+	setRawJSONPointerDefault(payload, "temperature", req.Temperature)
+	setRawJSONPointerDefault(payload, "top_p", req.TopP)
+
+	if req.Stream {
+		setRawJSONValue(payload, "stream", true)
+		streamOptions := make(map[string]interface{})
+		if raw := bytes.TrimSpace(payload["stream_options"]); len(raw) > 0 && string(raw) != "null" {
+			if err := json.Unmarshal(raw, &streamOptions); err != nil {
+				return nil, fmt.Errorf("decode stream_options: %w", err)
+			}
+		}
+		streamOptions["include_usage"] = true
+		setRawJSONValue(payload, "stream_options", streamOptions)
+	}
+
+	if rawMessages := bytes.TrimSpace(payload["messages"]); len(rawMessages) > 0 {
+		var messages []map[string]interface{}
+		if err := json.Unmarshal(rawMessages, &messages); err != nil {
+			return nil, fmt.Errorf("decode messages: %w", err)
+		}
+		for _, message := range messages {
+			if shouldNormalizeDeveloperRole(cfg) {
+				if role, _ := message["role"].(string); strings.EqualFold(strings.TrimSpace(role), "developer") {
+					message["role"] = "system"
+				}
+			}
+			normalizeOpenAIChatContentParts(message)
+		}
+		setRawJSONValue(payload, "messages", messages)
+	}
+
+	return json.Marshal(payload)
+}
+
+func setRawJSONPointerDefault(payload map[string]json.RawMessage, key string, value *float64) {
+	if value == nil {
+		return
+	}
+	if _, exists := payload[key]; exists {
+		return
+	}
+	setRawJSONValue(payload, key, *value)
+}
+
+func setRawJSONValue(payload map[string]json.RawMessage, key string, value interface{}) {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return
+	}
+	payload[key] = raw
+}
+
+func normalizeOpenAIChatContentParts(message map[string]interface{}) {
+	parts, ok := message["content"].([]interface{})
+	if !ok {
+		return
+	}
+	for _, rawPart := range parts {
+		part, ok := rawPart.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		partType, _ := part["type"].(string)
+		switch strings.TrimSpace(partType) {
+		case "input_text", "output_text":
+			part["type"] = "text"
+		}
+	}
 }
 
 func (t *OpenAITranslator) TranslateEmbeddingsRequest(ctx context.Context, req *models.EmbeddingsRequest) (*http.Request, error) {
@@ -184,6 +279,7 @@ func (t *OpenAITranslator) ParseResponse(resp *http.Response) (*models.UnifiedRe
 		return nil, fmt.Errorf("failed to unmarshal openai response: %w", err)
 	}
 
+	normalizedThinkTags := false
 	for i := range result.Choices {
 		c := &result.Choices[i]
 		if c.Message == nil {
@@ -205,6 +301,10 @@ func (t *OpenAITranslator) ParseResponse(resp *http.Response) (*models.UnifiedRe
 			}
 		}
 		c.Message.Content = cleaned
+		normalizedThinkTags = true
+	}
+	if !normalizedThinkTags {
+		result.RawJSON = append(json.RawMessage(nil), body...)
 	}
 
 	return &result, nil
@@ -304,6 +404,9 @@ func normalizeOpenAICompatibleRequestForProvider(req models.UnifiedRequest, cfg 
 		v := *cfg.TopP
 		req.TopP = &v
 	}
+	// top_k is not part of OpenAI's Chat Completions or Responses payloads.
+	// It remains available to translators for providers that support it.
+	req.TopK = nil
 
 	if !shouldNormalizeDeveloperRole(cfg) {
 		return req
@@ -436,6 +539,7 @@ func unifiedToResponsesPayload(req *models.UnifiedRequest) *models.ResponsesRequ
 		Tools:              make([]models.ResponsesTool, 0, len(req.Tools)),
 		ToolChoice:         normalizeResponsesToolChoiceForUpstream(req.ToolChoice),
 		Stream:             req.Stream,
+		Store:              req.Store,
 		User:               req.User,
 	}
 	if len(instructions) > 0 {
@@ -608,7 +712,27 @@ func responsesEventToStreamChunk(data []byte) (*models.StreamChunk, error) {
 			Str("provider", "openai").
 			Str("responses_event_type", typeName).
 			Msg("responses stream completed event")
-		return nil, ErrStreamDone
+		var event struct {
+			Response models.ResponsesResponse `json:"response"`
+		}
+		if err := json.Unmarshal(data, &event); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal responses completed event: %w", err)
+		}
+		chunk := &models.StreamChunk{
+			ID:      event.Response.ID,
+			Object:  "chat.completion.chunk",
+			Created: event.Response.CreatedAt,
+			Model:   event.Response.Model,
+			Choices: []models.Choice{},
+		}
+		if event.Response.Usage != nil {
+			chunk.Usage = &models.Usage{
+				PromptTokens:     event.Response.Usage.InputTokens,
+				CompletionTokens: event.Response.Usage.OutputTokens,
+				TotalTokens:      event.Response.Usage.TotalTokens,
+			}
+		}
+		return chunk, ErrStreamDone
 	case "response.output_text.delta":
 		delta := interfaceToString(raw["delta"])
 		if delta == "" {

@@ -71,30 +71,33 @@ func (h *Handler) streamNDJSONResponse(
 		}
 
 		chunk, err := translator.ParseStreamChunk(line)
-		if err != nil {
-			if err == providers.ErrStreamDone {
-				fmt.Fprintf(w, "data: [DONE]\n\n")
-				flusher.Flush()
-				return nil
-			}
+		streamDone := err == providers.ErrStreamDone
+		if err != nil && !streamDone {
 			return fmt.Errorf("failed to parse ndjson stream chunk: %w", err)
 		}
-		if chunk == nil {
+		if chunk == nil && !streamDone {
 			continue
 		}
 
-		if observer != nil {
-			observer(chunk)
+		if chunk != nil {
+			if observer != nil {
+				observer(chunk)
+			}
+
+			chunkJSON, err := json.Marshal(chunk)
+			if err != nil {
+				log.Error().Err(err).Msg("failed to marshal stream chunk")
+			} else {
+				fmt.Fprintf(w, "data: %s\n\n", chunkJSON)
+				flusher.Flush()
+			}
 		}
 
-		chunkJSON, err := json.Marshal(chunk)
-		if err != nil {
-			log.Error().Err(err).Msg("failed to marshal stream chunk")
-			continue
+		if streamDone {
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
+			return nil
 		}
-
-		fmt.Fprintf(w, "data: %s\n\n", chunkJSON)
-		flusher.Flush()
 
 		isDone := false
 		for _, c := range chunk.Choices {
@@ -113,6 +116,8 @@ func (h *Handler) streamNDJSONResponse(
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("stream scanner error: %w", err)
 	}
-
-	return nil
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return fmt.Errorf("%w: ndjson", ErrUpstreamStreamIncomplete)
 }

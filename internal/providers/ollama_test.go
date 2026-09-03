@@ -1,6 +1,7 @@
 package providers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,8 @@ import (
 
 	"github.com/lunargate-ai/gateway/internal/config"
 	"github.com/lunargate-ai/gateway/pkg/models"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 )
 
 func decodeOllamaRequestBody(t *testing.T, reqBody io.Reader) map[string]interface{} {
@@ -388,5 +391,83 @@ func TestOllamaTranslator_TranslateRequest_ToolChoiceFunctionUnknownToolReturnsP
 	}
 	if providerErr.Type != "invalid_request_error" {
 		t.Fatalf("expected invalid_request_error, got %q", providerErr.Type)
+	}
+}
+
+func TestOllamaTranslator_TranslateRequest_DebugLogRedactsRequestContent(t *testing.T) {
+	var output bytes.Buffer
+	previousLogger := log.Logger
+	log.Logger = zerolog.New(&output).Level(zerolog.DebugLevel)
+	t.Cleanup(func() {
+		log.Logger = previousLogger
+	})
+
+	translator := NewOllamaTranslator(config.ProviderConfig{
+		BaseURL:      "http://url-user:url-secret@localhost:11434",
+		DefaultModel: "gemma3",
+	})
+
+	_, err := translator.TranslateRequest(context.Background(), &models.UnifiedRequest{
+		Model: "gemma3",
+		Messages: []models.Message{
+			{Role: "system", Content: "system-secret-instruction"},
+			{Role: "user", Content: "prompt-secret-content"},
+			{Role: "tool", Content: "tool-result-secret-content"},
+		},
+		Tools: []models.Tool{{
+			Type: "function",
+			Function: models.ToolFunction{
+				Name:        "safe_tool_name",
+				Description: "tool-description-secret",
+				Parameters: map[string]interface{}{
+					"secret_default": "tool-schema-secret",
+				},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	logged := output.String()
+	for _, sensitive := range []string{
+		"system-secret-instruction",
+		"prompt-secret-content",
+		"tool-result-secret-content",
+		"tool-description-secret",
+		"tool-schema-secret",
+		"url-user",
+		"url-secret",
+	} {
+		if strings.Contains(logged, sensitive) {
+			t.Fatalf("debug log exposed sensitive value %q: %s", sensitive, logged)
+		}
+	}
+
+	var event map[string]interface{}
+	if err := json.Unmarshal(output.Bytes(), &event); err != nil {
+		t.Fatalf("failed to decode debug log: %v", err)
+	}
+	if _, ok := event["upstream_payload"]; ok {
+		t.Fatalf("debug log must not contain upstream_payload: %#v", event)
+	}
+	if _, ok := event["upstream_url"]; ok {
+		t.Fatalf("debug log must not contain an upstream URL: %#v", event)
+	}
+	if got := event["provider"]; got != "ollama" {
+		t.Fatalf("expected provider metadata, got %#v", got)
+	}
+	if got := event["model"]; got != "gemma3" {
+		t.Fatalf("expected model metadata, got %#v", got)
+	}
+	if got := event["messages_count"]; got != float64(3) {
+		t.Fatalf("expected messages_count=3, got %#v", got)
+	}
+	if got := event["tools_count"]; got != float64(1) {
+		t.Fatalf("expected tools_count=1, got %#v", got)
+	}
+	toolNames, ok := event["tool_names"].([]interface{})
+	if !ok || len(toolNames) != 1 || toolNames[0] != "safe_tool_name" {
+		t.Fatalf("expected safe tool-name metadata, got %#v", event["tool_names"])
 	}
 }

@@ -25,6 +25,7 @@ import (
 	"github.com/lunargate-ai/gateway/internal/routing"
 	"github.com/lunargate-ai/gateway/internal/security"
 	"github.com/lunargate-ai/gateway/internal/streaming"
+	"github.com/lunargate-ai/gateway/internal/updatecheck"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
@@ -77,7 +78,14 @@ func main() {
 	streamer := streaming.NewHandler()
 	metrics := observability.NewMetrics()
 	healthChecker := health.NewChecker(version)
-	collectorClient := observability.NewCollectorClient(cfg.DataSharing, version)
+	collectorClient := observability.NewCollectorClient(cfg.General, cfg.DataSharing, version)
+	updateChecker := updatecheck.NewChecker(cfg.UpdateCheck, version)
+	updateCheckCtx, updateCheckCancel := context.WithCancel(context.Background())
+	updateChecker.Start(updateCheckCtx)
+	log.Info().
+		Bool("enabled", cfg.UpdateCheck.Enabled).
+		Str("endpoint", cfg.UpdateCheck.Endpoint).
+		Msg("automatic update check status")
 	selector := modelselect.NewEngine(cfg.ModelSelect)
 	store := modelstore.NewStore(registry, cfg.Providers)
 	handler := api.NewHandler(registry, routingEngine, fallbackExec, cache, streamer, metrics, collectorClient, selector, store)
@@ -111,7 +119,9 @@ func main() {
 		remoteControlCancel()
 		remoteControlCancel = func() {}
 		remoteControlClient = remotecontrol.NewClient(
+			cfg.General,
 			cfg.DataSharing,
+			cfg.Security,
 			version,
 			remoteControlBaseURL,
 			routingEngine.RouteNames,
@@ -135,9 +145,11 @@ func main() {
 		providersChanged := !reflect.DeepEqual(oldCfg.Providers, newCfg.Providers)
 		routingChanged := !reflect.DeepEqual(oldCfg.Routing, newCfg.Routing)
 		modelSelectChanged := !reflect.DeepEqual(oldCfg.ModelSelect, newCfg.ModelSelect)
+		generalChanged := !reflect.DeepEqual(oldCfg.General, newCfg.General)
 		dataSharingChanged := !reflect.DeepEqual(oldCfg.DataSharing, newCfg.DataSharing)
 		securityChanged := !reflect.DeepEqual(oldCfg.Security, newCfg.Security)
 		serverChanged := !reflect.DeepEqual(oldCfg.Server, newCfg.Server)
+		updateCheckChanged := !reflect.DeepEqual(oldCfg.UpdateCheck, newCfg.UpdateCheck)
 
 		if serverChanged {
 			log.Warn().Msg("server config changed; listen address and timeouts still require process restart to fully apply")
@@ -153,14 +165,21 @@ func main() {
 		cache.UpdateConfig(newCfg.Cache)
 		retrier.UpdateConfig(newCfg.Retry)
 		selector.UpdateConfig(newCfg.ModelSelect)
-		collectorClient.UpdateConfig(newCfg.DataSharing)
+		collectorClient.UpdateConfig(newCfg.General, newCfg.DataSharing)
+		if updateCheckChanged {
+			updateChecker.UpdateConfig(newCfg.UpdateCheck)
+			log.Info().
+				Bool("enabled", newCfg.UpdateCheck.Enabled).
+				Str("endpoint", newCfg.UpdateCheck.Endpoint).
+				Msg("automatic update check config updated")
+		}
 		if securityChanged {
 			if err := authManager.UpdateConfig(newCfg.Security); err != nil {
 				log.Error().Err(err).Msg("failed to reconcile inbound auth config; keeping previous auth state")
 			}
 		}
 
-		if dataSharingChanged {
+		if dataSharingChanged || generalChanged || securityChanged {
 			reconcileRemoteControl(newCfg)
 		} else if providersChanged || routingChanged || modelSelectChanged {
 			refreshRemoteControlHello()
@@ -209,6 +228,7 @@ func main() {
 	remoteControlMu.Lock()
 	remoteControlCancel()
 	remoteControlMu.Unlock()
+	updateCheckCancel()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -277,6 +297,6 @@ func logRemoteControlStatus(cfg *config.Config, remoteControlClient *remotecontr
 		Bool("data_sharing_enabled", cfg.DataSharing.Enabled).
 		Bool("remote_control_enabled", remoteControlEnabled).
 		Str("instance_id", remoteControlInstanceID).
-		Str("backend_url", cfg.DataSharing.BackendURL).
+		Str("backend_url", cfg.General.BackendURL).
 		Msg("gateway data sharing and remote control status")
 }

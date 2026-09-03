@@ -8,6 +8,7 @@ import (
 )
 
 type ResponsesRequest struct {
+	RawJSON            json.RawMessage `json:"-"`
 	Model              string          `json:"model"`
 	Input              interface{}     `json:"input"`
 	PreviousResponseID string          `json:"previous_response_id,omitempty"`
@@ -19,6 +20,7 @@ type ResponsesRequest struct {
 	Tools              []ResponsesTool `json:"tools,omitempty"`
 	ToolChoice         interface{}     `json:"tool_choice,omitempty"`
 	Stream             bool            `json:"stream,omitempty"`
+	Store              *bool           `json:"store,omitempty"`
 	User               string          `json:"user,omitempty"`
 }
 
@@ -102,6 +104,7 @@ func ResponsesToUnifiedRequest(req *ResponsesRequest) (*UnifiedRequest, error) {
 		Tools:              tools,
 		ToolChoice:         toolChoice,
 		Stream:             req.Stream,
+		Store:              req.Store,
 		User:               req.User,
 		PreviousResponseID: strings.TrimSpace(req.PreviousResponseID),
 	}

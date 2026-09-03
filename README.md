@@ -130,21 +130,30 @@ For a runnable client example, see [`gateway-examples/`](https://github.com/luna
 
 By default, LunarGate does not forward prompts or responses outside your infrastructure.
 
+LunarGate does perform a separate automatic release check. It sends only the running version and CPU architecture to `https://get.lunargate.ai/latest`; no installation identifier is included. Disable it completely with:
+
+```yaml
+update_check:
+  enabled: false
+```
+
 If you want to connect the gateway to LunarGate observability, create a gateway in the `Gateways` section of [app.lunargate.ai](https://app.lunargate.ai) and add the generated gateway API key to your environment:
 
 ```bash
 LUNARGATE_GATEWAY_API_KEY=lgw_your_gateway_api_key
 ```
 
-Then enable `data_sharing` in `config.yaml`:
+Then configure the shared Dashboard connection and enable `data_sharing` in `config.yaml`:
 
 ```yaml
+general:
+  api_key: "${LUNARGATE_GATEWAY_API_KEY}"
+
 data_sharing:
   enabled: true
   share_prompts: true
   share_responses: true
   remote_control: true
-  api_key: "${LUNARGATE_GATEWAY_API_KEY}"
 ```
 
 You can keep `share_prompts` and `share_responses` off if you want metrics-only forwarding.

@@ -13,3 +13,5 @@ dump.rdb
 *.out
 coverage.out
 /gateway
+/.gocache/
+/.gomodcache/

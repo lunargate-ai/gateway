@@ -14,6 +14,7 @@ import (
 type registryEntry struct {
 	translator   models.ProviderTranslator
 	providerType string
+	capabilities config.ProviderCapabilities
 }
 
 // Registry manages all registered provider translators.
@@ -64,7 +65,11 @@ func buildRegistryEntries(providers map[string]config.ProviderConfig) map[string
 			log.Warn().Err(err).Str("provider", id).Str("provider_type", providerType).Msg("failed to create provider translator, skipping")
 			continue
 		}
-		entries[id] = registryEntry{translator: translator, providerType: providerType}
+		entries[id] = registryEntry{
+			translator:   translator,
+			providerType: providerType,
+			capabilities: cloneProviderCapabilities(cfg.Capabilities),
+		}
 		log.Info().
 			Str("provider", id).
 			Str("provider_type", providerType).
@@ -72,6 +77,11 @@ func buildRegistryEntries(providers map[string]config.ProviderConfig) map[string
 			Msg("registered provider")
 	}
 	return entries
+}
+
+func cloneProviderCapabilities(capabilities config.ProviderCapabilities) config.ProviderCapabilities {
+	capabilities.HostedTools = append([]string(nil), capabilities.HostedTools...)
+	return capabilities
 }
 
 func resolveProviderType(providerID string, cfg config.ProviderConfig) (string, error) {
@@ -121,6 +131,18 @@ func (r *Registry) Type(name string) (string, bool) {
 		return "", false
 	}
 	return entry.providerType, true
+}
+
+// Capabilities returns the explicitly configured optional API contracts for a
+// provider. The returned value does not alias registry-owned slices.
+func (r *Registry) Capabilities(name string) (config.ProviderCapabilities, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	entry, ok := r.providers[name]
+	if !ok {
+		return config.ProviderCapabilities{}, false
+	}
+	return cloneProviderCapabilities(entry.capabilities), true
 }
 
 // List returns all registered provider names.

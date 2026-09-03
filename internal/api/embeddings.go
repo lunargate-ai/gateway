@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -32,31 +33,16 @@ func parseEmbeddingsRequest(w http.ResponseWriter, r *http.Request, captureBody 
 	defer r.Body.Close()
 
 	var req models.EmbeddingsRequest
-	var body []byte
-
-	if captureBody {
-		var err error
-		body, err = io.ReadAll(r.Body)
-		if err != nil {
-			writeRequestReadError(w, err)
-			return nil, nil, false
-		}
-		if err := json.Unmarshal(body, &req); err != nil {
-			writeRequestDecodeError(w, err)
-			return nil, nil, false
-		}
-	} else {
-		decoder := json.NewDecoder(r.Body)
-		if err := decoder.Decode(&req); err != nil {
-			writeRequestDecodeError(w, err)
-			return nil, nil, false
-		}
-		var extra json.RawMessage
-		if err := decoder.Decode(&extra); err != io.EOF {
-			writeRequestDecodeError(w, err)
-			return nil, nil, false
-		}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeRequestReadError(w, err)
+		return nil, nil, false
 	}
+	if err := decodeJSONStrict(bytes.NewReader(body), &req); err != nil {
+		writeRequestDecodeError(w, err)
+		return nil, nil, false
+	}
+	req.RawJSON = append(json.RawMessage(nil), body...)
 
 	if strings.TrimSpace(req.Model) == "" {
 		writeError(w, http.StatusBadRequest, "model is required", "invalid_request_error")
@@ -67,6 +53,9 @@ func parseEmbeddingsRequest(w http.ResponseWriter, r *http.Request, captureBody 
 		return nil, nil, false
 	}
 
+	if !captureBody {
+		return nil, &req, true
+	}
 	return body, &req, true
 }
 
@@ -97,6 +86,10 @@ func (h *Handler) resolveEmbeddingsRoute(ctx context.Context, path string, heade
 	resolved, err := h.router.Resolve(ctx, path, headers)
 	if err == nil {
 		return resolved, nil
+	}
+	var unavailable *routing.RequestedTargetUnavailableError
+	if errors.As(err, &unavailable) {
+		return nil, err
 	}
 	if strings.TrimSpace(requestedProvider) == "" {
 		return nil, err
@@ -137,7 +130,7 @@ func (h *Handler) callEmbeddingsProvider(ctx context.Context, target routing.Tar
 	}
 
 	reqCopy := *req
-	if strings.TrimSpace(reqCopy.Model) == "" && strings.TrimSpace(target.Model) != "" {
+	if strings.TrimSpace(target.Model) != "" {
 		reqCopy.Model = strings.TrimSpace(target.Model)
 	}
 	reqCopy.Model = modelid.ModelName(reqCopy.Model)
@@ -239,6 +232,8 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 	if p, m, ok := modelid.SplitCanonical(req.Model); ok {
 		requestedProvider = strings.TrimSpace(p)
 		requestedModelRaw = strings.TrimSpace(m)
+	} else {
+		requestedModelRaw = strings.TrimSpace(req.Model)
 	}
 	if strings.TrimSpace(requestedProvider) == "" {
 		requestedProvider = strings.TrimSpace(explicitProvider)
@@ -265,6 +260,11 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 
 	resolved, err := h.resolveEmbeddingsRoute(r.Context(), r.URL.Path, headers, requestedProvider)
 	if err != nil {
+		var unavailable *routing.RequestedTargetUnavailableError
+		if errors.As(err, &unavailable) {
+			writeRequestedTargetUnavailable(w, unavailable)
+			return
+		}
 		log.Error().Err(err).Str("request_id", requestID).Msg("failed to resolve embeddings route")
 		writeError(w, http.StatusBadGateway, "no route matched for this request", "routing_error")
 		return
@@ -298,7 +298,7 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 
 	noCache := r.Header.Get("X-LunarGate-No-Cache") == "true"
 	if !noCache && h.cache.Enabled() {
-		cacheKey := middleware.GenerateEmbeddingsKey(&req)
+		cacheKey := middleware.GenerateEmbeddingsKeyForTarget(&req, resolved.Target.Provider, resolved.Target.UpstreamRequestType)
 		if cached := h.cache.Get(cacheKey); cached != nil {
 			if cachedResp, ok := cached.(*models.EmbeddingsResponse); ok {
 				h.metrics.CacheHits.WithLabelValues("hit").Inc()
@@ -620,7 +620,7 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !noCache && h.cache.Enabled() {
-		cacheKey := middleware.GenerateEmbeddingsKey(&req)
+		cacheKey := middleware.GenerateEmbeddingsKeyForTarget(&req, usedTarget.Provider, usedTarget.UpstreamRequestType)
 		h.cache.Set(cacheKey, models.CloneEmbeddingsResponse(embeddingsResp))
 	}
 

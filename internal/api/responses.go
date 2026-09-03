@@ -12,9 +12,13 @@ import (
 )
 
 func responsesRequestToRawMap(req *models.ResponsesRequest) (map[string]json.RawMessage, error) {
-	body, err := json.Marshal(req)
-	if err != nil {
-		return nil, err
+	body := []byte(req.RawJSON)
+	if len(bytes.TrimSpace(body)) == 0 {
+		var err error
+		body, err = json.Marshal(req)
+		if err != nil {
+			return nil, err
+		}
 	}
 	var payload map[string]json.RawMessage
 	if err := decodeJSONStrict(bytes.NewReader(body), &payload); err != nil {
@@ -32,6 +36,7 @@ func responsesRawMapToRequest(payload map[string]json.RawMessage) (*models.Respo
 	if err := decodeJSONStrict(bytes.NewReader(body), &req); err != nil {
 		return nil, err
 	}
+	req.RawJSON = append(json.RawMessage(nil), body...)
 	return &req, nil
 }
 
@@ -66,17 +71,47 @@ func parseResponsesRequest(w http.ResponseWriter, r *http.Request) (*models.Resp
 	limitRequestBody(w, r)
 	defer r.Body.Close()
 
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeRequestReadError(w, err)
+		return nil, false
+	}
 	var req models.ResponsesRequest
-	if err := decodeJSONStrict(r.Body, &req); err != nil {
+	if err := decodeJSONStrict(bytes.NewReader(body), &req); err != nil {
 		writeRequestDecodeError(w, err)
 		return nil, false
 	}
+	req.RawJSON = append(json.RawMessage(nil), body...)
 	return &req, true
 }
 
 func copyHeaders(dst http.Header, src http.Header) {
+	blocked := map[string]struct{}{
+		"connection":          {},
+		"content-encoding":    {},
+		"content-length":      {},
+		"content-md5":         {},
+		"digest":              {},
+		"etag":                {},
+		"keep-alive":          {},
+		"last-modified":       {},
+		"proxy-authenticate":  {},
+		"proxy-authorization": {},
+		"set-cookie":          {},
+		"te":                  {},
+		"trailer":             {},
+		"transfer-encoding":   {},
+		"upgrade":             {},
+	}
+	for _, value := range src.Values("Connection") {
+		for _, token := range strings.Split(value, ",") {
+			if token = strings.ToLower(strings.TrimSpace(token)); token != "" {
+				blocked[token] = struct{}{}
+			}
+		}
+	}
 	for key, values := range src {
-		if strings.EqualFold(key, "Content-Length") {
+		if _, unsafe := blocked[strings.ToLower(strings.TrimSpace(key))]; unsafe {
 			continue
 		}
 		if _, exists := dst[key]; exists {
@@ -109,23 +144,27 @@ func makeResponsesChatRequest(r *http.Request, unifiedReq *models.UnifiedRequest
 	chatReq.Header.Set("Content-Type", "application/json")
 	chatReq.Header.Set("X-LunarGate-Request-Type", "responses")
 	chatReq.Header.Set("X-LunarGate-Original-Path", originalPath)
+	// Creating a Response is stateful and must always yield a fresh response ID.
+	chatReq.Header.Set("X-LunarGate-No-Cache", "true")
+	chatReq.Header.Set("X-LunarGate-No-Retry", "true")
+	chatReq.Header.Set("X-LunarGate-No-Fallback", "true")
 	return chatReq, nil
 }
 
-func (h *Handler) handleResponsesStream(w http.ResponseWriter, chatReq *http.Request, requestPayload map[string]json.RawMessage) {
+func (h *Handler) handleResponsesStream(w http.ResponseWriter, chatReq *http.Request, requestPayload map[string]json.RawMessage, store bool) {
 	proxy := newResponsesStreamProxy(w)
 	h.ChatCompletions(proxy, chatReq)
 	if err := proxy.finalize(); err != nil {
 		writeError(w, http.StatusBadGateway, "failed to stream responses event payload", "provider_error")
 		return
 	}
-	if h == nil || h.responsesState == nil || proxy.responseID == "" || proxy.completedResponse == nil {
+	if !store || h == nil || h.responsesState == nil || proxy.responseID == "" || proxy.completedResponse == nil {
 		return
 	}
 	h.responsesState.put(proxy.responseID, withCompletedResponseHistory(requestPayload, proxy.completedResponse))
 }
 
-func (h *Handler) handleResponsesNonStream(w http.ResponseWriter, chatReq *http.Request, requestPayload map[string]json.RawMessage) {
+func (h *Handler) handleResponsesNonStream(w http.ResponseWriter, chatReq *http.Request, requestPayload map[string]json.RawMessage, store bool) {
 	status, headers, unifiedResp, errorBody, err := h.executeChatCompletionsUnified(chatReq)
 	copyHeaders(w.Header(), headers)
 	if err != nil {
@@ -139,7 +178,7 @@ func (h *Handler) handleResponsesNonStream(w http.ResponseWriter, chatReq *http.
 	}
 
 	resp := models.UnifiedResponseToResponses(unifiedResp)
-	if h != nil && h.responsesState != nil && resp != nil {
+	if store && h != nil && h.responsesState != nil && resp != nil {
 		if completedResponse, err := responsesResponseToMap(resp); err == nil {
 			h.responsesState.put(resp.ID, withCompletedResponseHistory(requestPayload, completedResponse))
 		}
@@ -189,8 +228,8 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if unifiedReq.Stream {
-		h.handleResponsesStream(w, chatReq, resolvedPayload)
+		h.handleResponsesStream(w, chatReq, resolvedPayload, responsesReq.Store == nil || *responsesReq.Store)
 		return
 	}
-	h.handleResponsesNonStream(w, chatReq, resolvedPayload)
+	h.handleResponsesNonStream(w, chatReq, resolvedPayload, responsesReq.Store == nil || *responsesReq.Store)
 }

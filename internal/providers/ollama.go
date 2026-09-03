@@ -153,7 +153,6 @@ func (t *OllamaTranslator) TranslateRequest(ctx context.Context, req *models.Uni
 	endpoint := fmt.Sprintf("%s/api/chat", strings.TrimRight(strings.TrimSpace(t.cfg.BaseURL), "/"))
 	log.Debug().
 		Str("provider", "ollama").
-		Str("upstream_url", endpoint).
 		Str("model", ollamaReq.Model).
 		Bool("stream", ollamaReq.Stream).
 		Int("messages_count", len(ollamaReq.Messages)).
@@ -163,7 +162,6 @@ func (t *OllamaTranslator) TranslateRequest(ctx context.Context, req *models.Uni
 		Str("tool_choice_mode", toolChoiceMode).
 		Bool("has_think", ollamaReq.Think != nil).
 		Bool("has_format", ollamaReq.Format != nil).
-		RawJSON("upstream_payload", body).
 		Msg("sending chat request to ollama")
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))

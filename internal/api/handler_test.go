@@ -2,7 +2,9 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -164,8 +166,16 @@ func TestChatCompletions_RetryExhausted429PreservesUpstreamStatus(t *testing.T) 
 
 func TestChatCompletions_NoRetryDisablesPerTargetRetriesAndStillFallsBack(t *testing.T) {
 	primaryCalls := 0
+	primaryModel := ""
 	primaryUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		primaryCalls++
+		var payload struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode primary request: %v", err)
+		}
+		primaryModel = payload.Model
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write([]byte(`{"error":{"message":"try fallback","type":"server_error"}}`))
@@ -173,8 +183,16 @@ func TestChatCompletions_NoRetryDisablesPerTargetRetriesAndStillFallsBack(t *tes
 	defer primaryUpstream.Close()
 
 	fallbackCalls := 0
+	fallbackModel := ""
 	fallbackUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fallbackCalls++
+		var payload struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode fallback request: %v", err)
+		}
+		fallbackModel = payload.Model
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"chatcmpl-fallback","object":"chat.completion","created":1,"model":"fallback-gpt","choices":[{"index":0,"message":{"role":"assistant","content":"ok-from-fallback"},"finish_reason":"stop"}]}`))
 	}))
@@ -208,7 +226,7 @@ func TestChatCompletions_NoRetryDisablesPerTargetRetriesAndStillFallsBack(t *tes
 	metrics := observability.NewMetricsWithRegisterer(prometheus.NewRegistry())
 	h := NewHandler(reg, router, fb, cache, streamer, metrics, nil, nil, nil)
 
-	payload := models.UnifiedRequest{Model: "gpt-primary", Messages: []models.Message{{Role: "user", Content: "hi"}}}
+	payload := models.UnifiedRequest{Messages: []models.Message{{Role: "user", Content: "hi"}}}
 	b, err := json.Marshal(payload)
 	if err != nil {
 		t.Fatalf("failed to marshal payload: %v", err)
@@ -228,11 +246,197 @@ func TestChatCompletions_NoRetryDisablesPerTargetRetriesAndStillFallsBack(t *tes
 	if fallbackCalls != 1 {
 		t.Fatalf("expected fallback to run after the single primary failure, got %d calls", fallbackCalls)
 	}
+	if primaryModel != "gpt-primary" {
+		t.Fatalf("primary upstream model = %q, want %q", primaryModel, "gpt-primary")
+	}
+	if fallbackModel != "gpt-fallback" {
+		t.Fatalf("fallback upstream model = %q, want %q", fallbackModel, "gpt-fallback")
+	}
 	if got := rec.Header().Get("X-LunarGate-Provider"); got != "fallback" {
 		t.Fatalf("expected fallback provider in response header, got %q", got)
 	}
 	if gauge := testutil.ToFloat64(metrics.CircuitBreakerState.WithLabelValues("fallback")); gauge != 0 {
 		t.Fatalf("expected fallback circuit breaker gauge to remain closed, got %v", gauge)
+	}
+}
+
+func TestCallEmbeddingsProviderBindsTargetModel(t *testing.T) {
+	upstreamModel := ""
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode embeddings request: %v", err)
+		}
+		upstreamModel = payload.Model
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[],"model":"embedding-fallback","usage":{"prompt_tokens":1,"total_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	reg := providers.NewRegistry(map[string]config.ProviderConfig{
+		"fallback": {Type: "openai", APIKey: "dummy", BaseURL: upstream.URL},
+	})
+	h := &Handler{registry: reg, providerClients: newProviderClientRegistry(nil)}
+	req := &models.EmbeddingsRequest{Model: "primary/embedding-primary", Input: "hello"}
+	resp, err := h.callEmbeddingsProvider(context.Background(), routing.Target{
+		Provider: "fallback",
+		Model:    "embedding-fallback",
+	}, req, nil)
+	if err != nil {
+		t.Fatalf("callEmbeddingsProvider returned error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if upstreamModel != "embedding-fallback" {
+		t.Fatalf("fallback upstream model = %q, want %q", upstreamModel, "embedding-fallback")
+	}
+}
+
+func TestChatCompletionsRejectsUnavailableBareModel(t *testing.T) {
+	h := newUnavailableModelTestHandler(t)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(
+		`{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}`,
+	))
+	rec := httptest.NewRecorder()
+
+	h.ChatCompletions(rec, req)
+	assertModelNotFoundError(t, rec)
+}
+
+func TestChatCompletionsNormalizesAutoModelHeader(t *testing.T) {
+	upstreamModel := ""
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		upstreamModel = payload.Model
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-auto","object":"chat.completion","created":1,"model":"mock-gpt","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer upstream.Close()
+
+	reg := providers.NewRegistry(map[string]config.ProviderConfig{
+		"openai": {Type: "openai", APIKey: "dummy", BaseURL: upstream.URL},
+	})
+	router := routing.NewEngine(config.RoutingConfig{
+		DefaultStrategy: "weighted",
+		Routes: []config.RouteConfig{{
+			Name:    "default",
+			Match:   config.MatchConfig{Path: "*"},
+			Targets: []config.TargetConfig{{Provider: "openai", Model: "mock-gpt", Weight: 1}},
+		}},
+	})
+	h := NewHandler(
+		reg,
+		router,
+		resilience.NewFallbackExecutor(
+			resilience.NewRetrier(config.RetryConfig{Enabled: false}),
+			resilience.NewCircuitBreakerManager(),
+		),
+		middleware.NewCache(config.CacheConfig{Enabled: false}),
+		streaming.NewHandler(),
+		observability.NewMetricsWithRegisterer(prometheus.NewRegistry()),
+		nil,
+		nil,
+		nil,
+	)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(
+		`{"model":"client-placeholder","messages":[{"role":"user","content":"hello"}]}`,
+	))
+	req.Header.Set("X-LunarGate-Model", "lunargate/auto")
+	rec := httptest.NewRecorder()
+
+	h.ChatCompletions(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if upstreamModel != "mock-gpt" {
+		t.Fatalf("upstream model = %q, want route-selected model", upstreamModel)
+	}
+}
+
+func TestEmbeddingsRejectsUnavailableBareModel(t *testing.T) {
+	h := newUnavailableModelTestHandler(t)
+	req := httptest.NewRequest(http.MethodPost, "/v1/embeddings", strings.NewReader(
+		`{"model":"text-embedding-ada-002","input":"hello"}`,
+	))
+	rec := httptest.NewRecorder()
+
+	h.Embeddings(rec, req)
+	assertModelNotFoundError(t, rec)
+}
+
+func TestResolveEmbeddingsRouteDoesNotBypassTargetPolicy(t *testing.T) {
+	reg := providers.NewRegistry(map[string]config.ProviderConfig{
+		"allowed": {Type: "openai", APIKey: "dummy", BaseURL: "http://127.0.0.1:1"},
+		"blocked": {Type: "openai", APIKey: "dummy", BaseURL: "http://127.0.0.1:2"},
+	})
+	router := routing.NewEngine(config.RoutingConfig{
+		DefaultStrategy: "weighted",
+		Routes: []config.RouteConfig{{
+			Name:    "embeddings-policy",
+			Match:   config.MatchConfig{Path: "/v1/embeddings"},
+			Targets: []config.TargetConfig{{Provider: "allowed", Model: "text-embedding-3-small", Weight: 1}},
+		}},
+	})
+	h := &Handler{registry: reg, router: router}
+
+	_, err := h.resolveEmbeddingsRoute(context.Background(), "/v1/embeddings", map[string]string{
+		"x-lunargate-provider": "blocked",
+		"x-lunargate-model":    "blocked/text-embedding-3-small",
+	}, "blocked")
+	var unavailable *routing.RequestedTargetUnavailableError
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("error = %T %v, want RequestedTargetUnavailableError", err, err)
+	}
+}
+
+func newUnavailableModelTestHandler(t *testing.T) *Handler {
+	t.Helper()
+	reg := providers.NewRegistry(map[string]config.ProviderConfig{
+		"openai": {Type: "openai", APIKey: "dummy", BaseURL: "http://127.0.0.1:1"},
+	})
+	router := routing.NewEngine(config.RoutingConfig{
+		DefaultStrategy: "weighted",
+		Routes: []config.RouteConfig{{
+			Name:    "default",
+			Match:   config.MatchConfig{Path: "*"},
+			Targets: []config.TargetConfig{{Provider: "openai", Model: "gpt-5.4", Weight: 1}},
+		}},
+	})
+	retrier := resilience.NewRetrier(config.RetryConfig{Enabled: false})
+	return NewHandler(
+		reg,
+		router,
+		resilience.NewFallbackExecutor(retrier, resilience.NewCircuitBreakerManager()),
+		middleware.NewCache(config.CacheConfig{Enabled: false}),
+		streaming.NewHandler(),
+		observability.NewMetricsWithRegisterer(prometheus.NewRegistry()),
+		nil,
+		nil,
+		nil,
+	)
+}
+
+func assertModelNotFoundError(t *testing.T, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	var response models.ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.Error.Param == nil || *response.Error.Param != "model" {
+		t.Fatalf("param = %#v, want model", response.Error.Param)
+	}
+	if response.Error.Code == nil || *response.Error.Code != "model_not_found" {
+		t.Fatalf("code = %#v, want model_not_found", response.Error.Code)
 	}
 }
 
@@ -1125,6 +1329,10 @@ func TestCopyHeaders_PreservesExistingDestinationHeaders(t *testing.T) {
 	src.Set("X-Keep", "replace")
 	src.Set("X-New", "new-value")
 	src.Set("Content-Length", "123")
+	src.Set("Content-Encoding", "gzip")
+	src.Set("Set-Cookie", "session=secret")
+	src.Set("Connection", "X-Hop")
+	src.Set("X-Hop", "private")
 
 	copyHeaders(dst, src)
 
@@ -1136,6 +1344,11 @@ func TestCopyHeaders_PreservesExistingDestinationHeaders(t *testing.T) {
 	}
 	if got := dst.Get("Content-Length"); got != "" {
 		t.Fatalf("expected Content-Length to be skipped, got %q", got)
+	}
+	for _, key := range []string{"Content-Encoding", "Set-Cookie", "Connection", "X-Hop"} {
+		if got := dst.Get(key); got != "" {
+			t.Fatalf("expected unsafe header %s to be skipped, got %q", key, got)
+		}
 	}
 }
 

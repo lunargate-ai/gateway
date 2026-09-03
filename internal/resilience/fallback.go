@@ -43,6 +43,9 @@ func (f *FallbackExecutor) Execute(ctx context.Context, primary routing.Target, 
 	if errors.Is(err, context.Canceled) || ctx.Err() != nil {
 		return nil, primary, false, retryCount, cbState, err
 	}
+	if fallbackDisabled(ctx) {
+		return nil, primary, false, retryCount, cbState, err
+	}
 
 	log.Warn().
 		Err(err).

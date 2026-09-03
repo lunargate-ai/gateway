@@ -9,12 +9,36 @@ server:
   write_timeout: 0s
   idle_timeout: 60s
 
+# Shared gateway identity used by Dashboard integrations.
+general:
+  api_key: "${LUNARGATE_GATEWAY_API_KEY}"
+  backend_url: "${LUNARGATE_BACKEND_URL}"
+
+# Automatic release checks. The gateway sends only its current version and
+# CPU architecture. Set enabled to false to disable all update-check traffic.
+update_check:
+  enabled: true
+  endpoint: "${LUNARGATE_UPDATE_CHECK_ENDPOINT}"
+  interval: 24h
+  timeout: 3s
+
 # LLM Provider Configuration
 providers:
   openai:
     api_key: "${OPENAI_API_KEY}"
     default_model: "gpt-4-turbo"
     organization: "${OPENAI_ORG_ID}"
+    # Extended APIs are opt-in. Enable only contracts implemented by the
+    # exact upstream behind base_url.
+    capabilities:
+      responses_lifecycle: true
+      conversations: true
+      background_responses: true
+      response_cancellation: true
+      response_compaction: true
+      response_input_tokens: true
+      embeddings_base64: true
+      hosted_tools: []
 
   openai-second-account:
     type: "openai"
@@ -161,10 +185,9 @@ security:
 # Enable to forward prompts/responses for log inspection in the dashboard.
 # WARNING: Enabling this means prompt/response content leaves your infrastructure.
 # Create the gateway API key in the "Gateways" section of https://app.lunargate.ai
+# and set it under `general.api_key`.
 data_sharing:
   enabled: false              # Master switch - must be true for any sharing
   share_prompts: false        # Forward user prompts to SaaS backend
   share_responses: false      # Forward LLM responses to SaaS backend
-  backend_url: "${LUNARGATE_BACKEND_URL}"
-  api_key: "${LUNARGATE_GATEWAY_API_KEY}"
   remote_control: false

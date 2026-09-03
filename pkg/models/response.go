@@ -1,15 +1,18 @@
 package models
 
+import "encoding/json"
+
 // UnifiedResponse represents an OpenAI-compatible chat completion response.
 // All provider translators convert their native responses TO this format.
 type UnifiedResponse struct {
-	ID                string   `json:"id"`
-	Object            string   `json:"object"`
-	Created           int64    `json:"created"`
-	Model             string   `json:"model"`
-	Choices           []Choice `json:"choices"`
-	Usage             *Usage   `json:"usage,omitempty"`
-	SystemFingerprint string   `json:"system_fingerprint,omitempty"`
+	RawJSON           json.RawMessage `json:"-"`
+	ID                string          `json:"id"`
+	Object            string          `json:"object"`
+	Created           int64           `json:"created"`
+	Model             string          `json:"model"`
+	Choices           []Choice        `json:"choices"`
+	Usage             *Usage          `json:"usage,omitempty"`
+	SystemFingerprint string          `json:"system_fingerprint,omitempty"`
 }
 
 type Choice struct {

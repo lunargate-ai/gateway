@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,8 @@ import (
 	"github.com/lunargate-ai/gateway/pkg/models"
 	"github.com/rs/zerolog/log"
 )
+
+var ErrUpstreamStreamIncomplete = errors.New("upstream stream ended before a terminal event")
 
 func upstreamProviderError(status int, provider string, body []byte) *providers.ProviderError {
 	trimmed := strings.TrimSpace(string(body))
@@ -137,39 +140,44 @@ func (h *Handler) streamResponse(
 
 		// Parse through the translator
 		chunk, err := translator.ParseStreamChunk([]byte(data))
-		if err != nil {
-			if err == providers.ErrStreamDone {
-				fmt.Fprintf(w, "data: [DONE]\n\n")
-				flusher.Flush()
-				return nil
-			}
+		streamDone := err == providers.ErrStreamDone
+		if err != nil && !streamDone {
 			return fmt.Errorf("failed to parse stream chunk: %w", err)
 		}
 
-		if chunk == nil {
+		if chunk == nil && !streamDone {
 			continue
 		}
 
-		if observer != nil {
-			observer(chunk)
+		if chunk != nil {
+			if observer != nil {
+				observer(chunk)
+			}
+
+			// Marshal to OpenAI-compatible format
+			chunkJSON, err := json.Marshal(chunk)
+			if err != nil {
+				log.Error().Err(err).Msg("failed to marshal stream chunk")
+			} else {
+				fmt.Fprintf(w, "data: %s\n\n", chunkJSON)
+				flusher.Flush()
+			}
 		}
 
-		// Marshal to OpenAI-compatible format
-		chunkJSON, err := json.Marshal(chunk)
-		if err != nil {
-			log.Error().Err(err).Msg("failed to marshal stream chunk")
-			continue
+		if streamDone {
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
+			return nil
 		}
-
-		fmt.Fprintf(w, "data: %s\n\n", chunkJSON)
-		flusher.Flush()
 	}
 
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("stream scanner error: %w", err)
 	}
-
-	return nil
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return fmt.Errorf("%w: sse", ErrUpstreamStreamIncomplete)
 }
 
 // StreamAnthropicResponse handles Anthropic's different SSE format.
@@ -265,35 +273,41 @@ func (h *Handler) streamAnthropicResponse(
 			}
 
 			chunk, parseErr := translator.ParseStreamChunk(payload)
-			if parseErr != nil {
-				if parseErr == providers.ErrStreamDone {
-					fmt.Fprintf(w, "data: [DONE]\n\n")
-					flusher.Flush()
-					return nil
-				}
+			streamDone := parseErr == providers.ErrStreamDone
+			if parseErr != nil && !streamDone {
 				return fmt.Errorf("failed to parse anthropic stream chunk: %w", parseErr)
 			}
 
-			if chunk == nil {
+			if chunk == nil && !streamDone {
 				continue
 			}
 
-			if observer != nil {
-				observer(chunk)
+			if chunk != nil {
+				if observer != nil {
+					observer(chunk)
+				}
+
+				chunkJSON, marshalErr := json.Marshal(chunk)
+				if marshalErr != nil {
+					log.Error().Err(marshalErr).Msg("failed to marshal stream chunk")
+				} else {
+					fmt.Fprintf(w, "data: %s\n\n", chunkJSON)
+					flusher.Flush()
+				}
 			}
 
-			chunkJSON, marshalErr := json.Marshal(chunk)
-			if marshalErr != nil {
-				log.Error().Err(marshalErr).Msg("failed to marshal stream chunk")
-				continue
+			if streamDone {
+				fmt.Fprintf(w, "data: [DONE]\n\n")
+				flusher.Flush()
+				return nil
 			}
-
-			fmt.Fprintf(w, "data: %s\n\n", chunkJSON)
-			flusher.Flush()
 		}
 	}
 
-	return nil
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return fmt.Errorf("%w: anthropic sse", ErrUpstreamStreamIncomplete)
 }
 
 // IsStreamRequest checks if the request body has stream=true.

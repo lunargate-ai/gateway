@@ -16,10 +16,16 @@ import (
 	"github.com/spf13/viper"
 )
 
-const defaultDataSharingBackendURL = "https://api.lunargate.ai/v1"
+const (
+	defaultBackendURL         = "https://api.lunargate.ai/v1"
+	defaultUpdateCheckURL     = "https://get.lunargate.ai/latest"
+	defaultUpdateCheckPeriod  = 24 * time.Hour
+	defaultUpdateCheckTimeout = 3 * time.Second
+)
 
 // Config holds the entire gateway configuration.
 type Config struct {
+	General     GeneralConfig             `mapstructure:"general"`
 	Server      ServerConfig              `mapstructure:"server"`
 	Providers   map[string]ProviderConfig `mapstructure:"providers"`
 	Routing     RoutingConfig             `mapstructure:"routing"`
@@ -30,6 +36,19 @@ type Config struct {
 	Logging     LoggingConfig             `mapstructure:"logging"`
 	Security    SecurityConfig            `mapstructure:"security"`
 	DataSharing DataSharingConfig         `mapstructure:"data_sharing"`
+	UpdateCheck UpdateCheckConfig         `mapstructure:"update_check"`
+}
+
+type GeneralConfig struct {
+	APIKey     string `mapstructure:"api_key"`
+	BackendURL string `mapstructure:"backend_url"`
+}
+
+type UpdateCheckConfig struct {
+	Enabled  bool          `mapstructure:"enabled"`
+	Endpoint string        `mapstructure:"endpoint"`
+	Interval time.Duration `mapstructure:"interval"`
+	Timeout  time.Duration `mapstructure:"timeout"`
 }
 
 type ServerConfig struct {
@@ -60,6 +79,20 @@ type ProviderConfig struct {
 	NormalizeDeveloperRole bool                 `mapstructure:"normalize_developer_role"`
 	Extra                  map[string]string    `mapstructure:"extra"`
 	Models                 ProviderModelsConfig `mapstructure:"models"`
+	Capabilities           ProviderCapabilities `mapstructure:"capabilities"`
+}
+
+// ProviderCapabilities declares optional API contracts that must never be
+// inferred from a provider's type or URL. Zero values are deliberately safe.
+type ProviderCapabilities struct {
+	ResponsesLifecycle   bool     `mapstructure:"responses_lifecycle"`
+	Conversations        bool     `mapstructure:"conversations"`
+	BackgroundResponses  bool     `mapstructure:"background_responses"`
+	ResponseCancellation bool     `mapstructure:"response_cancellation"`
+	ResponseCompaction   bool     `mapstructure:"response_compaction"`
+	ResponseInputTokens  bool     `mapstructure:"response_input_tokens"`
+	EmbeddingsBase64     bool     `mapstructure:"embeddings_base64"`
+	HostedTools          []string `mapstructure:"hosted_tools"`
 }
 
 type ProviderModelsConfig struct {
@@ -208,14 +241,13 @@ type ExternalAuthConfig struct {
 	Timeout          time.Duration `mapstructure:"timeout"`
 }
 
-// DataSharingConfig controls what request/response data the gateway forwards
-// to the SaaS backend. When disabled (default), ONLY metrics are sent (zero data leakage).
-// When enabled, prompts and/or responses can be forwarded for log inspection in the dashboard.
+// DataSharingConfig controls all gateway communication with the SaaS backend.
+// Enabled is the master switch for collection and remote control. Prompt and
+// response forwarding remain independently opt-in when the master switch is on.
 type DataSharingConfig struct {
 	Enabled        bool   `mapstructure:"enabled"`
 	SharePrompts   bool   `mapstructure:"share_prompts"`
 	ShareResponses bool   `mapstructure:"share_responses"`
-	BackendURL     string `mapstructure:"backend_url"`
 	APIKey         string `mapstructure:"api_key"`
 	GatewayLat     string `mapstructure:"gateway_lat"`
 	GatewayLon     string `mapstructure:"gateway_lon"`
@@ -256,6 +288,8 @@ func NewManager(path string) (*Manager, error) {
 }
 
 func (m *Manager) setDefaults() {
+	m.v.SetDefault("general.api_key", "")
+
 	m.v.SetDefault("server.host", "0.0.0.0")
 	m.v.SetDefault("server.port", 8080)
 	m.v.SetDefault("server.read_timeout", "30s")
@@ -309,9 +343,13 @@ func (m *Manager) setDefaults() {
 	m.v.SetDefault("data_sharing.enabled", false)
 	m.v.SetDefault("data_sharing.share_prompts", false)
 	m.v.SetDefault("data_sharing.share_responses", false)
-	m.v.SetDefault("data_sharing.backend_url", defaultDataSharingBackendURL)
 	m.v.SetDefault("data_sharing.api_key", "")
 	m.v.SetDefault("data_sharing.remote_control", false)
+
+	m.v.SetDefault("update_check.enabled", true)
+	m.v.SetDefault("update_check.endpoint", defaultUpdateCheckURL)
+	m.v.SetDefault("update_check.interval", defaultUpdateCheckPeriod)
+	m.v.SetDefault("update_check.timeout", defaultUpdateCheckTimeout)
 }
 
 func (m *Manager) load() error {
@@ -325,23 +363,65 @@ func (m *Manager) load() error {
 	}
 
 	expandConfigEnv(cfg)
+	normalizeProviderCapabilities(cfg)
 	normalizeSecurityConfig(cfg)
+	resolveGatewayAPIKey(cfg)
 	if err := validateConfig(cfg); err != nil {
 		return fmt.Errorf("invalid config: %w", err)
 	}
 
-	cfg.DataSharing.BackendURL = expandEnv(cfg.DataSharing.BackendURL)
-	cfg.DataSharing.BackendURL = strings.TrimRight(strings.TrimSpace(cfg.DataSharing.BackendURL), "/")
-	if strings.HasSuffix(cfg.DataSharing.BackendURL, "/collector") {
-		cfg.DataSharing.BackendURL = strings.TrimSuffix(cfg.DataSharing.BackendURL, "/collector")
+	if strings.TrimSpace(cfg.General.BackendURL) == "" {
+		cfg.General.BackendURL = strings.TrimSpace(expandEnv(m.v.GetString("data_sharing.backend_url")))
 	}
-	if strings.TrimSpace(cfg.DataSharing.BackendURL) == "" {
-		cfg.DataSharing.BackendURL = defaultDataSharingBackendURL
+	cfg.General.BackendURL = expandEnv(cfg.General.BackendURL)
+	cfg.General.BackendURL = strings.TrimRight(strings.TrimSpace(cfg.General.BackendURL), "/")
+	if strings.HasSuffix(cfg.General.BackendURL, "/collector") {
+		cfg.General.BackendURL = strings.TrimSuffix(cfg.General.BackendURL, "/collector")
 	}
-	cfg.DataSharing.APIKey = expandEnv(cfg.DataSharing.APIKey)
+	if strings.TrimSpace(cfg.General.BackendURL) == "" {
+		cfg.General.BackendURL = defaultBackendURL
+	}
+	cfg.DataSharing.APIKey = strings.TrimSpace(expandEnv(cfg.DataSharing.APIKey))
+	cfg.General.APIKey = strings.TrimSpace(expandEnv(cfg.General.APIKey))
+	cfg.UpdateCheck.Endpoint = strings.TrimSpace(expandEnv(cfg.UpdateCheck.Endpoint))
+	if cfg.UpdateCheck.Endpoint == "" {
+		cfg.UpdateCheck.Endpoint = defaultUpdateCheckURL
+	}
+	if cfg.UpdateCheck.Interval <= 0 {
+		cfg.UpdateCheck.Interval = defaultUpdateCheckPeriod
+	}
+	if cfg.UpdateCheck.Timeout <= 0 {
+		cfg.UpdateCheck.Timeout = defaultUpdateCheckTimeout
+	}
 
 	m.current.Store(cfg)
 	return nil
+}
+
+func normalizeProviderCapabilities(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+	for providerID, providerCfg := range cfg.Providers {
+		if len(providerCfg.Capabilities.HostedTools) == 0 {
+			continue
+		}
+		seen := make(map[string]struct{}, len(providerCfg.Capabilities.HostedTools))
+		hostedTools := make([]string, 0, len(providerCfg.Capabilities.HostedTools))
+		for _, raw := range providerCfg.Capabilities.HostedTools {
+			toolType := strings.ToLower(strings.TrimSpace(raw))
+			if toolType == "" {
+				continue
+			}
+			if _, ok := seen[toolType]; ok {
+				continue
+			}
+			seen[toolType] = struct{}{}
+			hostedTools = append(hostedTools, toolType)
+		}
+		providerCfg.Capabilities.HostedTools = hostedTools
+		cfg.Providers[providerID] = providerCfg
+	}
 }
 
 func normalizeSecurityConfig(cfg *Config) {
@@ -398,6 +478,26 @@ func normalizeSecurityConfig(cfg *Config) {
 	if securityCfg.Provider == "api_key" && len(securityCfg.APIKey.Keys) > 0 {
 		securityCfg.Enabled = true
 	}
+}
+
+func resolveGatewayAPIKey(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+
+	generalKey := strings.TrimSpace(expandEnv(cfg.General.APIKey))
+	legacyDataSharingKey := strings.TrimSpace(expandEnv(cfg.DataSharing.APIKey))
+
+	switch {
+	case generalKey != "" && legacyDataSharingKey != "" && generalKey != legacyDataSharingKey:
+		log.Warn().Msg("both general.api_key and deprecated data_sharing.api_key are set; using general.api_key")
+	case generalKey == "" && legacyDataSharingKey != "":
+		generalKey = legacyDataSharingKey
+		log.Warn().Msg("data_sharing.api_key is deprecated; move this value to general.api_key")
+	}
+
+	cfg.General.APIKey = generalKey
+	cfg.DataSharing.APIKey = generalKey
 }
 
 func validateConfig(cfg *Config) error {

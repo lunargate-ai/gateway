@@ -22,16 +22,19 @@ import (
 type ModelListFunc func(context.Context) []string
 
 type Client struct {
-	dataSharing  config.DataSharingConfig
-	instanceID   string
-	version      string
-	localBaseURL string
-	routeNames   func() []string
-	modelIDs     ModelListFunc
-	httpClient   *http.Client
-	refreshCh    chan struct{}
-	lastLogKey   string
-	lastLogAt    time.Time
+	backendURL      string
+	apiKey          string
+	instanceID      string
+	version         string
+	localBaseURL    string
+	localAuthHeader string
+	localAuthValue  string
+	routeNames      func() []string
+	modelIDs        ModelListFunc
+	httpClient      *http.Client
+	refreshCh       chan struct{}
+	lastLogKey      string
+	lastLogAt       time.Time
 }
 
 type helloMessage struct {
@@ -74,29 +77,63 @@ type sandboxResponseMessage struct {
 }
 
 func NewClient(
+	general config.GeneralConfig,
 	dataSharing config.DataSharingConfig,
+	security config.SecurityConfig,
 	version string,
 	localBaseURL string,
 	routeNames func() []string,
 	modelIDs ModelListFunc,
 ) *Client {
+	if !dataSharing.Enabled {
+		return nil
+	}
 	if !dataSharing.RemoteControl {
 		return nil
 	}
-	if strings.TrimSpace(dataSharing.APIKey) == "" {
-		log.Warn().Msg("remote control disabled: api_key missing in data_sharing config")
+	apiKey := strings.TrimSpace(general.APIKey)
+	if apiKey == "" {
+		log.Warn().Msg("remote control disabled: general.api_key missing in config")
 		return nil
 	}
-	return &Client{
-		dataSharing:  dataSharing,
-		instanceID:   localInstanceID(),
-		version:      version,
-		localBaseURL: strings.TrimRight(strings.TrimSpace(localBaseURL), "/"),
-		routeNames:   routeNames,
-		modelIDs:     modelIDs,
-		httpClient:   &http.Client{Timeout: 5 * time.Minute},
-		refreshCh:    make(chan struct{}, 1),
+	backendURL := strings.TrimSpace(general.BackendURL)
+	if backendURL == "" {
+		log.Warn().Msg("remote control disabled: general.backend_url missing in config")
+		return nil
 	}
+	localAuthHeader, localAuthValue := loopbackCredential(security)
+	return &Client{
+		backendURL:      backendURL,
+		apiKey:          apiKey,
+		instanceID:      localInstanceID(),
+		version:         version,
+		localBaseURL:    strings.TrimRight(strings.TrimSpace(localBaseURL), "/"),
+		localAuthHeader: localAuthHeader,
+		localAuthValue:  localAuthValue,
+		routeNames:      routeNames,
+		modelIDs:        modelIDs,
+		httpClient:      &http.Client{Timeout: 5 * time.Minute},
+		refreshCh:       make(chan struct{}, 1),
+	}
+}
+
+func loopbackCredential(security config.SecurityConfig) (string, string) {
+	if !security.Enabled || !strings.EqualFold(strings.TrimSpace(security.Provider), "api_key") || len(security.APIKey.Keys) == 0 {
+		return "", ""
+	}
+
+	header := strings.TrimSpace(security.APIKey.Header)
+	if header == "" {
+		header = "Authorization"
+	}
+	credential := strings.TrimSpace(security.APIKey.Keys[0].Value)
+	if credential == "" {
+		return "", ""
+	}
+	if prefix := strings.TrimSpace(security.APIKey.Prefix); prefix != "" {
+		credential = prefix + " " + credential
+	}
+	return header, credential
 }
 
 func (c *Client) Start(ctx context.Context) {
@@ -149,7 +186,7 @@ func (c *Client) connectAndServe(ctx context.Context) error {
 		return err
 	}
 	headers := http.Header{}
-	headers.Set("Authorization", "Bearer "+strings.TrimSpace(c.dataSharing.APIKey))
+	headers.Set("Authorization", "Bearer "+strings.TrimSpace(c.apiKey))
 	conn, resp, err := websocket.DefaultDialer.DialContext(ctx, wsURL, headers)
 	if err != nil {
 		return classifyDialError(err, resp)
@@ -307,6 +344,9 @@ func (c *Client) executeSandbox(ctx context.Context, msg sandboxExecuteMessage) 
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-LunarGate-No-Cache", "true")
+	if c.localAuthHeader != "" && c.localAuthValue != "" {
+		req.Header.Set(c.localAuthHeader, c.localAuthValue)
+	}
 	if msg.Target.Mode == "route" {
 		req.Header.Set("X-LunarGate-Route", strings.TrimSpace(msg.Target.Value))
 	} else if msg.Target.Mode == "model" {
@@ -344,9 +384,9 @@ func (c *Client) buildHello(ctx context.Context) helloMessage {
 }
 
 func (c *Client) websocketURL() (string, error) {
-	base, err := url.Parse(strings.TrimSpace(c.dataSharing.BackendURL))
+	base, err := url.Parse(strings.TrimSpace(c.backendURL))
 	if err != nil {
-		return "", fmt.Errorf("invalid data_sharing.backend_url: %w", err)
+		return "", fmt.Errorf("invalid general.backend_url: %w", err)
 	}
 	switch base.Scheme {
 	case "https":
@@ -354,7 +394,7 @@ func (c *Client) websocketURL() (string, error) {
 	case "http":
 		base.Scheme = "ws"
 	default:
-		return "", fmt.Errorf("unsupported data_sharing.backend_url scheme: %s", base.Scheme)
+		return "", fmt.Errorf("unsupported general.backend_url scheme: %s", base.Scheme)
 	}
 	base.Path = strings.TrimRight(base.Path, "/") + "/remote-control/ws/gateway"
 	return base.String(), nil
@@ -381,7 +421,7 @@ func (c *Client) logConnectionIssue(err error) {
 		if statusErr.detail != "" {
 			event = event.Str("detail", statusErr.detail)
 		}
-		event.Msg("remote control authentication rejected by lunargate.ai; go to app.lunargate.ai and check data_sharing.api_key")
+		event.Msg("remote control authentication rejected by lunargate.ai; go to app.lunargate.ai and check general.api_key")
 		return
 	}
 

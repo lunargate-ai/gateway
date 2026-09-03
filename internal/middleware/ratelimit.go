@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lunargate-ai/gateway/internal/config"
@@ -55,11 +56,15 @@ func (tb *TokenBucket) allow() (bool, float64) {
 
 // RateLimiter is a middleware that limits request rates using token bucket algorithm.
 type RateLimiter struct {
-	mu         sync.RWMutex
-	buckets    map[string]*bucketEntry
-	cfg        config.RateLimitConfig
+	current    atomic.Pointer[rateLimitSnapshot]
 	maxBuckets int
 	bucketTTL  time.Duration
+}
+
+type rateLimitSnapshot struct {
+	cfg     config.RateLimitConfig
+	mu      sync.Mutex
+	buckets map[string]*bucketEntry
 }
 
 type bucketEntry struct {
@@ -69,38 +74,45 @@ type bucketEntry struct {
 
 // NewRateLimiter creates a new rate limiter middleware.
 func NewRateLimiter(cfg config.RateLimitConfig) *RateLimiter {
-	return &RateLimiter{
-		buckets:    make(map[string]*bucketEntry),
-		cfg:        cfg,
+	rl := &RateLimiter{
 		maxBuckets: 10000,
 		bucketTTL:  15 * time.Minute,
+	}
+	rl.current.Store(newRateLimitSnapshot(cfg))
+	return rl
+}
+
+func newRateLimitSnapshot(cfg config.RateLimitConfig) *rateLimitSnapshot {
+	return &rateLimitSnapshot{
+		cfg:     cfg,
+		buckets: make(map[string]*bucketEntry),
 	}
 }
 
 // UpdateConfig hot-reloads rate limit config.
 func (rl *RateLimiter) UpdateConfig(cfg config.RateLimitConfig) {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-	rl.cfg = cfg
-	// Reset buckets on config change
-	rl.buckets = make(map[string]*bucketEntry)
+	if rl == nil {
+		return
+	}
+	rl.current.Store(newRateLimitSnapshot(cfg))
 	log.Info().Msg("rate limiter config updated")
 }
 
 // Middleware returns the HTTP middleware handler.
 func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !rl.cfg.Enabled {
+		snapshot := rl.current.Load()
+		if snapshot == nil || !snapshot.cfg.Enabled {
 			next.ServeHTTP(w, r)
 			return
 		}
 
 		key := extractRateLimitKey(r)
-		bucket := rl.getBucket(key)
+		bucket := rl.getBucket(key, snapshot)
 
 		allowed, remaining := bucket.allow()
 
-		limit := rl.cfg.RequestsPerMinute
+		limit := snapshot.cfg.RequestsPerMinute
 		w.Header().Set("X-RateLimit-Limit", strconv.Itoa(limit))
 		w.Header().Set("X-RateLimit-Remaining", strconv.FormatFloat(remaining, 'f', 0, 64))
 
@@ -116,51 +128,37 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 	})
 }
 
-func (rl *RateLimiter) getBucket(key string) *TokenBucket {
+func (rl *RateLimiter) getBucket(key string, snapshot *rateLimitSnapshot) *TokenBucket {
 	now := time.Now()
-	rl.mu.RLock()
-	entry, ok := rl.buckets[key]
-	rl.mu.RUnlock()
-	if ok {
-		rl.mu.Lock()
-		if entry2, ok2 := rl.buckets[key]; ok2 {
-			entry2.lastSeen = now
-			b := entry2.bucket
-			rl.mu.Unlock()
-			return b
-		}
-		rl.mu.Unlock()
-	}
+	snapshot.mu.Lock()
+	defer snapshot.mu.Unlock()
 
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-
-	if entry, ok = rl.buckets[key]; ok {
+	if entry, ok := snapshot.buckets[key]; ok {
 		entry.lastSeen = now
 		return entry.bucket
 	}
 
-	rl.evictLocked(now)
+	rl.evictLocked(snapshot, now)
 
-	rpm := float64(rl.cfg.RequestsPerMinute)
-	burst := float64(rl.cfg.BurstSize)
+	rpm := float64(snapshot.cfg.RequestsPerMinute)
+	burst := float64(snapshot.cfg.BurstSize)
 	if burst <= 0 {
 		burst = rpm / 6 // default burst = 10s worth
 	}
 	b := newTokenBucket(burst, rpm/60.0)
-	rl.buckets[key] = &bucketEntry{bucket: b, lastSeen: now}
+	snapshot.buckets[key] = &bucketEntry{bucket: b, lastSeen: now}
 	return b
 }
 
-func (rl *RateLimiter) evictLocked(now time.Time) {
+func (rl *RateLimiter) evictLocked(snapshot *rateLimitSnapshot, now time.Time) {
 	if rl.bucketTTL > 0 {
-		for k, e := range rl.buckets {
+		for k, e := range snapshot.buckets {
 			if e == nil {
-				delete(rl.buckets, k)
+				delete(snapshot.buckets, k)
 				continue
 			}
 			if now.Sub(e.lastSeen) > rl.bucketTTL {
-				delete(rl.buckets, k)
+				delete(snapshot.buckets, k)
 			}
 		}
 	}
@@ -168,10 +166,10 @@ func (rl *RateLimiter) evictLocked(now time.Time) {
 	if rl.maxBuckets <= 0 {
 		return
 	}
-	for len(rl.buckets) >= rl.maxBuckets {
+	for len(snapshot.buckets) >= rl.maxBuckets {
 		var oldestKey string
 		oldestTime := now
-		for k, e := range rl.buckets {
+		for k, e := range snapshot.buckets {
 			if e == nil {
 				oldestKey = k
 				break
@@ -184,7 +182,7 @@ func (rl *RateLimiter) evictLocked(now time.Time) {
 		if oldestKey == "" {
 			return
 		}
-		delete(rl.buckets, oldestKey)
+		delete(snapshot.buckets, oldestKey)
 	}
 }
 

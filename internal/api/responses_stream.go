@@ -30,12 +30,14 @@ type responsesStreamProxy struct {
 	reasoningItemID  string
 	model            string
 	created          int64
+	usage            *models.Usage
 	text             strings.Builder
 	reasoningText    strings.Builder
 	started          bool
 	messageStarted   bool
 	reasoningStarted bool
 	completed        bool
+	streamErr        error
 	eventSeq         int
 
 	nextOutputIndex      int
@@ -73,6 +75,10 @@ func (p *responsesStreamProxy) Header() http.Header {
 
 func (p *responsesStreamProxy) WriteHeader(statusCode int) {
 	p.statusCode = statusCode
+}
+
+func (p *responsesStreamProxy) RecordStreamError(err error) {
+	p.streamErr = err
 }
 
 func (p *responsesStreamProxy) Flush() {
@@ -126,11 +132,45 @@ func (p *responsesStreamProxy) finalize() error {
 		}
 		p.buffer.Reset()
 	}
+	if p.streamErr != nil && !p.completed {
+		return p.emitFailed(p.streamErr)
+	}
 
 	if !p.completed {
 		return p.emitCompleted()
 	}
 	return nil
+}
+
+func (p *responsesStreamProxy) emitFailed(streamErr error) error {
+	if p.completed {
+		return nil
+	}
+	if err := p.ensureStarted(); err != nil {
+		return err
+	}
+	p.completed = true
+
+	message := "upstream stream failed before completion"
+	if streamErr != nil {
+		message = streamErr.Error()
+	}
+	response := map[string]interface{}{
+		"id":         p.responseID,
+		"object":     "response",
+		"created_at": p.created,
+		"status":     "failed",
+		"model":      p.model,
+		"output":     []interface{}{},
+		"error": map[string]interface{}{
+			"code":    "upstream_stream_error",
+			"message": message,
+		},
+	}
+	return p.writeEvent(map[string]interface{}{
+		"type":     "response.failed",
+		"response": response,
+	})
 }
 
 func (p *responsesStreamProxy) processToolCallDelta(tc models.ToolCall) error {
@@ -272,6 +312,9 @@ func (p *responsesStreamProxy) processFrame(frame string) error {
 		if p.created == 0 {
 			p.created = chunk.Created
 		}
+		if chunk.Usage != nil {
+			p.mergeUsage(chunk.Usage)
+		}
 		if err := p.ensureStarted(); err != nil {
 			return err
 		}
@@ -330,6 +373,27 @@ func (p *responsesStreamProxy) processFrame(frame string) error {
 		}
 	}
 	return nil
+}
+
+func (p *responsesStreamProxy) mergeUsage(update *models.Usage) {
+	if update == nil {
+		return
+	}
+	if p.usage == nil {
+		p.usage = &models.Usage{}
+	}
+	if update.PromptTokens > p.usage.PromptTokens {
+		p.usage.PromptTokens = update.PromptTokens
+	}
+	if update.CompletionTokens > p.usage.CompletionTokens {
+		p.usage.CompletionTokens = update.CompletionTokens
+	}
+	if update.TotalTokens > p.usage.TotalTokens {
+		p.usage.TotalTokens = update.TotalTokens
+	}
+	if componentTotal := p.usage.PromptTokens + p.usage.CompletionTokens; componentTotal > p.usage.TotalTokens {
+		p.usage.TotalTokens = componentTotal
+	}
 }
 
 func (p *responsesStreamProxy) mergeTextDelta(delta string) string {
@@ -707,6 +771,13 @@ func (p *responsesStreamProxy) emitCompleted() error {
 		"model":       p.model,
 		"output_text": text,
 		"output":      outputItems,
+	}
+	if p.usage != nil {
+		resp["usage"] = models.ResponsesUsage{
+			InputTokens:  p.usage.PromptTokens,
+			OutputTokens: p.usage.CompletionTokens,
+			TotalTokens:  p.usage.TotalTokens,
+		}
 	}
 	if p.reasoningStarted {
 		resp["reasoning"] = map[string]interface{}{

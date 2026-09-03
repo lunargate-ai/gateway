@@ -28,6 +28,21 @@ type ResolvedRoute struct {
 	Index     int
 }
 
+type RequestedTargetUnavailableError struct {
+	Provider string
+	Model    string
+}
+
+func (e *RequestedTargetUnavailableError) Error() string {
+	if e == nil {
+		return "requested target is not available"
+	}
+	if strings.TrimSpace(e.Model) != "" {
+		return fmt.Sprintf("requested model %q is not available", e.Model)
+	}
+	return fmt.Sprintf("requested provider %q is not available", e.Provider)
+}
+
 // Engine handles route matching and target selection.
 type Engine struct {
 	config  atomic.Value // stores *config.RoutingConfig
@@ -78,8 +93,7 @@ func (e *Engine) Resolve(ctx context.Context, path string, headers map[string]st
 			}
 			selectedTargets, indexMap := filterTargets(route.Targets, requestedProvider, requestedModel)
 			if len(selectedTargets) == 0 {
-				selectedTargets = route.Targets
-				indexMap = nil
+				return nil, &RequestedTargetUnavailableError{Provider: requestedProvider, Model: requestedModel}
 			}
 
 			target, idx := e.selectTarget(cfg.DefaultStrategy, selectedTargets)
@@ -87,8 +101,9 @@ func (e *Engine) Resolve(ctx context.Context, path string, headers map[string]st
 				idx = indexMap[idx]
 			}
 
+			fallbackConfigs, _ := filterTargets(route.Fallback, requestedProvider, requestedModel)
 			var fallbacks []Target
-			for _, fb := range route.Fallback {
+			for _, fb := range fallbackConfigs {
 				fallbacks = append(fallbacks, Target{
 					Provider:            fb.Provider,
 					Model:               fb.Model,
@@ -105,7 +120,6 @@ func (e *Engine) Resolve(ctx context.Context, path string, headers map[string]st
 			}, nil
 		}
 	}
-
 	return nil, fmt.Errorf("no route matched for path=%s", path)
 }
 
