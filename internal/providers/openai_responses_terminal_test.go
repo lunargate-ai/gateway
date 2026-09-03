@@ -35,6 +35,11 @@ func TestOpenAITranslator_ParseResponse_ResponsesTerminalStates(t *testing.T) {
 			wantFinish: "length",
 		},
 		{
+			name:       "incomplete max messages",
+			body:       `{"id":"resp_incomplete","object":"response","created_at":1,"status":"incomplete","incomplete_details":{"reason":"max_messages"},"model":"gpt-5.4","output":[]}`,
+			wantFinish: "length",
+		},
+		{
 			name:       "incomplete content filter",
 			body:       `{"id":"resp_filtered","object":"response","created_at":1,"status":"incomplete","incomplete_details":{"reason":"content_filter"},"model":"gpt-5.4","output":[]}`,
 			wantFinish: "content_filter",
@@ -136,6 +141,11 @@ func TestOpenAIStreamTranslator_ResponsesTerminalStates(t *testing.T) {
 		{
 			name:       "incomplete",
 			event:      `{"type":"response.incomplete","response":{"id":"resp_incomplete","created_at":1,"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"model":"gpt-5.4","output":[]}}`,
+			wantFinish: "length",
+		},
+		{
+			name:       "incomplete max messages",
+			event:      `{"type":"response.incomplete","response":{"id":"resp_incomplete","created_at":1,"status":"incomplete","incomplete_details":{"reason":"max_messages"},"model":"gpt-5.4","output":[]}}`,
 			wantFinish: "length",
 		},
 		{

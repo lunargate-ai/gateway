@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"math"
 	"net"
 	"net/http"
 	"strconv"
@@ -40,32 +41,50 @@ type TokenBucket struct {
 }
 
 func newTokenBucket(maxTokens float64, refillRate float64) *TokenBucket {
+	return newTokenBucketAt(maxTokens, refillRate, time.Now())
+}
+
+func newTokenBucketAt(maxTokens float64, refillRate float64, now time.Time) *TokenBucket {
 	return &TokenBucket{
 		tokens:     maxTokens,
 		maxTokens:  maxTokens,
 		refillRate: refillRate,
-		lastRefill: time.Now(),
+		lastRefill: now,
 	}
 }
 
-func (tb *TokenBucket) allow() (bool, float64) {
+func (tb *TokenBucket) allow() (bool, int, int) {
+	return tb.allowAt(time.Now())
+}
+
+func (tb *TokenBucket) allowAt(now time.Time) (allowed bool, remaining int, retryAfterSeconds int) {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
 
-	now := time.Now()
 	elapsed := now.Sub(tb.lastRefill).Seconds()
-	tb.tokens += elapsed * tb.refillRate
+	if elapsed > 0 {
+		tb.tokens += elapsed * tb.refillRate
+	}
 	if tb.tokens > tb.maxTokens {
 		tb.tokens = tb.maxTokens
 	}
-	tb.lastRefill = now
+	if now.After(tb.lastRefill) {
+		tb.lastRefill = now
+	}
 
 	if tb.tokens >= 1 {
 		tb.tokens--
-		return true, tb.tokens
+		return true, int(math.Floor(tb.tokens)), 0
 	}
 
-	return false, 0
+	retryAfterSeconds = 1
+	if tb.refillRate > 0 {
+		retryAfterSeconds = int(math.Ceil((1 - tb.tokens) / tb.refillRate))
+		if retryAfterSeconds < 1 {
+			retryAfterSeconds = 1
+		}
+	}
+	return false, int(math.Floor(tb.tokens)), retryAfterSeconds
 }
 
 // RateLimiter is a middleware that limits request rates using token bucket algorithm.
@@ -73,6 +92,7 @@ type RateLimiter struct {
 	current    atomic.Pointer[rateLimitSnapshot]
 	maxBuckets int
 	bucketTTL  time.Duration
+	now        func() time.Time
 }
 
 type rateLimitSnapshot struct {
@@ -91,6 +111,7 @@ func NewRateLimiter(cfg config.RateLimitConfig) *RateLimiter {
 	rl := &RateLimiter{
 		maxBuckets: 10000,
 		bucketTTL:  15 * time.Minute,
+		now:        time.Now,
 	}
 	rl.current.Store(newRateLimitSnapshot(cfg))
 	return rl
@@ -108,8 +129,16 @@ func (rl *RateLimiter) UpdateConfig(cfg config.RateLimitConfig) {
 	if rl == nil {
 		return
 	}
-	rl.current.Store(newRateLimitSnapshot(cfg))
-	log.Info().Msg("rate limiter config updated")
+	for {
+		current := rl.current.Load()
+		if current != nil && current.cfg == cfg {
+			return
+		}
+		if rl.current.CompareAndSwap(current, newRateLimitSnapshot(cfg)) {
+			log.Info().Msg("rate limiter config updated")
+			return
+		}
+	}
 }
 
 // Middleware returns the HTTP middleware handler.
@@ -124,14 +153,14 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 		key := extractRateLimitKey(r)
 		bucket := rl.getBucket(key, snapshot)
 
-		allowed, remaining := bucket.allow()
+		allowed, remaining, retryAfterSeconds := bucket.allowAt(rl.currentTime())
 
 		limit := snapshot.cfg.RequestsPerMinute
 		w.Header().Set("X-RateLimit-Limit", strconv.Itoa(limit))
-		w.Header().Set("X-RateLimit-Remaining", strconv.FormatFloat(remaining, 'f', 0, 64))
+		w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(remaining))
 
 		if !allowed {
-			w.Header().Set("Retry-After", "60")
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds))
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusTooManyRequests)
 			_, _ = w.Write([]byte(`{"error":{"message":"Rate limit exceeded","type":"rate_limit_error","code":"rate_limit_exceeded"}}`))
@@ -143,7 +172,7 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 }
 
 func (rl *RateLimiter) getBucket(key string, snapshot *rateLimitSnapshot) *TokenBucket {
-	now := time.Now()
+	now := rl.currentTime()
 	snapshot.mu.Lock()
 	defer snapshot.mu.Unlock()
 
@@ -158,10 +187,20 @@ func (rl *RateLimiter) getBucket(key string, snapshot *rateLimitSnapshot) *Token
 	burst := float64(snapshot.cfg.BurstSize)
 	if burst <= 0 {
 		burst = rpm / 6 // default burst = 10s worth
+		if burst < 1 {
+			burst = 1
+		}
 	}
-	b := newTokenBucket(burst, rpm/60.0)
+	b := newTokenBucketAt(burst, rpm/60.0, now)
 	snapshot.buckets[key] = &bucketEntry{bucket: b, lastSeen: now}
 	return b
+}
+
+func (rl *RateLimiter) currentTime() time.Time {
+	if rl.now != nil {
+		return rl.now()
+	}
+	return time.Now()
 }
 
 func (rl *RateLimiter) evictLocked(snapshot *rateLimitSnapshot, now time.Time) {

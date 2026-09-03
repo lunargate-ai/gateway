@@ -113,6 +113,109 @@ func TestNativeResponsesLifecycleBindsCreateAndProxiesReads(t *testing.T) {
 	}
 }
 
+func TestNativeResponsesLifecycleJSONRejectsInvalidResponseID(t *testing.T) {
+	testCases := []struct {
+		name string
+		body string
+	}{
+		{name: "missing", body: `{"object":"response","future_secret":"must-not-leak"}`},
+		{name: "non string", body: `{"id":7,"object":"response","future_secret":"must-not-leak"}`},
+		{name: "blank", body: `{"id":"   ","object":"response","future_secret":"must-not-leak"}`},
+		{name: "mismatch", body: `{"id":"resp_other","object":"response","future_secret":"must-not-leak"}`},
+		{name: "wrong object", body: `{"id":"resp_expected","object":"list","future_secret":"must-not-leak"}`},
+		{name: "multiple values", body: `{"id":"resp_expected","object":"response"} {"future_secret":"must-not-leak"}`},
+	}
+	endpoints := []struct {
+		name   string
+		method string
+		path   string
+		body   []byte
+	}{
+		{name: "retrieve", method: http.MethodGet, path: "/v1/responses/resp_expected"},
+		{name: "cancel", method: http.MethodPost, path: "/v1/responses/resp_expected/cancel", body: []byte(`{}`)},
+	}
+
+	for _, endpoint := range endpoints {
+		for _, testCase := range testCases {
+			t.Run(endpoint.name+"/"+testCase.name, func(t *testing.T) {
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, testCase.body)
+				}))
+				defer upstream.Close()
+
+				router, handler, cache := newNativeLifecycleRouter(t, upstream.URL+"/v1", map[string]config.ProviderCapabilities{
+					"native": {ResponsesLifecycle: true, ResponseCancellation: true},
+				})
+				defer cache.Stop()
+				handler.responseBindings.put("resp_expected", mustResponseBinding(t, handler, "native"))
+
+				response := performLifecycleRequest(t, router, endpoint.method, endpoint.path, endpoint.body)
+
+				if response.Code != http.StatusBadGateway {
+					t.Fatalf("status = %d, want 502; body=%s", response.Code, response.Body.String())
+				}
+				if contentType := response.Header().Get("Content-Type"); !strings.HasPrefix(contentType, "application/json") {
+					t.Fatalf("Content-Type = %q, want application/json", contentType)
+				}
+				if strings.Contains(response.Body.String(), "future_secret") || !json.Valid(response.Body.Bytes()) {
+					t.Fatalf("invalid lifecycle response leaked downstream: %q", response.Body.String())
+				}
+				if _, ok := handler.responseBindings.get("resp_expected"); !ok {
+					t.Fatal("invalid lifecycle response removed the owner binding")
+				}
+			})
+		}
+	}
+}
+
+func TestNativeResponsesCancelPreservesValidRawResponse(t *testing.T) {
+	const rawResponse = "{\n  \"id\": \"resp_cancel_raw\",\n  \"object\": \"response\",\n  \"status\": \"cancelled\",\n  \"future_field\": 9007199254740993\n}\n"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = io.WriteString(w, rawResponse)
+	}))
+	defer upstream.Close()
+
+	router, handler, cache := newNativeLifecycleRouter(t, upstream.URL+"/v1", map[string]config.ProviderCapabilities{
+		"native": {ResponsesLifecycle: true, ResponseCancellation: true},
+	})
+	defer cache.Stop()
+	handler.responseBindings.put("resp_cancel_raw", mustResponseBinding(t, handler, "native"))
+
+	response := performLifecycleRequest(t, router, http.MethodPost, "/v1/responses/resp_cancel_raw/cancel", []byte(`{}`))
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body=%s", response.Code, response.Body.String())
+	}
+	if got := response.Body.String(); got != rawResponse {
+		t.Fatalf("raw cancel response changed\n got: %q\nwant: %q", got, rawResponse)
+	}
+}
+
+func TestNativeResponsesLifecycleJSONBoundsResponseBody(t *testing.T) {
+	oversized := `{"id":"resp_expected","padding":"` + strings.Repeat("x", maxNativeLifecycleResponseBytes) + `"}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, oversized)
+	}))
+	defer upstream.Close()
+
+	router, handler, cache := newNativeLifecycleRouter(t, upstream.URL+"/v1", map[string]config.ProviderCapabilities{
+		"native": {ResponsesLifecycle: true},
+	})
+	defer cache.Stop()
+	handler.responseBindings.put("resp_expected", mustResponseBinding(t, handler, "native"))
+
+	response := performLifecycleRequest(t, router, http.MethodGet, "/v1/responses/resp_expected", nil)
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body=%s", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "padding") || !json.Valid(response.Body.Bytes()) {
+		t.Fatalf("oversized lifecycle response leaked downstream: %q", response.Body.String())
+	}
+}
+
 func TestNativeResponsesLifecycleRequiresBindingOrExplicitProvider(t *testing.T) {
 	var calls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -154,7 +257,7 @@ func TestNativeResponsesStreamRetainsNonCompletedOwnerBinding(t *testing.T) {
 				w.Header().Set("Content-Type", "text/event-stream")
 				_, _ = fmt.Fprintf(
 					w,
-					"event: response.%s\ndata: {\"type\":\"response.%s\",\"response\":{\"id\":%q,\"object\":\"response\",\"status\":%q,\"model\":\"gpt-native\",\"output\":[]}}\n\n",
+					"event: response.%s\ndata: {\"type\":\"response.%s\",\"sequence_number\":0,\"response\":{\"id\":%q,\"object\":\"response\",\"status\":%q,\"model\":\"gpt-native\",\"output\":[]}}\n\n",
 					status,
 					status,
 					responseID,
@@ -206,12 +309,12 @@ func TestNativeResponsesStoreFalseRetainsNoLifecycleState(t *testing.T) {
 }
 
 func TestNativeResponsesRetrieveStreamsRawSSEAndEscapesResponseID(t *testing.T) {
-	const rawStream = ": keepalive\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp space\",\"object\":\"response\",\"status\":\"completed\",\"future_field\":true}}\n\n"
+	const rawStream = ": keepalive\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":0,\"response\":{\"id\":\"resp space\",\"object\":\"response\",\"status\":\"completed\",\"future_field\":true}}\n\n"
 	var escapedPath string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		escapedPath = r.URL.EscapedPath()
 		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-		w.WriteHeader(http.StatusAccepted)
+		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, rawStream)
 	}))
 	defer upstream.Close()
@@ -226,8 +329,8 @@ func TestNativeResponsesRetrieveStreamsRawSSEAndEscapesResponseID(t *testing.T) 
 	handler.responseBindings.put("resp space", binding)
 
 	retrieve := performLifecycleRequest(t, router, http.MethodGet, "/v1/responses/resp%20space", nil)
-	if retrieve.Code != http.StatusAccepted {
-		t.Fatalf("retrieve status = %d, want 202; body=%s", retrieve.Code, retrieve.Body.String())
+	if retrieve.Code != http.StatusOK {
+		t.Fatalf("retrieve status = %d, want 200; body=%s", retrieve.Code, retrieve.Body.String())
 	}
 	if got := retrieve.Body.String(); got != rawStream {
 		t.Fatalf("native retrieve stream changed\n got: %q\nwant: %q", got, rawStream)

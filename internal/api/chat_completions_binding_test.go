@@ -1,6 +1,7 @@
 package api
 
 import (
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -62,16 +63,19 @@ func TestChatCompletionBindingStoreRejectsInvalidOrOversizedEntries(t *testing.T
 	}
 }
 
-func TestChatCompletionBindingStoreDelete(t *testing.T) {
+func TestChatCompletionBindingStoreDeleteIfOwned(t *testing.T) {
 	store := newChatCompletionBindingStore(time.Hour)
 	binding := chatCompletionBinding{Provider: "native", AccountFingerprint: "account"}
 	if !store.put("chatcmpl_delete", binding) {
 		t.Fatal("failed to seed binding")
 	}
-	if !store.delete("chatcmpl_delete") {
+	if store.deleteIfOwned("chatcmpl_delete", chatCompletionBinding{Provider: "other", AccountFingerprint: "account"}) {
+		t.Fatal("wrong owner deleted binding")
+	}
+	if !store.deleteIfOwned("chatcmpl_delete", binding) {
 		t.Fatal("delete returned false")
 	}
-	if store.delete("chatcmpl_delete") {
+	if store.deleteIfOwned("chatcmpl_delete", binding) {
 		t.Fatal("second delete returned true")
 	}
 	if _, ok := store.get("chatcmpl_delete"); ok {
@@ -83,7 +87,7 @@ func TestChatCompletionStreamBindingCandidateRequiresOneStableID(t *testing.T) {
 	var candidate chatCompletionStreamBindingCandidate
 	candidate.observe(nil)
 	candidate.observe(&models.StreamChunk{})
-	candidate.observe(&models.StreamChunk{ID: " chatcmpl_stable "})
+	candidate.observe(&models.StreamChunk{ID: "chatcmpl_stable"})
 	candidate.observe(&models.StreamChunk{ID: "chatcmpl_stable"})
 	if got := candidate.completionID(); got != "chatcmpl_stable" {
 		t.Fatalf("stable completion ID = %q", got)
@@ -92,6 +96,18 @@ func TestChatCompletionStreamBindingCandidateRequiresOneStableID(t *testing.T) {
 	candidate.observe(&models.StreamChunk{ID: "chatcmpl_other"})
 	if got := candidate.completionID(); got != "" {
 		t.Fatalf("inconsistent completion ID = %q, want empty", got)
+	}
+
+	var padded chatCompletionStreamBindingCandidate
+	padded.observe(&models.StreamChunk{ID: " chatcmpl_stable "})
+	if got := padded.completionID(); got != "" {
+		t.Fatalf("padded completion ID = %q, want empty", got)
+	}
+
+	var internalSpace chatCompletionStreamBindingCandidate
+	internalSpace.observe(&models.StreamChunk{ID: "chatcmpl internal space"})
+	if got := internalSpace.completionID(); got != "chatcmpl internal space" {
+		t.Fatalf("internal-space completion ID = %q", got)
 	}
 }
 
@@ -107,5 +123,35 @@ func TestChatCompletionStreamBindingCandidateUsesRawUpstreamID(t *testing.T) {
 	})
 	if got := candidate.completionID(); got != "" {
 		t.Fatalf("conflicting raw completion ID = %q, want empty", got)
+	}
+}
+
+func TestChatCompletionResponseIDCaptureUsesOnlyOriginalID(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "real ID", body: `{"id":"chatcmpl_real","object":"chat.completion"}`, want: "chatcmpl_real"},
+		{name: "internal whitespace", body: `{"id":"chatcmpl internal space","object":"chat.completion"}`, want: "chatcmpl internal space"},
+		{name: "padded ID", body: `{"id":" chatcmpl_real ","object":"chat.completion"}`},
+		{name: "missing object", body: `{"id":"chatcmpl_real"}`},
+		{name: "padded object", body: `{"id":"chatcmpl_real","object":" chat.completion "}`},
+		{name: "wrong object", body: `{"id":"chatcmpl_real","object":"response"}`},
+		{name: "missing ID", body: `{"object":"chat.completion"}`},
+		{name: "null ID", body: `{"id":null,"object":"chat.completion"}`},
+		{name: "non-string ID", body: `{"id":7,"object":"chat.completion"}`},
+		{name: "invalid JSON", body: `{"id":"chatcmpl_partial"`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			capture := newChatCompletionResponseIDCapture(io.NopCloser(strings.NewReader(test.body)))
+			if _, err := io.ReadAll(capture); err != nil {
+				t.Fatalf("read capture: %v", err)
+			}
+			if got := capture.completionID(); got != test.want {
+				t.Fatalf("completion ID = %q, want %q", got, test.want)
+			}
+		})
 	}
 }

@@ -12,7 +12,6 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 )
 
@@ -103,7 +102,10 @@ func (h *Handler) CreateConversation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) GetConversation(w http.ResponseWriter, r *http.Request) {
-	conversationID := strings.TrimSpace(chi.URLParam(r, "conversation_id"))
+	conversationID, ok := clientURLResourceID(w, r, "conversation_id")
+	if !ok {
+		return
+	}
 	binding, native, local, err := h.resolveConversationOwner(r, conversationID)
 	if err != nil {
 		writeConversationBindingResolutionError(w, err)
@@ -129,7 +131,10 @@ func (h *Handler) GetConversation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) UpdateConversation(w http.ResponseWriter, r *http.Request) {
-	conversationID := strings.TrimSpace(chi.URLParam(r, "conversation_id"))
+	conversationID, ok := clientURLResourceID(w, r, "conversation_id")
+	if !ok {
+		return
+	}
 	binding, native, local, err := h.resolveConversationOwner(r, conversationID)
 	if err != nil {
 		writeConversationBindingResolutionError(w, err)
@@ -172,7 +177,10 @@ func (h *Handler) UpdateConversation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) DeleteConversation(w http.ResponseWriter, r *http.Request) {
-	conversationID := strings.TrimSpace(chi.URLParam(r, "conversation_id"))
+	conversationID, ok := clientURLResourceID(w, r, "conversation_id")
+	if !ok {
+		return
+	}
 	binding, native, local, err := h.resolveConversationOwner(r, conversationID)
 	if err != nil {
 		writeConversationBindingResolutionError(w, err)
@@ -202,7 +210,10 @@ func (h *Handler) DeleteConversation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) CreateConversationItems(w http.ResponseWriter, r *http.Request) {
-	conversationID := strings.TrimSpace(chi.URLParam(r, "conversation_id"))
+	conversationID, ok := clientURLResourceID(w, r, "conversation_id")
+	if !ok {
+		return
+	}
 	binding, native, local, err := h.resolveConversationOwner(r, conversationID)
 	if err != nil {
 		writeConversationBindingResolutionError(w, err)
@@ -249,7 +260,14 @@ func (h *Handler) CreateConversationItems(w http.ResponseWriter, r *http.Request
 }
 
 func (h *Handler) ListConversationItems(w http.ResponseWriter, r *http.Request) {
-	conversationID := strings.TrimSpace(chi.URLParam(r, "conversation_id"))
+	conversationID, ok := clientURLResourceID(w, r, "conversation_id")
+	if !ok {
+		return
+	}
+	after, ok := clientOptionalResourceID(w, r.URL.Query().Get("after"), "after")
+	if !ok {
+		return
+	}
 	binding, native, local, err := h.resolveConversationOwner(r, conversationID)
 	if err != nil {
 		writeConversationBindingResolutionError(w, err)
@@ -285,7 +303,7 @@ func (h *Handler) ListConversationItems(w http.ResponseWriter, r *http.Request) 
 	}
 	items, err := h.conversationsState.listItems(
 		conversationID,
-		strings.TrimSpace(r.URL.Query().Get("after")),
+		after,
 		order,
 		limit,
 	)
@@ -301,8 +319,14 @@ func (h *Handler) ListConversationItems(w http.ResponseWriter, r *http.Request) 
 }
 
 func (h *Handler) GetConversationItem(w http.ResponseWriter, r *http.Request) {
-	conversationID := strings.TrimSpace(chi.URLParam(r, "conversation_id"))
-	itemID := strings.TrimSpace(chi.URLParam(r, "item_id"))
+	conversationID, ok := clientURLResourceID(w, r, "conversation_id")
+	if !ok {
+		return
+	}
+	itemID, ok := clientURLResourceID(w, r, "item_id")
+	if !ok {
+		return
+	}
 	binding, native, local, err := h.resolveConversationOwner(r, conversationID)
 	if err != nil {
 		writeConversationBindingResolutionError(w, err)
@@ -328,8 +352,14 @@ func (h *Handler) GetConversationItem(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) DeleteConversationItem(w http.ResponseWriter, r *http.Request) {
-	conversationID := strings.TrimSpace(chi.URLParam(r, "conversation_id"))
-	itemID := strings.TrimSpace(chi.URLParam(r, "item_id"))
+	conversationID, ok := clientURLResourceID(w, r, "conversation_id")
+	if !ok {
+		return
+	}
+	itemID, ok := clientURLResourceID(w, r, "item_id")
+	if !ok {
+		return
+	}
 	binding, native, local, err := h.resolveConversationOwner(r, conversationID)
 	if err != nil {
 		writeConversationBindingResolutionError(w, err)
@@ -440,8 +470,21 @@ func prepareConversationItems(rawItems []json.RawMessage) ([]map[string]json.Raw
 		if err := json.Unmarshal(raw, &item); err != nil || item == nil {
 			return nil, newConversationItemInputError(index, "", "must be an object", "invalid_conversation_item")
 		}
-		itemType := parseJSONStringRaw(item["type"])
-		if itemType == "" && parseJSONStringRaw(item["role"]) != "" {
+		itemType, hasType := conversationItemJSONString(item["type"])
+		if hasType {
+			if itemType == "" || itemType != strings.TrimSpace(itemType) {
+				return nil, newConversationItemInputError(index, "type", "must be a non-empty string without surrounding whitespace", "invalid_value")
+			}
+			canonicalType := strings.ToLower(itemType)
+			switch canonicalType {
+			case "message", "function_call", "function_call_output", "reasoning", "item_reference":
+				if itemType != canonicalType {
+					return nil, newConversationItemInputError(index, "type", "must use the canonical lowercase item type", "invalid_value")
+				}
+			}
+		} else if _, typeWasSupplied := item["type"]; typeWasSupplied {
+			return nil, newConversationItemInputError(index, "type", "must be a non-empty string", "invalid_value")
+		} else if _, hasRole := item["role"]; hasRole {
 			itemType = "message"
 			item["type"] = json.RawMessage(`"message"`)
 		}
@@ -450,6 +493,9 @@ func prepareConversationItems(rawItems []json.RawMessage) ([]map[string]json.Raw
 		}
 		if itemType == "item_reference" {
 			return nil, newConversationItemInputError(index, "type", "item_reference cannot be resolved by local conversation storage", "unsupported_feature")
+		}
+		if err := validateLocalConversationItem(index, itemType, item); err != nil {
+			return nil, err
 		}
 		itemID, hasID, validID := suppliedConversationItemID(item)
 		if hasID && !validID {
@@ -471,13 +517,209 @@ func prepareConversationItems(rawItems []json.RawMessage) ([]map[string]json.Raw
 	return items, nil
 }
 
+// Local conversation storage interprets only these core Responses item kinds.
+// Validate their stable structural contract before retaining them, while keeping
+// every additive field verbatim. Other non-empty item types remain opaque so a
+// newer Responses item can be stored and replayed without a gateway upgrade.
+func validateLocalConversationItem(index int, itemType string, item map[string]json.RawMessage) error {
+	switch itemType {
+	case "message":
+		return validateLocalConversationMessage(index, item)
+	case "function_call":
+		return validateLocalConversationFunctionCall(index, item)
+	case "function_call_output":
+		return validateLocalConversationFunctionCallOutput(index, item)
+	case "reasoning":
+		return validateLocalConversationReasoning(index, item)
+	default:
+		return nil
+	}
+}
+
+func validateLocalConversationMessage(index int, item map[string]json.RawMessage) error {
+	role, err := requiredConversationItemString(index, item, "role", "role", true)
+	if err != nil {
+		return err
+	}
+	switch role {
+	case "user", "assistant", "system", "developer":
+	default:
+		return newConversationItemInputError(index, "role", "must be one of user, assistant, system, or developer", "invalid_value")
+	}
+	if err := validateConversationItemStatus(index, item); err != nil {
+		return err
+	}
+	rawContent, exists := item["content"]
+	if !exists {
+		return newConversationItemInputError(index, "content", "is required", "invalid_conversation_item")
+	}
+	return validateConversationItemContent(index, "content", rawContent)
+}
+
+func validateLocalConversationFunctionCall(index int, item map[string]json.RawMessage) error {
+	if _, err := requiredConversationItemString(index, item, "call_id", "call_id", true); err != nil {
+		return err
+	}
+	if _, err := requiredConversationItemString(index, item, "name", "name", true); err != nil {
+		return err
+	}
+	if _, err := requiredConversationItemString(index, item, "arguments", "arguments", false); err != nil {
+		return err
+	}
+	return validateConversationItemStatus(index, item)
+}
+
+func validateLocalConversationFunctionCallOutput(index int, item map[string]json.RawMessage) error {
+	// Local replay correlates function output exclusively by call_id. Newer native
+	// variants may also carry caller/name/namespace, but those remain opaque fields
+	// and cannot replace the correlation key on a locally managed conversation.
+	if _, err := requiredConversationItemString(index, item, "call_id", "call_id", true); err != nil {
+		return err
+	}
+	if err := validateConversationItemStatus(index, item); err != nil {
+		return err
+	}
+	rawOutput, exists := item["output"]
+	if !exists {
+		return newConversationItemInputError(index, "output", "is required", "invalid_conversation_item")
+	}
+	return validateConversationItemContent(index, "output", rawOutput)
+}
+
+func validateLocalConversationReasoning(index int, item map[string]json.RawMessage) error {
+	if _, err := requiredConversationItemString(index, item, "id", "id", true); err != nil {
+		return err
+	}
+	if err := validateConversationItemStatus(index, item); err != nil {
+		return err
+	}
+	rawSummary, exists := item["summary"]
+	if !exists {
+		return newConversationItemInputError(index, "summary", "is required", "invalid_conversation_item")
+	}
+	if err := validateConversationItemPartArray(index, "summary", rawSummary); err != nil {
+		return err
+	}
+	if rawContent, exists := item["content"]; exists {
+		if err := validateConversationItemPartArray(index, "content", rawContent); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateConversationItemStatus(index int, item map[string]json.RawMessage) error {
+	rawStatus, exists := item["status"]
+	if !exists {
+		return nil
+	}
+	status, ok := conversationItemJSONString(rawStatus)
+	if !ok {
+		return newConversationItemInputError(index, "status", "must be a string", "invalid_value")
+	}
+	switch status {
+	case "in_progress", "completed", "incomplete":
+		return nil
+	default:
+		return newConversationItemInputError(index, "status", "must be one of in_progress, completed, or incomplete", "invalid_value")
+	}
+}
+
+func validateConversationItemContent(index int, field string, raw json.RawMessage) error {
+	if _, ok := conversationItemJSONString(raw); ok {
+		return nil
+	}
+	return validateConversationItemPartArrayShape(
+		index,
+		field,
+		raw,
+		"must be a string or an array of content objects",
+	)
+}
+
+func validateConversationItemPartArray(index int, field string, raw json.RawMessage) error {
+	return validateConversationItemPartArrayShape(index, field, raw, "must be an array of content objects")
+}
+
+func validateConversationItemPartArrayShape(index int, field string, raw json.RawMessage, shapeError string) error {
+	var parts []json.RawMessage
+	if err := json.Unmarshal(raw, &parts); err != nil || parts == nil {
+		return newConversationItemInputError(index, field, shapeError, "invalid_value")
+	}
+	for partIndex, rawPart := range parts {
+		partField := fmt.Sprintf("%s[%d]", field, partIndex)
+		var part map[string]json.RawMessage
+		if err := json.Unmarshal(rawPart, &part); err != nil || part == nil {
+			return newConversationItemInputError(index, partField, "must be an object", "invalid_value")
+		}
+		partType, err := requiredConversationItemString(index, part, "type", partField+".type", true)
+		if err != nil {
+			return err
+		}
+		if partType != strings.TrimSpace(partType) {
+			return newConversationItemInputError(index, partField+".type", "must not contain surrounding whitespace", "invalid_value")
+		}
+		canonicalPartType := strings.ToLower(strings.TrimSpace(partType))
+		switch canonicalPartType {
+		case "input_text", "output_text", "text", "reasoning_text", "summary_text":
+			if partType != canonicalPartType {
+				return newConversationItemInputError(index, partField+".type", "must use the canonical lowercase content type", "invalid_value")
+			}
+			if _, err := requiredConversationItemString(index, part, "text", partField+".text", false); err != nil {
+				return err
+			}
+		case "refusal":
+			if partType != canonicalPartType {
+				return newConversationItemInputError(index, partField+".type", "must use the canonical lowercase content type", "invalid_value")
+			}
+			if _, err := requiredConversationItemString(index, part, "refusal", partField+".refusal", false); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func requiredConversationItemString(
+	index int,
+	item map[string]json.RawMessage,
+	key string,
+	param string,
+	requireNonEmpty bool,
+) (string, error) {
+	raw, exists := item[key]
+	if !exists {
+		return "", newConversationItemInputError(index, param, "is required", "invalid_conversation_item")
+	}
+	value, ok := conversationItemJSONString(raw)
+	if !ok {
+		return "", newConversationItemInputError(index, param, "must be a string", "invalid_value")
+	}
+	if requireNonEmpty && strings.TrimSpace(value) == "" {
+		return "", newConversationItemInputError(index, param, "must be a non-empty string", "invalid_value")
+	}
+	return value, nil
+}
+
+func conversationItemJSONString(raw json.RawMessage) (string, bool) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '"' {
+		return "", false
+	}
+	var value string
+	if err := json.Unmarshal(trimmed, &value); err != nil {
+		return "", false
+	}
+	return value, true
+}
+
 func suppliedConversationItemID(item map[string]json.RawMessage) (string, bool, bool) {
 	raw, exists := item["id"]
 	if !exists {
 		return "", false, true
 	}
 	var id string
-	if err := json.Unmarshal(raw, &id); err != nil || strings.TrimSpace(id) == "" {
+	if err := json.Unmarshal(raw, &id); err != nil || strings.TrimSpace(id) == "" || id != strings.TrimSpace(id) {
 		return "", true, false
 	}
 	return id, true, true

@@ -2,7 +2,10 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -11,7 +14,14 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-const maxNativeConversationCreateCaptureBytes = 1 << 20
+const maxNativeConversationResponseBytes = 16 << 20
+
+type nativeConversationResponseContract struct {
+	object         string
+	requireID      bool
+	expectedID     string
+	requireDeleted bool
+}
 
 // resolveConversationOwner deliberately checks retained native ownership before
 // local state, then permits an explicit provider recovery path. It never picks
@@ -39,7 +49,7 @@ func (h *Handler) resolveConversationOwner(
 }
 
 func nativeConversationPath(conversationID string) string {
-	return "conversations/" + url.PathEscape(strings.TrimSpace(conversationID))
+	return "conversations/" + url.PathEscape(conversationID)
 }
 
 func nativeConversationItemsPath(conversationID string) string {
@@ -47,7 +57,7 @@ func nativeConversationItemsPath(conversationID string) string {
 }
 
 func nativeConversationItemPath(conversationID, itemID string) string {
-	return nativeConversationItemsPath(conversationID) + "/" + url.PathEscape(strings.TrimSpace(itemID))
+	return nativeConversationItemsPath(conversationID) + "/" + url.PathEscape(itemID)
 }
 
 func (h *Handler) makeNativeConversationRequest(
@@ -82,10 +92,14 @@ func (h *Handler) proxyNativeConversationRequest(
 ) {
 	response, err := h.makeNativeConversationRequest(r, binding, method, path, body)
 	if err != nil {
-		writeNativeConversationTransportError(w, binding, err)
+		writeNativeConversationTransportError(w, r.Context(), binding, err)
 		return
 	}
-	h.proxyNativeConversationResponse(w, binding, response, nil)
+	if contract, ok := nativeConversationRequestContract(method, path); ok {
+		h.proxyValidatedNativeConversationResponse(w, r.Context(), binding, response, contract)
+		return
+	}
+	h.proxyNativeConversationResponse(w, binding, response)
 }
 
 func (h *Handler) proxyNativeConversationCreate(
@@ -96,17 +110,20 @@ func (h *Handler) proxyNativeConversationCreate(
 ) {
 	response, err := h.makeNativeConversationRequest(r, binding, http.MethodPost, "conversations", body)
 	if err != nil {
-		writeNativeConversationTransportError(w, binding, err)
+		writeNativeConversationTransportError(w, r.Context(), binding, err)
 		return
 	}
-	capture := &boundedCaptureWriter{limit: maxNativeConversationCreateCaptureBytes}
-	status, copyErr := h.proxyNativeConversationResponse(w, binding, response, capture)
-	if copyErr != nil || status < http.StatusOK || status >= http.StatusMultipleChoices || capture.truncated {
+	_, conversationID, valid := h.proxyValidatedNativeConversationResponse(
+		w,
+		r.Context(),
+		binding,
+		response,
+		nativeConversationResponseContract{object: "conversation", requireID: true},
+	)
+	if !valid {
 		return
 	}
-	if conversationID := nativeConversationID(capture.Bytes()); conversationID != "" {
-		h.retainNativeConversationBinding(conversationID, binding)
-	}
+	h.retainNativeConversationBinding(conversationID, binding)
 }
 
 func (h *Handler) deleteNativeConversation(
@@ -117,21 +134,190 @@ func (h *Handler) deleteNativeConversation(
 ) {
 	response, err := h.makeNativeConversationRequest(r, binding, http.MethodDelete, nativeConversationPath(conversationID), nil)
 	if err != nil {
-		writeNativeConversationTransportError(w, binding, err)
+		writeNativeConversationTransportError(w, r.Context(), binding, err)
 		return
 	}
-	status := response.StatusCode
-	h.proxyNativeConversationResponse(w, binding, response, nil)
-	if status >= http.StatusOK && status < http.StatusMultipleChoices && h != nil && h.conversationBindings != nil {
-		h.conversationBindings.delete(conversationID)
+	_, _, valid := h.proxyValidatedNativeConversationResponse(
+		w,
+		r.Context(),
+		binding,
+		response,
+		nativeConversationResponseContract{
+			object:         "conversation.deleted",
+			requireID:      true,
+			expectedID:     conversationID,
+			requireDeleted: true,
+		},
+	)
+	if valid && h != nil && h.conversationBindings != nil {
+		h.conversationBindings.deleteIfOwned(conversationID, binding)
 	}
+}
+
+func nativeConversationRequestContract(method string, path string) (nativeConversationResponseContract, bool) {
+	parts := strings.Split(path, "/")
+	if len(parts) < 2 || len(parts) > 4 || parts[0] != "conversations" {
+		return nativeConversationResponseContract{}, false
+	}
+	conversationID, ok := nativeConversationPathID(parts[1])
+	if !ok {
+		return nativeConversationResponseContract{}, false
+	}
+
+	switch len(parts) {
+	case 2:
+		if method != http.MethodGet && method != http.MethodPost {
+			return nativeConversationResponseContract{}, false
+		}
+		return nativeConversationResponseContract{
+			object:     "conversation",
+			requireID:  true,
+			expectedID: conversationID,
+		}, true
+	case 3:
+		if parts[2] != "items" || (method != http.MethodGet && method != http.MethodPost) {
+			return nativeConversationResponseContract{}, false
+		}
+		return nativeConversationResponseContract{object: "list"}, true
+	case 4:
+		if parts[2] != "items" {
+			return nativeConversationResponseContract{}, false
+		}
+		itemID, ok := nativeConversationPathID(parts[3])
+		if !ok {
+			return nativeConversationResponseContract{}, false
+		}
+		switch method {
+		case http.MethodGet:
+			return nativeConversationResponseContract{
+				requireID:  true,
+				expectedID: itemID,
+			}, true
+		case http.MethodDelete:
+			return nativeConversationResponseContract{
+				object:     "conversation",
+				requireID:  true,
+				expectedID: conversationID,
+			}, true
+		}
+	}
+	return nativeConversationResponseContract{}, false
+}
+
+func nativeConversationPathID(encodedID string) (string, bool) {
+	if encodedID == "" {
+		return "", false
+	}
+	resourceID, err := url.PathUnescape(encodedID)
+	if err != nil {
+		return "", false
+	}
+	return resourceID, validOpaqueResourceID(resourceID)
+}
+
+func (h *Handler) proxyValidatedNativeConversationResponse(
+	w http.ResponseWriter,
+	parent context.Context,
+	binding conversationBinding,
+	response *http.Response,
+	contract nativeConversationResponseContract,
+) (int, string, bool) {
+	if response == nil || response.Body == nil {
+		conversationBindingHeaders(w, binding)
+		writeError(w, http.StatusBadGateway, "provider returned an empty response", "provider_error")
+		return http.StatusBadGateway, "", false
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		status, _ := h.proxyNativeConversationResponse(w, binding, response)
+		return status, "", false
+	}
+	defer response.Body.Close()
+
+	payload, conversationID, err := readValidatedNativeConversationResponse(response.Body, contract)
+	if err != nil {
+		if parent != nil && parent.Err() != nil {
+			return 499, "", false
+		}
+		conversationBindingHeaders(w, binding)
+		writeError(w, http.StatusBadGateway, "native conversation provider returned an invalid response object", "provider_error")
+		log.Warn().Err(err).Str("provider", binding.Provider).Msg("native conversation response validation failed")
+		return http.StatusBadGateway, "", false
+	}
+
+	conversationBindingHeaders(w, binding)
+	copyHeaders(w.Header(), response.Header)
+	w.WriteHeader(response.StatusCode)
+	if _, err := w.Write(payload); err != nil {
+		log.Warn().Err(err).Str("provider", binding.Provider).Msg("failed to write native conversation payload")
+		return response.StatusCode, "", false
+	}
+	return response.StatusCode, conversationID, true
+}
+
+func readValidatedNativeConversationResponse(
+	body io.Reader,
+	contract nativeConversationResponseContract,
+) ([]byte, string, error) {
+	payload, err := io.ReadAll(io.LimitReader(body, maxNativeConversationResponseBytes+1))
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to read native conversation response: %w", err)
+	}
+	if len(payload) > maxNativeConversationResponseBytes {
+		return nil, "", errors.New("native conversation response exceeds 16 MiB limit")
+	}
+
+	var envelope map[string]json.RawMessage
+	if err := decodeJSONStrict(bytes.NewReader(payload), &envelope); err != nil || envelope == nil {
+		return nil, "", errors.New("native conversation response must contain one JSON object")
+	}
+	conversationID := ""
+	if contract.requireID || contract.expectedID != "" {
+		conversationID, err = requiredNativeConversationString(envelope, "id")
+		if err != nil {
+			return nil, "", err
+		}
+		if trimmedID := strings.TrimSpace(conversationID); trimmedID == "" || conversationID != trimmedID {
+			return nil, "", errors.New("native conversation response requires a non-empty string id without surrounding whitespace")
+		}
+	}
+	if contract.object != "" {
+		object, err := requiredNativeConversationString(envelope, "object")
+		if err != nil || object != contract.object {
+			return nil, "", fmt.Errorf("native conversation response object must be %q", contract.object)
+		}
+	}
+	if contract.expectedID != "" && conversationID != contract.expectedID {
+		return nil, "", errors.New("native conversation response id does not match the requested conversation")
+	}
+	if contract.requireDeleted {
+		deletedRaw, ok := envelope["deleted"]
+		if !ok {
+			return nil, "", errors.New("native conversation delete response requires deleted=true")
+		}
+		var deleted bool
+		if err := decodeJSONStrict(bytes.NewReader(deletedRaw), &deleted); err != nil || !deleted {
+			return nil, "", errors.New("native conversation delete response requires deleted=true")
+		}
+	}
+	return payload, conversationID, nil
+}
+
+func requiredNativeConversationString(envelope map[string]json.RawMessage, field string) (string, error) {
+	raw, ok := envelope[field]
+	if !ok {
+		return "", fmt.Errorf("native conversation response requires string %s", field)
+	}
+	var value string
+	if err := decodeJSONStrict(bytes.NewReader(raw), &value); err != nil {
+		return "", fmt.Errorf("native conversation response requires string %s", field)
+	}
+	return value, nil
 }
 
 func (h *Handler) proxyNativeConversationResponse(
 	w http.ResponseWriter,
 	binding conversationBinding,
 	response *http.Response,
-	capture io.Writer,
 ) (int, error) {
 	if response == nil || response.Body == nil {
 		writeError(w, http.StatusBadGateway, "provider returned an empty response", "provider_error")
@@ -142,63 +328,13 @@ func (h *Handler) proxyNativeConversationResponse(
 	copyHeaders(w.Header(), response.Header)
 	w.WriteHeader(response.StatusCode)
 
-	destination := io.Writer(w)
-	if capture != nil {
-		destination = io.MultiWriter(w, capture)
-	}
-	_, err := io.Copy(destination, response.Body)
+	_, err := io.Copy(w, response.Body)
 	if err != nil {
 		log.Warn().Err(err).Str("provider", binding.Provider).Msg("failed to proxy native conversation body")
 	}
 	return response.StatusCode, err
 }
 
-func writeNativeConversationTransportError(w http.ResponseWriter, binding conversationBinding, err error) {
-	writeNativeResponseTransportError(w, responseBinding{Provider: binding.Provider}, err)
-}
-
-func nativeConversationID(body []byte) string {
-	var envelope struct {
-		ID string `json:"id"`
-	}
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	if err := decoder.Decode(&envelope); err != nil {
-		return ""
-	}
-	var extra json.RawMessage
-	if err := decoder.Decode(&extra); err != io.EOF {
-		return ""
-	}
-	if !validNativeConversationID(envelope.ID) {
-		return ""
-	}
-	return strings.TrimSpace(envelope.ID)
-}
-
-type boundedCaptureWriter struct {
-	bytes.Buffer
-	limit     int
-	truncated bool
-}
-
-func (w *boundedCaptureWriter) Write(p []byte) (int, error) {
-	if w == nil {
-		return len(p), nil
-	}
-	remaining := w.limit - w.Len()
-	if remaining <= 0 {
-		if len(p) > 0 {
-			w.truncated = true
-		}
-		return len(p), nil
-	}
-	writeLen := len(p)
-	if writeLen > remaining {
-		writeLen = remaining
-		w.truncated = true
-	}
-	if writeLen > 0 {
-		_, _ = w.Buffer.Write(p[:writeLen])
-	}
-	return len(p), nil
+func writeNativeConversationTransportError(w http.ResponseWriter, parent context.Context, binding conversationBinding, err error) {
+	writeNativeResponseTransportError(w, parent, responseBinding{Provider: binding.Provider}, err)
 }

@@ -67,6 +67,12 @@ func TestNormalizeUsageBoundsCacheDetailsAndTotal(t *testing.T) {
 			CacheWriteTokens5m: 80,
 			CacheWriteTokens1h: 80,
 		},
+		CompletionTokensDetails: &CompletionTokensDetails{
+			AcceptedPredictionTokens: -2,
+			AudioTokens:              -3,
+			ReasoningTokens:          100,
+			RejectedPredictionTokens: -4,
+		},
 	}
 
 	NormalizeUsage(usage)
@@ -84,6 +90,26 @@ func TestNormalizeUsageBoundsCacheDetailsAndTotal(t *testing.T) {
 	}
 	if got := usage.PromptTokensDetails.CacheWriteTokens1h; got != 0 {
 		t.Fatalf("cache_write_tokens_1h = %d, want 0", got)
+	}
+	if got := usage.CompletionTokensDetails.ReasoningTokens; got != 7 {
+		t.Fatalf("reasoning_tokens = %d, want bounded output total 7", got)
+	}
+	if usage.CompletionTokensDetails.AcceptedPredictionTokens != 0 ||
+		usage.CompletionTokensDetails.AudioTokens != 0 ||
+		usage.CompletionTokensDetails.RejectedPredictionTokens != 0 {
+		t.Fatalf("negative completion details were not clamped: %#v", usage.CompletionTokensDetails)
+	}
+}
+
+func TestCloneCompletionTokensDetailsDoesNotAlias(t *testing.T) {
+	original := &CompletionTokensDetails{ReasoningTokens: 3, AcceptedPredictionTokens: 2}
+	cloned := CloneCompletionTokensDetails(original)
+	if cloned == nil || *cloned != *original {
+		t.Fatalf("clone = %#v, want %#v", cloned, original)
+	}
+	cloned.ReasoningTokens = 1
+	if original.ReasoningTokens != 3 {
+		t.Fatalf("clone aliases original: %#v", original)
 	}
 }
 

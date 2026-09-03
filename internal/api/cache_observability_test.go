@@ -251,4 +251,7 @@ func TestBoundedModelMetricLabelCollapsesUnconfiguredModels(t *testing.T) {
 	if got := boundedModelMetricLabel(configured, "gpt-configured"); got != "gpt-configured" {
 		t.Fatalf("configured model label = %q, want gpt-configured", got)
 	}
+	if got := boundedModelMetricLabel(configured, "attacker-model-456"); got != "gpt-configured" {
+		t.Fatalf("upstream-controlled model label = %q, want configured model", got)
+	}
 }

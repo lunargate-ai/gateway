@@ -83,6 +83,29 @@ func TestCanceledFetchDoesNotCacheFallback(t *testing.T) {
 	}
 }
 
+func TestIdenticalProviderUpdatePreservesFetchedModels(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		writeOpenAIModels(t, w, "remote-model")
+	}))
+	defer server.Close()
+
+	providerConfigs := fetchProviderConfigs(server.URL, "local-default")
+	store := NewStore(providers.NewRegistry(providerConfigs), providerConfigs)
+	if got := store.AllModels(context.Background()); !hasModel(got, "custom/remote-model") {
+		t.Fatalf("initial models = %#v", got)
+	}
+
+	store.UpdateProvidersConfig(providerConfigs)
+	if got := store.AllModels(context.Background()); !hasModel(got, "custom/remote-model") {
+		t.Fatalf("models after identical update = %#v", got)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("provider requests = %d, want cached result after identical update", got)
+	}
+}
+
 func TestOldFetchCannotPoisonCacheAfterConfigReload(t *testing.T) {
 	oldRequestStarted := make(chan struct{})
 	releaseOldRequest := make(chan struct{})

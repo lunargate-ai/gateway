@@ -1,9 +1,34 @@
 package models
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
+
+func TestResponsesResponseMarshalOmitsSDKOnlyOutputText(t *testing.T) {
+	response := &ResponsesResponse{
+		ID:         "resp_wire",
+		Object:     "response",
+		Status:     "completed",
+		Output:     []ResponsesOutput{},
+		OutputText: "helper text",
+	}
+	payload, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+	if strings.Contains(string(payload), "output_text") || response.OutputText != "helper text" {
+		t.Fatalf("SDK-only helper leaked or was lost: payload=%s helper=%q", payload, response.OutputText)
+	}
+	var decoded ResponsesResponse
+	if err := json.Unmarshal([]byte(`{"id":"resp_compat","output_text":"provider helper"}`), &decoded); err != nil {
+		t.Fatalf("unmarshal compatible response: %v", err)
+	}
+	if decoded.OutputText != "provider helper" {
+		t.Fatalf("compatible helper = %q, want provider helper", decoded.OutputText)
+	}
+}
 
 func TestResponsesToUnifiedRequest_MapsTopLevelFunctionTool(t *testing.T) {
 	strict := true

@@ -93,14 +93,16 @@ func TestValidateConfigRejectsInvalidUpstreamRequestTypes(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			target := TargetConfig{Provider: test.providerID, UpstreamRequestType: test.requestType}
+			target := TargetConfig{Provider: test.providerID, Weight: 1, UpstreamRequestType: test.requestType}
 			route := RouteConfig{Name: "test"}
 			if test.fallback {
+				route.Targets = []TargetConfig{{Provider: test.providerID, Weight: 1}}
 				route.Fallback = []TargetConfig{target}
 			} else {
 				route.Targets = []TargetConfig{target}
 			}
 			cfg := &Config{
+				Server: ServerConfig{Port: 8080},
 				Providers: map[string]ProviderConfig{
 					test.providerID: {Type: test.providerType},
 				},
@@ -124,6 +126,7 @@ routing:
     - name: "default"
       targets:
         - provider: openai
+          weight: 100
 `
 	if err := os.WriteFile(configPath, []byte(configBody), 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -161,6 +164,7 @@ routing:
     - name: "default"
       targets:
         - provider: openai
+          weight: 100
 update_check:
   enabled: false
   endpoint: "${UPDATE_URL}"
@@ -201,6 +205,7 @@ routing:
     - name: "default"
       targets:
         - provider: openai
+          weight: 100
 general:
   api_key: "lgw_from_general"
 data_sharing:
@@ -235,6 +240,7 @@ routing:
     - name: "default"
       targets:
         - provider: openai
+          weight: 100
 data_sharing:
   enabled: true
   api_key: "lgw_from_legacy"
@@ -270,11 +276,13 @@ func TestNewManager_ParsesProviderCompatibilityFields(t *testing.T) {
     base_url: "https://api.deepseek.com/v1"
     compatibility_profile: "deepseek"
     normalize_developer_role: true
+    extract_reasoning_tags: true
 routing:
   routes:
     - name: "default"
       targets:
         - provider: deepseek
+          weight: 100
 `
 	if err := os.WriteFile(configPath, []byte(configBody), 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -291,6 +299,9 @@ routing:
 	}
 	if !provider.NormalizeDeveloperRole {
 		t.Fatalf("provider normalize_developer_role = false, want true")
+	}
+	if !provider.ExtractReasoningTags {
+		t.Fatalf("provider extract_reasoning_tags = false, want true")
 	}
 }
 
@@ -318,6 +329,7 @@ routing:
     - name: "default"
       targets:
         - provider: openai
+          weight: 100
 `
 	if err := os.WriteFile(configPath, []byte(configBody), 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -356,6 +368,7 @@ routing:
     - name: "default"
       targets:
         - provider: openai
+          weight: 100
 `
 	if err := os.WriteFile(configPath, []byte(configBody), 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -386,6 +399,7 @@ routing:
     - name: "default"
       targets:
         - provider: ollama
+          weight: 100
 `
 	if err := os.WriteFile(configPath, []byte(configBody), 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -420,6 +434,7 @@ routing:
     - name: "default"
       targets:
         - provider: openai
+          weight: 100
 security:
   enabled: true
   provider: "api_key"
@@ -470,6 +485,7 @@ routing:
     - name: "default"
       targets:
         - provider: openai
+          weight: 100
 security:
   api_keys_enabled: true
   api_keys:

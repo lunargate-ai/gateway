@@ -272,8 +272,14 @@ func validateTranslatedResponsesInput(raw json.RawMessage, path, providerID, pro
 			default:
 				return translatedResponsesFieldError(providerID, itemPath+".role")
 			}
-			if err := validateTranslatedResponsesMessageContent(item["content"], itemPath+".content", providerID, providerType); err != nil {
-				return err
+			// Translated Responses history may contain an empty assistant output
+			// item. It has no model-visible content, and the converter deliberately
+			// consumes it while retaining all substantive items. Other roles must
+			// remain non-empty.
+			if role != "assistant" || !translatedResponsesMessageContentIsEmpty(item["content"]) {
+				if err := validateTranslatedResponsesMessageContent(item["content"], itemPath+".content", providerID, providerType); err != nil {
+					return err
+				}
 			}
 		case "function_call":
 			allowed := map[string]struct{}{"arguments": {}, "call_id": {}, "id": {}, "name": {}, "status": {}, "type": {}}
@@ -283,7 +289,7 @@ func validateTranslatedResponsesInput(raw json.RawMessage, path, providerID, pro
 			if err := validateTranslatedResponsesLifecycleFields(item, itemPath, false, providerID); err != nil {
 				return err
 			}
-			if strings.TrimSpace(parseJSONStringRaw(item["call_id"])) == "" {
+			if callID, ok := rawJSONString(item["call_id"]); !ok || !validOpaqueResourceID(callID) {
 				return translatedResponsesFieldError(providerID, itemPath+".call_id")
 			}
 			if strings.TrimSpace(parseJSONStringRaw(item["name"])) == "" {
@@ -300,7 +306,7 @@ func validateTranslatedResponsesInput(raw json.RawMessage, path, providerID, pro
 			if err := validateTranslatedResponsesLifecycleFields(item, itemPath, false, providerID); err != nil {
 				return err
 			}
-			if strings.TrimSpace(parseJSONStringRaw(item["call_id"])) == "" {
+			if callID, ok := rawJSONString(item["call_id"]); !ok || !validOpaqueResourceID(callID) {
 				return translatedResponsesFieldError(providerID, itemPath+".call_id")
 			}
 			if _, ok := rawJSONString(item["output"]); !ok {
@@ -313,19 +319,24 @@ func validateTranslatedResponsesInput(raw json.RawMessage, path, providerID, pro
 	return nil
 }
 
-// Conversations assigns lifecycle metadata to stored items. These fields do
-// not control model generation, so translated targets may deliberately consume
-// them without forwarding them. Keep the accepted values narrow and explicit.
+// Conversations assigns lifecycle metadata to stored items. IDs and supported
+// phases do not control model generation, so translated targets may consume
+// them without forwarding them. Status is different: treating an incomplete
+// message, function call, or function output as completed would expose partial
+// data as final Chat Completions history.
 func validateTranslatedResponsesLifecycleFields(
 	item map[string]json.RawMessage,
 	path string,
 	allowPhase bool,
 	providerID string,
 ) error {
-	if rawID, exists := item["id"]; exists && strings.TrimSpace(parseJSONStringRaw(rawID)) == "" {
-		return translatedResponsesFieldError(providerID, path+".id")
+	if rawID, exists := item["id"]; exists {
+		if id, ok := rawJSONString(rawID); !ok || !validOpaqueResourceID(id) {
+			return translatedResponsesFieldError(providerID, path+".id")
+		}
 	}
-	if rawStatus, exists := item["status"]; exists && !strings.EqualFold(strings.TrimSpace(parseJSONStringRaw(rawStatus)), "completed") {
+	if rawStatus, exists := item["status"]; exists &&
+		!strings.EqualFold(strings.TrimSpace(parseJSONStringRaw(rawStatus)), "completed") {
 		return translatedResponsesFieldError(providerID, path+".status")
 	}
 	if rawPhase, exists := item["phase"]; exists {
@@ -335,6 +346,19 @@ func validateTranslatedResponsesLifecycleFields(
 		}
 	}
 	return nil
+}
+
+func translatedResponsesMessageContentIsEmpty(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return true
+	}
+	if trimmed[0] == '"' {
+		value, ok := rawJSONString(trimmed)
+		return ok && strings.TrimSpace(value) == ""
+	}
+	var parts []json.RawMessage
+	return json.Unmarshal(trimmed, &parts) == nil && len(parts) == 0
 }
 
 func validateTranslatedResponsesMessageContent(raw json.RawMessage, path, providerID, providerType string) error {
@@ -364,11 +388,27 @@ func validateTranslatedResponsesMessageContent(raw json.RawMessage, path, provid
 		partType := strings.ToLower(strings.TrimSpace(parseJSONStringRaw(part["type"])))
 		switch partType {
 		case "input_text", "output_text", "text":
-			if field := firstUnsupportedRawKey(part, map[string]struct{}{"text": {}, "type": {}}, partPath); field != "" {
+			allowed := map[string]struct{}{"text": {}, "type": {}}
+			if partType == "output_text" {
+				// Responses output text always carries annotations and may carry
+				// logprobs. Neither affects the model-visible text replayed through
+				// Chat Completions, but both must be arrays when present.
+				allowed["annotations"] = struct{}{}
+				allowed["logprobs"] = struct{}{}
+			}
+			if field := firstUnsupportedRawKey(part, allowed, partPath); field != "" {
 				return translatedResponsesFieldError(providerID, field)
 			}
 			if value, ok := rawJSONString(part["text"]); !ok || strings.TrimSpace(value) == "" {
 				return translatedResponsesFieldError(providerID, partPath+".text")
+			}
+			for _, field := range []string{"annotations", "logprobs"} {
+				if rawValue, exists := part[field]; exists {
+					var values []json.RawMessage
+					if err := json.Unmarshal(rawValue, &values); err != nil {
+						return translatedResponsesFieldError(providerID, partPath+"."+field)
+					}
+				}
 			}
 		case "input_image":
 			if !translatedTargetSupportsImageContent(providerType) {

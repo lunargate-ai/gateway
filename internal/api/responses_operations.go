@@ -38,7 +38,15 @@ func (h *Handler) handleNativeResponseOperation(
 		writeResponseBindingResolutionError(w, err)
 		return
 	}
-	h.proxyResponseLifecycleRequest(w, r, binding, http.MethodPost, path, upstreamBody)
+	contract := nativeResponseBodyContract{}
+	if capability == responseNativeCompaction {
+		contract = nativeResponseBodyContract{
+			expectedObject: "response.compaction",
+			requireID:      true,
+			requireJSON:    true,
+		}
+	}
+	h.proxyResponseLifecycleRequestWithContract(w, r, binding, http.MethodPost, path, upstreamBody, contract)
 }
 
 func readResponseOperationPayload(w http.ResponseWriter, r *http.Request) ([]byte, map[string]json.RawMessage, bool) {

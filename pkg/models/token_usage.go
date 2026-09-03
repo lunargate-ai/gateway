@@ -49,6 +49,13 @@ func NormalizeUsage(usage *Usage) {
 		usage.PromptTokensDetails.CacheWriteTokens5m = normalized.CacheWriteInputTokens5m
 		usage.PromptTokensDetails.CacheWriteTokens1h = normalized.CacheWriteInputTokens1h
 	}
+	if usage.CompletionTokensDetails != nil {
+		normalized := TokenUsageFromUsage(usage)
+		usage.CompletionTokensDetails.AcceptedPredictionTokens = NonNegativeTokenCount(usage.CompletionTokensDetails.AcceptedPredictionTokens)
+		usage.CompletionTokensDetails.AudioTokens = NonNegativeTokenCount(usage.CompletionTokensDetails.AudioTokens)
+		usage.CompletionTokensDetails.ReasoningTokens = normalized.ReasoningOutputTokens
+		usage.CompletionTokensDetails.RejectedPredictionTokens = NonNegativeTokenCount(usage.CompletionTokensDetails.RejectedPredictionTokens)
+	}
 }
 
 // TokenUsage is an inclusive token total with mutually exclusive cache
@@ -60,6 +67,7 @@ type TokenUsage struct {
 	CacheWriteInputTokens   int
 	CacheWriteInputTokens5m int
 	CacheWriteInputTokens1h int
+	ReasoningOutputTokens   int
 }
 
 // TokenUsageFromUsage produces a bounded, non-overlapping accounting view.
@@ -77,6 +85,9 @@ func TokenUsageFromUsage(usage *Usage) TokenUsage {
 		result.CacheWriteInputTokens5m = details.CacheWriteTokens5m
 		result.CacheWriteInputTokens1h = details.CacheWriteTokens1h
 	}
+	if details := usage.CompletionTokensDetails; details != nil {
+		result.ReasoningOutputTokens = details.ReasoningTokens
+	}
 	return result.Normalized()
 }
 
@@ -89,6 +100,7 @@ func (usage TokenUsage) Normalized() TokenUsage {
 	usage.CacheWriteInputTokens = NonNegativeTokenCount(usage.CacheWriteInputTokens)
 	usage.CacheWriteInputTokens5m = NonNegativeTokenCount(usage.CacheWriteInputTokens5m)
 	usage.CacheWriteInputTokens1h = NonNegativeTokenCount(usage.CacheWriteInputTokens1h)
+	usage.ReasoningOutputTokens = NonNegativeTokenCount(usage.ReasoningOutputTokens)
 
 	classifiedWrites := SaturatingTokenSum(usage.CacheWriteInputTokens5m, usage.CacheWriteInputTokens1h)
 	if classifiedWrites > usage.CacheWriteInputTokens {
@@ -109,6 +121,9 @@ func (usage TokenUsage) Normalized() TokenUsage {
 	if usage.CacheWriteInputTokens1h > remainingWrites {
 		usage.CacheWriteInputTokens1h = remainingWrites
 	}
+	if usage.ReasoningOutputTokens > usage.OutputTokens {
+		usage.ReasoningOutputTokens = usage.OutputTokens
+	}
 	return usage
 }
 
@@ -123,6 +138,14 @@ func (usage TokenUsage) UnclassifiedCacheWriteInputTokens() int {
 }
 
 func CloneInputTokensDetails(details *InputTokensDetails) *InputTokensDetails {
+	if details == nil {
+		return nil
+	}
+	copyDetails := *details
+	return &copyDetails
+}
+
+func CloneCompletionTokensDetails(details *CompletionTokensDetails) *CompletionTokensDetails {
 	if details == nil {
 		return nil
 	}

@@ -30,7 +30,7 @@ func TestResponsesNativeStreamKeepsOnlyFirstTerminalEvent(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
 	}
-	wantBody := preTerminal + firstTerminal + done
+	wantBody := preTerminal + firstTerminal
 	if got := recorder.Body.String(); got != wantBody {
 		t.Fatalf("native stream after first terminal\n got: %q\nwant: %q", got, wantBody)
 	}
@@ -60,8 +60,8 @@ func TestResponsesWebSocketKeepsOnlyFirstNativeTerminalEvent(t *testing.T) {
 			return
 		}
 		_, _ = io.WriteString(w,
-			"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_followup\",\"status\":\"in_progress\",\"model\":\"gpt-5.4\",\"output\":[]}}\n\n"+
-				"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_followup\",\"status\":\"completed\",\"model\":\"gpt-5.4\",\"output\":[],\"output_text\":\"followup\"}}\n\n"+
+			"event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_followup\",\"status\":\"in_progress\",\"model\":\"gpt-5.4\",\"output\":[]}}\n\n"+
+				"event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{\"id\":\"resp_followup\",\"status\":\"completed\",\"model\":\"gpt-5.4\",\"output\":[],\"output_text\":\"followup\"}}\n\n"+
 				done,
 		)
 	}))
@@ -106,6 +106,63 @@ func TestResponsesWebSocketKeepsOnlyFirstNativeTerminalEvent(t *testing.T) {
 	}
 }
 
+func TestResponsesWebSocketRejectsNativeResponseIDChanges(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w,
+			"event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_locked\",\"status\":\"in_progress\",\"model\":\"gpt-5.4\",\"output\":[]}}\n\n"+
+				"event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{\"id\":\"resp_changed\",\"status\":\"completed\",\"model\":\"gpt-5.4\",\"output\":[]}}\n\n",
+		)
+	}))
+	defer upstream.Close()
+
+	handler := newResponsesWebSocketTestHandlerWithUpstreamType(upstream.URL, requestTypeResponses)
+	defer handler.cache.Stop()
+	server := httptest.NewServer(http.HandlerFunc(handler.ResponsesWebSocket))
+	defer server.Close()
+	conn := mustDialResponsesWebSocket(t, server.URL)
+	defer conn.Close()
+
+	sendResponsesWebSocketJSON(t, conn, map[string]interface{}{
+		"type":  "response.create",
+		"model": "lunargate/auto",
+		"input": "first request",
+	})
+	events := readResponsesWebSocketEventsUntilTerminal(t, conn)
+	if got := strings.Join(eventTypes(events), ","); got != "response.created,response.failed" {
+		t.Fatalf("event types = %s, want response.created,response.failed", got)
+	}
+	if got := extractTerminalResponseID(events, "response.failed"); got != "resp_locked" {
+		t.Fatalf("synthetic failure response id = %q, want resp_locked", got)
+	}
+	encoded, err := json.Marshal(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "resp_changed") {
+		t.Fatalf("inconsistent terminal reached websocket: %s", encoded)
+	}
+
+	sendResponsesWebSocketJSON(t, conn, map[string]interface{}{
+		"type":                 "response.create",
+		"previous_response_id": "resp_changed",
+		"input":                "must not continue",
+	})
+	notFound := readResponsesWebSocketEvent(t, conn)
+	if got, _ := notFound["type"].(string); got != "error" {
+		t.Fatalf("continuation event type = %q, want error", got)
+	}
+	errorObject, _ := notFound["error"].(map[string]interface{})
+	if code, _ := errorObject["code"].(string); code != "previous_response_not_found" {
+		t.Fatalf("continuation error code = %q, want previous_response_not_found", code)
+	}
+	if got := upstreamCalls.Load(); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1", got)
+	}
+}
+
 func TestResponsesWebSocketAdapterConsumesApplicationFramesAfterTerminal(t *testing.T) {
 	_, firstTerminal, afterTerminal, secondTerminal, done := duplicateNativeTerminalFrames()
 	proxy := &responsesWebSocketProxy{}
@@ -141,10 +198,10 @@ func TestResponsesWebSocketAdapterConsumesApplicationFramesAfterTerminal(t *test
 }
 
 func duplicateNativeTerminalFrames() (preTerminal, firstTerminal, afterTerminal, secondTerminal, done string) {
-	preTerminal = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_first\",\"status\":\"in_progress\",\"model\":\"gpt-5.4\",\"output\":[]}}\n\n"
-	firstTerminal = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_first\",\"status\":\"completed\",\"model\":\"gpt-5.4\",\"output\":[],\"output_text\":\"first\"}}\n\n"
-	afterTerminal = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"response_id\":\"resp_first\",\"delta\":\"must-not-leak\"}\n\n"
-	secondTerminal = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_second\",\"status\":\"completed\",\"model\":\"gpt-5.4\",\"output\":[],\"output_text\":\"second\"}}\n\n"
+	preTerminal = "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_first\",\"status\":\"in_progress\",\"model\":\"gpt-5.4\",\"output\":[]}}\n\n"
+	firstTerminal = "event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{\"id\":\"resp_first\",\"status\":\"completed\",\"model\":\"gpt-5.4\",\"output\":[],\"output_text\":\"first\"}}\n\n"
+	afterTerminal = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,\"response_id\":\"resp_first\",\"delta\":\"must-not-leak\"}\n\n"
+	secondTerminal = "event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"resp_second\",\"status\":\"completed\",\"model\":\"gpt-5.4\",\"output\":[],\"output_text\":\"second\"}}\n\n"
 	done = "data: [DONE]\n\n"
 	return
 }

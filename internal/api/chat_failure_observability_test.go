@@ -16,6 +16,7 @@ import (
 	"github.com/lunargate-ai/gateway/internal/routing"
 	"github.com/lunargate-ai/gateway/internal/streaming"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func TestChatCompletionsFailureCollectorUsesLastFallbackModel(t *testing.T) {
@@ -53,6 +54,7 @@ func TestChatCompletionsFailureCollectorUsesLastFallbackModel(t *testing.T) {
 	})
 	cache := middleware.NewCache(config.CacheConfig{Enabled: false})
 	t.Cleanup(cache.Stop)
+	metrics := observability.NewMetricsWithRegisterer(prometheus.NewRegistry())
 	handler := NewHandler(
 		registry,
 		router,
@@ -62,7 +64,7 @@ func TestChatCompletionsFailureCollectorUsesLastFallbackModel(t *testing.T) {
 		),
 		cache,
 		streaming.NewHandler(),
-		observability.NewMetricsWithRegisterer(prometheus.NewRegistry()),
+		metrics,
 		capture.client,
 		nil,
 		nil,
@@ -84,6 +86,12 @@ func TestChatCompletionsFailureCollectorUsesLastFallbackModel(t *testing.T) {
 	}
 	if got := fallbackCalls.Load(); got != 1 {
 		t.Fatalf("fallback calls = %d, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.ProviderErrors.WithLabelValues("fallback", "all_failed")); got != 1 {
+		t.Fatalf("fallback all_failed metric = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(metrics.ProviderErrors.WithLabelValues("primary", "all_failed")); got != 0 {
+		t.Fatalf("primary all_failed metric = %v, want 0", got)
 	}
 
 	metric, requestLog := waitForFailureCollectorEvents(t, capture)

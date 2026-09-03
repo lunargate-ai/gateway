@@ -8,6 +8,7 @@ routing:
       targets:
         - provider: openai
           model: gpt-5.6-terra
+          weight: 100
 
 # Optional: enable inbound API-key auth for /v1/*
 # security:
@@ -27,3 +28,4 @@ routing:
 #   enabled: true
 #   share_prompts: true
 #   share_responses: true
+#   remote_control: false  # Sandbox traffic is separate from collector share flags

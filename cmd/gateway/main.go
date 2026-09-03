@@ -4,10 +4,14 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"reflect"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -23,6 +27,7 @@ import (
 	"github.com/lunargate-ai/gateway/internal/remotecontrol"
 	"github.com/lunargate-ai/gateway/internal/resilience"
 	"github.com/lunargate-ai/gateway/internal/routing"
+	"github.com/lunargate-ai/gateway/internal/safeurl"
 	"github.com/lunargate-ai/gateway/internal/security"
 	"github.com/lunargate-ai/gateway/internal/streaming"
 	"github.com/lunargate-ai/gateway/internal/updatecheck"
@@ -45,12 +50,15 @@ func main() {
 	}
 
 	cfg := cfgManager.Get()
-	if *logLevel != "" {
-		cfg.Logging.Level = *logLevel
+	effectiveLogging, err := resolveLoggingConfig(cfg.Logging, *logLevel)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid logging configuration: %v\n", err)
+		os.Exit(1)
 	}
 
 	// --- Setup Logging ---
-	effectiveLogLevel := setupLogging(cfg.Logging)
+	effectiveLogLevel := setupLogging(effectiveLogging)
+	startupLogFormat := effectiveLogging.Format
 	printStartupBanner(version, *configPath, effectiveLogLevel, cfg.Server.Address())
 
 	log.Info().
@@ -84,34 +92,15 @@ func main() {
 	updateChecker.Start(updateCheckCtx)
 	log.Info().
 		Bool("enabled", cfg.UpdateCheck.Enabled).
-		Str("endpoint", cfg.UpdateCheck.Endpoint).
+		Str("endpoint", redactedHTTPURL(cfg.UpdateCheck.Endpoint)).
 		Msg("automatic update check status")
 	selector := modelselect.NewEngine(cfg.ModelSelect)
 	store := modelstore.NewStore(registry, cfg.Providers)
 	handler := api.NewHandler(registry, routingEngine, fallbackExec, cache, streamer, metrics, collectorClient, selector, store)
-	handler.UpdateProviderConfigs(cfg.Providers)
-	remoteControlBaseURL := "http://" + localLoopbackAddress(cfg.Server)
-	modelSnapshotIDs := func() []string {
-		var ids []string
-		if store != nil {
-			for _, item := range store.AllModelsSnapshot() {
-				if item.ID != "" {
-					ids = append(ids, item.ID)
-				}
-			}
-		}
-		return ids
-	}
-	modelIDs := func(ctx context.Context) []string {
-		var ids []string
-		if store != nil {
-			for _, item := range store.AllModels(ctx) {
-				if item.ID != "" {
-					ids = append(ids, item.ID)
-				}
-			}
-		}
-		return ids
+	remoteControlAddress, remoteControlAddressErr := localLoopbackAddress(cfg.Server)
+	remoteControlBaseURL := ""
+	if remoteControlAddressErr == nil {
+		remoteControlBaseURL = "http://" + remoteControlAddress
 	}
 	var remoteControlMu sync.Mutex
 	var remoteControlClient *remotecontrol.Client
@@ -129,16 +118,21 @@ func main() {
 
 		remoteControlCancel()
 		remoteControlCancel = func() {}
-		remoteControlClient = remotecontrol.NewClient(
-			cfg.General,
-			cfg.DataSharing,
-			cfg.Security,
-			version,
-			remoteControlBaseURL,
-			routingEngine.RouteNames,
-			modelSnapshotIDs,
-			modelIDs,
-		)
+		remoteControlClient = nil
+		if cfg.DataSharing.Enabled && cfg.DataSharing.RemoteControl && remoteControlAddressErr != nil {
+			log.Error().Err(remoteControlAddressErr).Msg("remote control disabled: secure local sandbox address unavailable")
+		} else {
+			remoteControlClient = remotecontrol.NewClient(
+				cfg.General,
+				cfg.DataSharing,
+				cfg.Security,
+				version,
+				remoteControlBaseURL,
+				handler.RuntimeRouteNames,
+				handler.RuntimeModelSnapshotIDs,
+				handler.RuntimeModelIDs,
+			)
+		}
 		if remoteControlClient != nil {
 			rcCtx, cancel := context.WithCancel(context.Background())
 			remoteControlCancel = cancel
@@ -154,35 +148,44 @@ func main() {
 	cfgManager.OnChange(func(newCfg *config.Config) {
 		oldCfg := currentCfg
 		currentCfg = newCfg
-		providersChanged := !reflect.DeepEqual(oldCfg.Providers, newCfg.Providers)
-		routingChanged := !reflect.DeepEqual(oldCfg.Routing, newCfg.Routing)
-		modelSelectChanged := !reflect.DeepEqual(oldCfg.ModelSelect, newCfg.ModelSelect)
 		generalChanged := !reflect.DeepEqual(oldCfg.General, newCfg.General)
 		dataSharingChanged := !reflect.DeepEqual(oldCfg.DataSharing, newCfg.DataSharing)
 		securityChanged := !reflect.DeepEqual(oldCfg.Security, newCfg.Security)
 		serverChanged := !reflect.DeepEqual(oldCfg.Server, newCfg.Server)
 		updateCheckChanged := !reflect.DeepEqual(oldCfg.UpdateCheck, newCfg.UpdateCheck)
+		loggingChanged := !reflect.DeepEqual(oldCfg.Logging, newCfg.Logging)
 
 		if serverChanged {
 			log.Warn().Msg("server config changed; listen address and timeouts still require process restart to fully apply")
 		}
 
-		setupLogging(newCfg.Logging)
-		routingEngine.UpdateConfig(newCfg.Routing)
-		if registry.UpdateProvidersConfig(newCfg.Providers) {
-			store.UpdateProvidersConfig(newCfg.Providers)
-			handler.UpdateProviderConfigs(newCfg.Providers)
+		if loggingChanged {
+			reloadedLogging, loggingErr := resolveLoggingConfig(newCfg.Logging, *logLevel)
+			if loggingErr != nil {
+				log.Error().Err(loggingErr).Msg("failed to reconcile logging config; keeping previous log level")
+			} else {
+				setLogLevel(reloadedLogging.Level)
+				if reloadedLogging.Format != startupLogFormat {
+					log.Warn().
+						Str("configured_format", reloadedLogging.Format).
+						Str("active_format", startupLogFormat).
+						Msg("logging format changed; process restart required to apply")
+				}
+			}
+		}
+		runtimeChanged, runtimeErr := handler.UpdateRuntime(newCfg.Providers, newCfg.Routing, newCfg.ModelSelect)
+		if runtimeErr != nil {
+			log.Error().Err(runtimeErr).Msg("failed to reconcile runtime generation; keeping previous runtime")
 		}
 		rateLimiter.UpdateConfig(newCfg.RateLimit)
 		cache.UpdateConfig(newCfg.Cache)
 		retrier.UpdateConfig(newCfg.Retry)
-		selector.UpdateConfig(newCfg.ModelSelect)
 		collectorClient.UpdateConfig(newCfg.General, newCfg.DataSharing)
 		if updateCheckChanged {
 			updateChecker.UpdateConfig(newCfg.UpdateCheck)
 			log.Info().
 				Bool("enabled", newCfg.UpdateCheck.Enabled).
-				Str("endpoint", newCfg.UpdateCheck.Endpoint).
+				Str("endpoint", redactedHTTPURL(newCfg.UpdateCheck.Endpoint)).
 				Msg("automatic update check config updated")
 		}
 		if securityChanged {
@@ -193,7 +196,7 @@ func main() {
 
 		if dataSharingChanged || generalChanged || securityChanged {
 			reconcileRemoteControl(newCfg)
-		} else if providersChanged || routingChanged || modelSelectChanged {
+		} else if runtimeChanged {
 			refreshRemoteControlHello()
 			remoteControlMu.Lock()
 			clientSnapshot := remoteControlClient
@@ -225,7 +228,7 @@ func main() {
 	go func() {
 		log.Info().
 			Str("address", cfg.Server.Address()).
-			Strs("providers", registry.List()).
+			Strs("providers", handler.RuntimeProviderNames()).
 			Msg("gateway listening")
 
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -245,6 +248,9 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	if err := handler.CloseResponsesWebSockets(ctx); err != nil {
+		log.Error().Err(err).Msg("responses websocket shutdown error")
+	}
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Error().Err(err).Msg("server shutdown error")
 	}
@@ -259,19 +265,38 @@ func main() {
 }
 
 func setupLogging(cfg config.LoggingConfig) string {
-	level, err := zerolog.ParseLevel(cfg.Level)
+	return setupLoggingOutput(cfg, os.Stderr)
+}
+
+func setupLoggingOutput(cfg config.LoggingConfig, output io.Writer) string {
+	zerolog.TimeFieldFormat = time.RFC3339Nano
+	if cfg.Format == "console" {
+		output = zerolog.ConsoleWriter{Out: output, TimeFormat: time.RFC3339}
+	}
+	log.Logger = zerolog.New(output).With().Timestamp().Logger()
+	return setLogLevel(cfg.Level)
+}
+
+func setLogLevel(raw string) string {
+	level, err := zerolog.ParseLevel(raw)
 	if err != nil {
 		level = zerolog.InfoLevel
 	}
 	zerolog.SetGlobalLevel(level)
 
-	if cfg.Format == "console" {
-		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339})
-	}
-
-	zerolog.TimeFieldFormat = time.RFC3339Nano
-
 	return level.String()
+}
+
+func resolveLoggingConfig(cfg config.LoggingConfig, override string) (config.LoggingConfig, error) {
+	cfg.Level = strings.ToLower(strings.TrimSpace(cfg.Level))
+	cfg.Format = strings.ToLower(strings.TrimSpace(cfg.Format))
+	if override = strings.ToLower(strings.TrimSpace(override)); override != "" {
+		if _, err := zerolog.ParseLevel(override); err != nil {
+			return config.LoggingConfig{}, fmt.Errorf("invalid --log-level value")
+		}
+		cfg.Level = override
+	}
+	return cfg, nil
 }
 
 func printStartupBanner(version, configPath, logLevel, address string) {
@@ -290,12 +315,36 @@ listen:  %s
 `, version, configPath, logLevel, address)
 }
 
-func localLoopbackAddress(cfg config.ServerConfig) string {
-	host := cfg.Host
-	if host == "" || host == "0.0.0.0" || host == "::" {
-		host = "127.0.0.1"
+func localLoopbackAddress(cfg config.ServerConfig) (string, error) {
+	host := strings.TrimSpace(cfg.Host)
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
 	}
-	return fmt.Sprintf("%s:%d", host, cfg.Port)
+
+	switch {
+	case host == "", host == "0.0.0.0":
+		host = "127.0.0.1"
+	case host == "::":
+		host = "::1"
+	case strings.EqualFold(host, "localhost"):
+		host = "127.0.0.1"
+	default:
+		ip := net.ParseIP(host)
+		if ip == nil {
+			return "", fmt.Errorf("server.host is not a wildcard or loopback address")
+		}
+		switch {
+		case ip.IsUnspecified() && ip.To4() != nil:
+			host = "127.0.0.1"
+		case ip.IsUnspecified():
+			host = "::1"
+		case ip.IsLoopback():
+			host = ip.String()
+		default:
+			return "", fmt.Errorf("server.host is not a wildcard or loopback address")
+		}
+	}
+	return net.JoinHostPort(host, strconv.Itoa(cfg.Port)), nil
 }
 
 func logRemoteControlStatus(cfg *config.Config, remoteControlClient *remotecontrol.Client) {
@@ -309,6 +358,13 @@ func logRemoteControlStatus(cfg *config.Config, remoteControlClient *remotecontr
 		Bool("data_sharing_enabled", cfg.DataSharing.Enabled).
 		Bool("remote_control_enabled", remoteControlEnabled).
 		Str("instance_id", remoteControlInstanceID).
-		Str("backend_url", cfg.General.BackendURL).
+		Str("backend_url", redactedHTTPURL(cfg.General.BackendURL)).
 		Msg("gateway data sharing and remote control status")
+}
+
+func redactedHTTPURL(raw string) string {
+	if redacted, ok := safeurl.RedactedHTTPURL(raw); ok {
+		return redacted
+	}
+	return "[invalid]"
 }

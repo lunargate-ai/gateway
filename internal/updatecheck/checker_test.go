@@ -3,8 +3,10 @@ package updatecheck
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -138,6 +140,31 @@ func TestCheckRejectsInvalidJSONDocuments(t *testing.T) {
 	}
 }
 
+func TestCheckRedactsTransportURLCredentials(t *testing.T) {
+	const endpoint = "https://update-user:update-password@updates.example.test/latest?token=query-secret"
+	client := &http.Client{Transport: updateCheckRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return nil, errors.New("dial " + request.URL.String() + ": connection refused")
+	})}
+	checker := newChecker(config.UpdateCheckConfig{
+		Enabled:  true,
+		Endpoint: endpoint,
+		Timeout:  time.Second,
+	}, "0.3.0", "amd64", client)
+
+	_, err := checker.Check(context.Background())
+	if err == nil {
+		t.Fatal("Check returned nil transport error")
+	}
+	for _, secret := range []string{"update-user", "update-password", "query-secret"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("transport error leaked %q: %v", secret, err)
+		}
+	}
+	if !strings.Contains(err.Error(), "updates.example.test/latest") || !strings.Contains(err.Error(), "connection refused") {
+		t.Fatalf("transport error lost useful context: %v", err)
+	}
+}
+
 func TestIsUpdateAvailableUsesSemanticVersionOrder(t *testing.T) {
 	tests := []struct {
 		current string
@@ -155,4 +182,10 @@ func TestIsUpdateAvailableUsesSemanticVersionOrder(t *testing.T) {
 			t.Errorf("IsUpdateAvailable(%q, %q) = %v, want %v", test.current, test.latest, got, test.want)
 		}
 	}
+}
+
+type updateCheckRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn updateCheckRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return fn(request)
 }

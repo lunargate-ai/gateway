@@ -360,11 +360,12 @@ func TestResponsesWebSocket_MapsUpstreamError(t *testing.T) {
 	}
 }
 
-func TestResponsesWebSocket_ContinuesFromNonCompletedTerminal(t *testing.T) {
+func TestResponsesWebSocket_NonCompletedTerminalContinuationPolicy(t *testing.T) {
 	tests := []struct {
 		name              string
 		firstTerminalType string
 		firstStream       string
+		wantErrorField    string
 		wantMessageCount  int
 	}{
 		{
@@ -373,7 +374,7 @@ func TestResponsesWebSocket_ContinuesFromNonCompletedTerminal(t *testing.T) {
 			firstStream: "data: {\"id\":\"chatcmpl-incomplete\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"mock-gpt\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n" +
 				"data: {\"id\":\"chatcmpl-incomplete\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"mock-gpt\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n" +
 				"data: [DONE]\n\n",
-			wantMessageCount: 3,
+			wantErrorField: "input[1].status",
 		},
 		{
 			name:              "failed",
@@ -422,6 +423,7 @@ func TestResponsesWebSocket_ContinuesFromNonCompletedTerminal(t *testing.T) {
 			if firstResponseID == "" {
 				t.Fatalf("expected %s response ID; events=%v", test.firstTerminalType, eventTypes(firstEvents))
 			}
+			callsBeforeContinuation := atomic.LoadInt32(&upstreamCalls)
 
 			sendResponsesWebSocketJSON(t, conn, map[string]interface{}{
 				"type":                 "response.create",
@@ -430,6 +432,23 @@ func TestResponsesWebSocket_ContinuesFromNonCompletedTerminal(t *testing.T) {
 				"previous_response_id": firstResponseID,
 			})
 			continued := readResponsesWebSocketEventsUntilTerminal(t, conn)
+			if test.wantErrorField != "" {
+				if !hasResponsesWebSocketEventType(continued, "error") {
+					t.Fatalf("continuation events = %v, want error", eventTypes(continued))
+				}
+				if status, _ := continued[len(continued)-1]["status"].(float64); int(status) != http.StatusBadRequest {
+					t.Fatalf("continuation status = %v, want 400", continued[len(continued)-1]["status"])
+				}
+				errorObject, _ := continued[len(continued)-1]["error"].(map[string]interface{})
+				if errorObject["type"] != "invalid_request_error" || errorObject["code"] != "unsupported_feature" ||
+					errorObject["param"] != test.wantErrorField {
+					t.Fatalf("continuation error = %#v, want compatibility error for %s", errorObject, test.wantErrorField)
+				}
+				if got := atomic.LoadInt32(&upstreamCalls); got != callsBeforeContinuation {
+					t.Fatalf("rejected continuation made %d new upstream calls, want 0", got-callsBeforeContinuation)
+				}
+				return
+			}
 			if !hasResponsesWebSocketEventType(continued, "response.completed") {
 				t.Fatalf("continuation events = %v, want response.completed", eventTypes(continued))
 			}
@@ -458,7 +477,7 @@ func TestResponsesWebSocket_NativeStreamRequiresTerminalEvent(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&upstreamCalls, 1)
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, "event: response.output_text.delta\r\ndata: {\"type\":\"response.output_text.delta\",\"response_id\":\"resp_partial\",\"delta\":\"partial\"}\r\n\r\n")
+		_, _ = io.WriteString(w, "event: response.output_text.delta\r\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":0,\"response_id\":\"resp_partial\",\"delta\":\"partial\"}\r\n\r\n")
 		_, _ = io.WriteString(w, "data: [DONE]\r\n\r\n")
 	}))
 	defer upstream.Close()
@@ -475,13 +494,14 @@ func TestResponsesWebSocket_NativeStreamRequiresTerminalEvent(t *testing.T) {
 		"input": "Say hi",
 	})
 	events := readResponsesWebSocketEventsUntilTerminal(t, conn)
-	if !hasResponsesWebSocketEventType(events, "error") {
-		t.Fatalf("expected terminal error for truncated native stream, got %v", eventTypes(events))
+	if !hasResponsesWebSocketEventType(events, "response.failed") {
+		t.Fatalf("expected response.failed for truncated native stream, got %v", eventTypes(events))
 	}
 	last := events[len(events)-1]
-	errObj, _ := last["error"].(map[string]interface{})
-	if code, _ := errObj["code"].(string); code != "upstream_stream_incomplete" {
-		t.Fatalf("error code = %q, want upstream_stream_incomplete", code)
+	response, _ := last["response"].(map[string]interface{})
+	errObj, _ := response["error"].(map[string]interface{})
+	if code, _ := errObj["code"].(string); code != "server_error" {
+		t.Fatalf("error code = %q, want server_error", code)
 	}
 
 	sendResponsesWebSocketJSON(t, conn, map[string]interface{}{
@@ -806,7 +826,9 @@ func newResponsesWebSocketTestHandlerWithUpstreamType(upstreamURL, upstreamReque
 	cache := middleware.NewCache(config.CacheConfig{Enabled: false})
 	streamer := streaming.NewHandler()
 	metrics := observability.NewMetricsWithRegisterer(prometheus.NewRegistry())
-	return NewHandler(reg, router, fb, cache, streamer, metrics, nil, nil, nil)
+	handler := NewHandler(reg, router, fb, cache, streamer, metrics, nil, nil, nil)
+	handler.UpdateProviderConfigs(cfgProviders)
+	return handler
 }
 
 func mustDialResponsesWebSocket(t *testing.T, serverURL string) *websocket.Conn {

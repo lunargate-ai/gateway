@@ -19,6 +19,7 @@ func TestNativeResponsesCreateRequiresHTTP200(t *testing.T) {
 		{name: "no content", status: http.StatusNoContent},
 		{name: "partial content", status: http.StatusPartialContent},
 		{name: "redirect", status: http.StatusTemporaryRedirect},
+		{name: "stream accepted", status: http.StatusAccepted, stream: true},
 		{name: "stream partial content", status: http.StatusPartialContent, stream: true},
 	}
 

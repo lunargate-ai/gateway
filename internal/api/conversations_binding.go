@@ -2,19 +2,16 @@ package api
 
 import (
 	"container/list"
-	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/hex"
 	"fmt"
 	"net/http"
-	"net/url"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/lunargate-ai/gateway/internal/modelid"
+	"github.com/lunargate-ai/gateway/internal/provideridentity"
 )
 
 const (
@@ -28,6 +25,7 @@ const (
 type conversationBinding struct {
 	Provider           string
 	AccountFingerprint string
+	Local              bool
 }
 
 type conversationBindingStore struct {
@@ -43,6 +41,7 @@ type conversationBindingStore struct {
 
 type conversationBindingEntry struct {
 	binding   conversationBinding
+	ambiguous bool
 	expiresAt time.Time
 	size      int
 	element   *list.Element
@@ -62,14 +61,113 @@ func newConversationBindingStore(ttl time.Duration) *conversationBindingStore {
 	}
 }
 
-func (s *conversationBindingStore) put(conversationID string, binding conversationBinding) bool {
-	conversationID = strings.TrimSpace(conversationID)
+func (s *conversationBindingStore) claim(conversationID string, binding conversationBinding) ownerClaimResult {
+	binding = normalizeConversationBinding(binding)
+	if s == nil || !validOpaqueResourceID(conversationID) || binding.Provider == "" || binding.AccountFingerprint == "" || s.maxEntries <= 0 {
+		return ownerClaimUnavailable
+	}
+	size := conversationBindingSize(conversationID, binding)
+	if size > s.maxBytes {
+		return ownerClaimUnavailable
+	}
+
+	now := s.currentTime()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanupExpiredLocked(now)
+	if existing := s.entries[conversationID]; existing != nil {
+		if existing.ambiguous {
+			existing.expiresAt = now.Add(s.ttl)
+			s.order.MoveToBack(existing.element)
+			return ownerClaimConflict
+		}
+		if sameConversationBindingOwner(existing.binding, binding) {
+			existing.expiresAt = now.Add(s.ttl)
+			s.order.MoveToBack(existing.element)
+			return ownerClaimRefreshed
+		}
+		s.markConflictLocked(conversationID, existing, now)
+		return ownerClaimConflict
+	}
+	for len(s.entries) >= s.maxEntries || s.totalBytes+size > s.maxBytes {
+		if !s.removeOldestLocked() {
+			return ownerClaimUnavailable
+		}
+	}
+	element := s.order.PushBack(conversationID)
+	s.entries[conversationID] = &conversationBindingEntry{
+		binding:   binding,
+		expiresAt: now.Add(s.ttl),
+		size:      size,
+		element:   element,
+	}
+	s.totalBytes += size
+	return ownerClaimed
+}
+
+func normalizeConversationBinding(binding conversationBinding) conversationBinding {
 	binding.Provider = strings.TrimSpace(binding.Provider)
 	binding.AccountFingerprint = strings.TrimSpace(binding.AccountFingerprint)
-	if s == nil || conversationID == "" || binding.Provider == "" || binding.AccountFingerprint == "" {
+	return binding
+}
+
+func conversationBindingSize(conversationID string, binding conversationBinding) int {
+	size := len(conversationID) + len(binding.Provider) + len(binding.AccountFingerprint)
+	if binding.Local {
+		size++
+	}
+	return size
+}
+
+func sameConversationBindingOwner(first, second conversationBinding) bool {
+	return first.Local == second.Local &&
+		first.Provider == second.Provider &&
+		first.AccountFingerprint == second.AccountFingerprint
+}
+
+func (s *conversationBindingStore) markConflictLocked(
+	conversationID string,
+	entry *conversationBindingEntry,
+	now time.Time,
+) {
+	if entry == nil {
+		return
+	}
+	tombstoneSize := len(conversationID)
+	s.totalBytes += tombstoneSize - entry.size
+	entry.binding = conversationBinding{}
+	entry.ambiguous = true
+	entry.expiresAt = now.Add(s.ttl)
+	entry.size = tombstoneSize
+	s.order.MoveToBack(entry.element)
+}
+
+func (s *conversationBindingStore) lookup(conversationID string) (conversationBinding, ownerLookupResult) {
+	if s == nil || !validOpaqueResourceID(conversationID) {
+		return conversationBinding{}, ownerLookupMissing
+	}
+
+	now := s.currentTime()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanupExpiredLocked(now)
+	entry := s.entries[conversationID]
+	if entry == nil {
+		return conversationBinding{}, ownerLookupMissing
+	}
+	s.order.MoveToBack(entry.element)
+	if entry.ambiguous {
+		return conversationBinding{}, ownerLookupConflict
+	}
+	return entry.binding, ownerLookupBound
+}
+
+func (s *conversationBindingStore) put(conversationID string, binding conversationBinding) bool {
+	binding = normalizeConversationBinding(binding)
+	if s == nil || !validOpaqueResourceID(conversationID) || binding.Provider == "" || binding.AccountFingerprint == "" {
 		return false
 	}
-	size := len(conversationID) + len(binding.Provider) + len(binding.AccountFingerprint)
+	size := conversationBindingSize(conversationID, binding)
 	if size > s.maxBytes || s.maxEntries <= 0 {
 		return false
 	}
@@ -98,26 +196,16 @@ func (s *conversationBindingStore) put(conversationID string, binding conversati
 }
 
 func (s *conversationBindingStore) get(conversationID string) (conversationBinding, bool) {
-	conversationID = strings.TrimSpace(conversationID)
-	if s == nil || conversationID == "" {
-		return conversationBinding{}, false
-	}
-
-	now := s.currentTime()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.cleanupExpiredLocked(now)
-	entry := s.entries[conversationID]
-	if entry == nil {
-		return conversationBinding{}, false
-	}
-	s.order.MoveToBack(entry.element)
-	return entry.binding, true
+	binding, result := s.lookup(conversationID)
+	return binding, result == ownerLookupBound
 }
 
-func (s *conversationBindingStore) delete(conversationID string) bool {
-	conversationID = strings.TrimSpace(conversationID)
-	if s == nil || conversationID == "" {
+// deleteIfOwned removes a binding only when it still belongs to the account
+// observed before an upstream operation. In particular, it must not erase a
+// conflict tombstone installed while that operation was in flight.
+func (s *conversationBindingStore) deleteIfOwned(conversationID string, binding conversationBinding) bool {
+	binding = normalizeConversationBinding(binding)
+	if s == nil || !validOpaqueResourceID(conversationID) || binding.Provider == "" || binding.AccountFingerprint == "" {
 		return false
 	}
 
@@ -126,7 +214,7 @@ func (s *conversationBindingStore) delete(conversationID string) bool {
 	defer s.mu.Unlock()
 	s.cleanupExpiredLocked(now)
 	entry := s.entries[conversationID]
-	if entry == nil {
+	if entry == nil || entry.ambiguous || !sameConversationBindingOwner(entry.binding, binding) {
 		return false
 	}
 	s.removeLocked(conversationID, entry)
@@ -318,11 +406,21 @@ func (h *Handler) boundConversationBinding(r *http.Request, conversationID strin
 	if h == nil || h.conversationBindings == nil {
 		return conversationBinding{}, false, nil
 	}
-	binding, ok := h.conversationBindings.get(conversationID)
-	if !ok {
+	requestedProvider := strings.TrimSpace(r.Header.Get("X-LunarGate-Provider"))
+	binding, lookup := h.conversationBindings.lookup(conversationID)
+	if lookup == ownerLookupConflict {
+		if requestedProvider != "" {
+			return conversationBinding{}, false, nil
+		}
+		return conversationBinding{}, false, &conversationBindingResolutionError{
+			message: fmt.Sprintf("conversation %q has conflicting provider ownership", conversationID),
+			param:   "conversation_id",
+			code:    "provider_binding_conflict",
+		}
+	}
+	if lookup != ownerLookupBound {
 		return conversationBinding{}, false, nil
 	}
-	requestedProvider := strings.TrimSpace(r.Header.Get("X-LunarGate-Provider"))
 	if requestedProvider != "" && requestedProvider != binding.Provider {
 		return conversationBinding{}, false, &conversationBindingResolutionError{
 			message: fmt.Sprintf("conversation %q belongs to provider %q, not %q", conversationID, binding.Provider, requestedProvider),
@@ -360,40 +458,16 @@ func (h *Handler) retainNativeConversationBinding(conversationID string, binding
 	if h == nil || h.conversationBindings == nil || !validNativeConversationID(conversationID) {
 		return false
 	}
-	return h.conversationBindings.put(conversationID, binding)
+	return h.conversationBindings.claim(conversationID, binding).retained()
 }
 
 func validNativeConversationID(conversationID string) bool {
-	conversationID = strings.TrimSpace(conversationID)
-	return strings.HasPrefix(conversationID, "conv_") && len(conversationID) > len("conv_")
+	return validOpaqueResourceID(conversationID) &&
+		strings.HasPrefix(conversationID, "conv_") && len(conversationID) > len("conv_")
 }
 
 func conversationAccountFingerprint(providerType, baseURL, organization, apiKey string) string {
-	hash := sha256.New()
-	for _, value := range []string{
-		strings.ToLower(strings.TrimSpace(providerType)),
-		normalizeConversationAccountBaseURL(baseURL),
-		strings.TrimSpace(organization),
-		apiKey,
-	} {
-		_, _ = hash.Write([]byte(strconv.Itoa(len(value))))
-		_, _ = hash.Write([]byte{':'})
-		_, _ = hash.Write([]byte(value))
-	}
-	return hex.EncodeToString(hash.Sum(nil))
-}
-
-func normalizeConversationAccountBaseURL(raw string) string {
-	raw = strings.TrimSpace(raw)
-	parsed, err := url.Parse(raw)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return strings.TrimRight(raw, "/")
-	}
-	parsed.Scheme = strings.ToLower(parsed.Scheme)
-	parsed.Host = strings.ToLower(parsed.Host)
-	parsed.Path = strings.TrimRight(parsed.Path, "/")
-	parsed.Fragment = ""
-	return parsed.String()
+	return provideridentity.AccountFingerprint(providerType, baseURL, organization, apiKey)
 }
 
 func conversationBindingHeaders(w http.ResponseWriter, binding conversationBinding) {

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/lunargate-ai/gateway/internal/config"
+	"github.com/lunargate-ai/gateway/internal/safeurl"
 	"github.com/lunargate-ai/gateway/pkg/models"
 	"github.com/rs/zerolog/log"
 )
@@ -172,7 +173,10 @@ func (t *OllamaTranslator) TranslateRequest(ctx context.Context, req *models.Uni
 		return nil, fmt.Errorf("failed to marshal ollama request: %w", err)
 	}
 
-	endpoint := fmt.Sprintf("%s/api/chat", strings.TrimRight(strings.TrimSpace(t.cfg.BaseURL), "/"))
+	endpoint, err := safeurl.JoinHTTPPath(t.cfg.BaseURL, "api/chat")
+	if err != nil {
+		return nil, fmt.Errorf("failed to build ollama endpoint: %w", err)
+	}
 	log.Debug().
 		Str("provider", "ollama").
 		Str("model", ollamaReq.Model).
@@ -366,7 +370,10 @@ func (t *OllamaTranslator) TranslateEmbeddingsRequest(ctx context.Context, req *
 		return nil, fmt.Errorf("failed to marshal ollama embeddings request: %w", err)
 	}
 
-	endpoint := fmt.Sprintf("%s/api/embed", strings.TrimRight(strings.TrimSpace(t.cfg.BaseURL), "/"))
+	endpoint, err := safeurl.JoinHTTPPath(t.cfg.BaseURL, "api/embed")
+	if err != nil {
+		return nil, fmt.Errorf("failed to build ollama embeddings endpoint: %w", err)
+	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create ollama embeddings http request: %w", err)

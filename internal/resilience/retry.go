@@ -128,6 +128,8 @@ func (r *Retrier) Do(ctx context.Context, fn DoFunc) (*http.Response, int, error
 		maxAttempts = cfg.MaxAttempts
 		if maxAttempts < 1 {
 			maxAttempts = 1
+		} else if maxAttempts > config.MaxRetryAttempts {
+			maxAttempts = config.MaxRetryAttempts
 		}
 	}
 	if retryDisabled(ctx) && maxAttempts > 1 {
@@ -204,25 +206,55 @@ func isProviderFailureStatus(code int) bool {
 }
 
 func calculateRetryDelay(cfg config.RetryConfig, attempt int, lastErr error, now time.Time) time.Duration {
-	delay := float64(cfg.InitialDelay) * math.Pow(cfg.Multiplier, float64(attempt))
-
-	// Add jitter: delay * (1 +/- jitterFactor/2)
-	jitter := delay * cfg.JitterFactor * (rand.Float64() - 0.5)
-	result := time.Duration(delay + jitter)
-
-	if result < 0 {
-		result = cfg.InitialDelay
+	maxDelay := cfg.MaxDelay
+	if maxDelay < 0 {
+		maxDelay = 0
 	}
+	initialDelay := cfg.InitialDelay
+	if initialDelay < 0 {
+		initialDelay = 0
+	}
+	multiplier := cfg.Multiplier
+	if math.IsNaN(multiplier) || math.IsInf(multiplier, -1) || multiplier < 1 {
+		multiplier = 1
+	}
+	jitterFactor := cfg.JitterFactor
+	if math.IsNaN(jitterFactor) || math.IsInf(jitterFactor, 0) || jitterFactor < 0 {
+		jitterFactor = 0
+	} else if jitterFactor > 1 {
+		jitterFactor = 1
+	}
+
+	delay := float64(initialDelay)
+	if delay > 0 && attempt > 0 {
+		delay *= math.Pow(multiplier, float64(attempt))
+	}
+	// Add jitter: delay * (1 +/- jitterFactor/2).
+	delay *= 1 + jitterFactor*(rand.Float64()-0.5)
+	result := saturatingRetryDuration(delay, maxDelay)
+
 	var statusErr *RetryableStatusError
 	if errors.As(lastErr, &statusErr) {
 		if retryAfter, ok := parseRetryAfter(statusErr.Headers.Get("Retry-After"), now); ok && retryAfter > result {
 			result = retryAfter
 		}
 	}
-	if result > cfg.MaxDelay {
-		result = cfg.MaxDelay
+	if result > maxDelay {
+		result = maxDelay
 	}
 	return result
+}
+
+func saturatingRetryDuration(value float64, maximum time.Duration) time.Duration {
+	if maximum <= 0 || math.IsNaN(value) || value <= 0 {
+		return 0
+	}
+	// Compare before conversion: float64(MaxInt64) rounds to 1<<63, which
+	// would wrap negative if converted directly to time.Duration.
+	if math.IsInf(value, 1) || value >= float64(maximum) {
+		return maximum
+	}
+	return time.Duration(value)
 }
 
 func parseRetryAfter(value string, now time.Time) (time.Duration, bool) {

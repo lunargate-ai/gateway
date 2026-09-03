@@ -83,8 +83,11 @@ func TestResponsesUsesAndUpdatesLocalConversation(t *testing.T) {
 	if responseConversation["id"] != conversation.ID {
 		t.Fatalf("response conversation = %#v", response["conversation"])
 	}
-	if response["status"] != "completed" || response["output_text"] != "answer" {
+	if response["status"] != "completed" || responsesTextFromMapForTest(response) != "answer" {
 		t.Fatalf("response = %#v", response)
+	}
+	if _, exists := response["output_text"]; exists {
+		t.Fatalf("translated response exposed SDK-only output_text: %#v", response)
 	}
 
 	items, ok := handler.conversationsState.getItems(conversation.ID)

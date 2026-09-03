@@ -7,9 +7,8 @@ import (
 )
 
 func translatedResponseID(upstreamID string) string {
-	candidate := strings.TrimSpace(upstreamID)
-	if strings.HasPrefix(candidate, "resp_") && len(candidate) > len("resp_") {
-		return candidate
+	if validOpaqueResourceID(upstreamID) && strings.HasPrefix(upstreamID, "resp_") && len(upstreamID) > len("resp_") {
+		return upstreamID
 	}
 	return "resp_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 }

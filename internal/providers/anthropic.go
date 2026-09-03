@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/lunargate-ai/gateway/internal/config"
+	"github.com/lunargate-ai/gateway/internal/safeurl"
 	"github.com/lunargate-ai/gateway/pkg/models"
 )
 
@@ -27,7 +28,7 @@ func NewAnthropicTranslator(cfg config.ProviderConfig) *AnthropicTranslator {
 		cfg.DefaultModel = "claude-sonnet-4-6"
 	}
 	if cfg.APIVersion == "" {
-		cfg.APIVersion = "2023-06-01"
+		cfg.APIVersion = anthropicDefaultAPIVersion
 	}
 	return &AnthropicTranslator{cfg: cfg}
 }
@@ -181,7 +182,7 @@ func (t *AnthropicTranslator) ValidateRequestCompatibility(providerID string, re
 	if req.Store != nil && *req.Store && !strings.EqualFold(strings.TrimSpace(req.SourceRequestType), "responses") {
 		return unsupported("store", "Anthropic Messages has no per-request storage control")
 	}
-	if strings.TrimSpace(req.PreviousResponseID) != "" {
+	if req.PreviousResponseID != "" {
 		return unsupported("previous_response_id", "Anthropic Messages has no native Responses continuation")
 	}
 
@@ -617,7 +618,10 @@ func (t *AnthropicTranslator) TranslateRequest(ctx context.Context, req *models.
 		return nil, fmt.Errorf("failed to marshal anthropic request: %w", err)
 	}
 
-	endpoint := fmt.Sprintf("%s/v1/messages", t.cfg.BaseURL)
+	endpoint, err := safeurl.JoinHTTPPath(t.cfg.BaseURL, "v1/messages")
+	if err != nil {
+		return nil, fmt.Errorf("failed to build anthropic endpoint: %w", err)
+	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create anthropic http request: %w", err)
@@ -626,6 +630,7 @@ func (t *AnthropicTranslator) TranslateRequest(ctx context.Context, req *models.
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("x-api-key", t.cfg.APIKey)
 	httpReq.Header.Set("anthropic-version", t.cfg.APIVersion)
+	applyUpstreamRequestHeaders(ctx, httpReq, "Anthropic-Beta")
 
 	return httpReq, nil
 }
@@ -996,7 +1001,7 @@ func openAIMessageToAnthropicBlocks(msg *models.Message) ([]anthropicContentBloc
 		for _, tc := range msg.ToolCalls {
 			input := interface{}(map[string]interface{}{})
 			if strings.TrimSpace(tc.Function.Arguments) != "" {
-				if err := json.Unmarshal([]byte(tc.Function.Arguments), &input); err != nil {
+				if err := decodeJSONPreserveNumbers([]byte(tc.Function.Arguments), &input); err != nil {
 					return nil, fmt.Errorf("invalid tool arguments JSON for %s: %w", tc.Function.Name, err)
 				}
 			}

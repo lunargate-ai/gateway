@@ -53,6 +53,9 @@ func TestTranslatedResponsesRejectsUnmappedFieldsPerTarget(t *testing.T) {
 		{name: "reasoning input item", raw: `{"model":"gpt-5","input":[{"type":"reasoning","encrypted_content":"abc"}]}`, wantField: "input[0].type"},
 		{name: "image file reference", raw: `{"model":"gpt-5","input":[{"type":"message","role":"user","content":[{"type":"input_image","file_id":"file_1"}]}]}`, wantField: "input[0].content[0].file_id"},
 		{name: "empty lifecycle id", raw: `{"model":"gpt-5","input":[{"type":"message","id":"","role":"user","content":"hi"}]}`, wantField: "input[0].id"},
+		{name: "padded lifecycle id", raw: `{"model":"gpt-5","input":[{"type":"message","id":" msg_1 ","role":"user","content":"hi"}]}`, wantField: "input[0].id"},
+		{name: "padded function call id", raw: `{"model":"gpt-5","input":[{"type":"function_call","call_id":" call_1 ","name":"lookup","arguments":"{}"}]}`, wantField: "input[0].call_id"},
+		{name: "padded function output call id", raw: `{"model":"gpt-5","input":[{"type":"function_call_output","call_id":" call_1 ","output":"done"}]}`, wantField: "input[0].call_id"},
 		{name: "incomplete lifecycle status", raw: `{"model":"gpt-5","input":[{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}","status":"in_progress"}]}`, wantField: "input[0].status"},
 		{name: "unknown message phase", raw: `{"model":"gpt-5","input":[{"type":"message","role":"assistant","content":"hi","phase":"analysis"}]}`, wantField: "input[0].phase"},
 		{name: "foreign nested input field", raw: `{"model":"gpt-5","input":[{"type":"message","role":"user","content":"hi","vendor_hint":true}]}`, wantField: "input[0].vendor_hint"},
@@ -319,7 +322,10 @@ func TestResponsesNativeTargetPassesCompleteEnvelopeThrough(t *testing.T) {
 			{"type":"message","role":"user","content":[
 				{"type":"input_text","text":"describe","prompt_cache_breakpoint":{"type":"ephemeral"}},
 				{"type":"input_file","file_id":"file_1"}
-			]}
+			]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial answer"}],"status":"incomplete"},
+			{"type":"function_call","call_id":"call_partial","name":"lookup","arguments":"{\"query\":","status":"incomplete"},
+			{"type":"function_call_output","call_id":"call_partial","output":"partial result","status":"incomplete"}
 		],
 		"instructions":[{"type":"message","role":"developer","content":"be concise"}],
 		"reasoning":{"effort":"high","summary":"auto","context":"auto","mode":"standard","generate_summary":"auto"},
@@ -376,6 +382,16 @@ func TestResponsesNativeTargetPassesCompleteEnvelopeThrough(t *testing.T) {
 	messageContent := input[1].(map[string]interface{})["content"].([]interface{})
 	if messageContent[0].(map[string]interface{})["prompt_cache_breakpoint"] == nil {
 		t.Fatalf("native input cache breakpoint changed: %#v", messageContent)
+	}
+	for index := 2; index < 5; index++ {
+		partialItem, ok := input[index].(map[string]interface{})
+		if !ok || partialItem["status"] != "incomplete" {
+			t.Fatalf("native partial input item %d changed: %#v", index, input[index])
+		}
+	}
+	partialCall := input[3].(map[string]interface{})
+	if partialCall["arguments"] != `{"query":` {
+		t.Fatalf("native partial function arguments changed: %#v", partialCall)
 	}
 	reasoning := captured["reasoning"].(map[string]interface{})
 	if reasoning["summary"] != "auto" || reasoning["context"] != "auto" || reasoning["mode"] != "standard" || reasoning["generate_summary"] != "auto" {

@@ -2,9 +2,11 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strings"
@@ -16,23 +18,27 @@ import (
 
 const (
 	responsesFallbackModel       = "unknown"
-	responsesEventIDPrefix       = "evt_lg_"
 	responsesStreamStateMaxBytes = 16 << 20
 	responsesStreamMaxToolCalls  = 128
 )
 
 var (
-	errResponsesStreamStateTooLarge = errors.New("translated responses stream state exceeds 16 MiB limit")
-	errResponsesStreamTooManyTools  = errors.New("translated responses stream exceeds 128 tool calls")
+	errResponsesStreamStateTooLarge   = errors.New("translated responses stream state exceeds 16 MiB limit")
+	errResponsesStreamTooManyTools    = errors.New("translated responses stream exceeds 128 tool calls")
+	errResponsesStreamInvalidToolID   = errors.New("translated tool call id must not contain surrounding whitespace")
+	errNativeResponsesInvalidTerminal = errors.New("native Responses terminal event is invalid or inconsistent")
+	errNativeResponsesInvalidIdentity = errors.New("native Responses event identity is invalid or inconsistent")
+	errNativeResponsesInvalidSequence = errors.New("native Responses event sequence_number is invalid or inconsistent")
 )
 
 type responsesStreamProxy struct {
-	target      http.ResponseWriter
-	headers     http.Header
-	statusCode  int
-	headersSent bool
-	native      bool
-	buffer      bytes.Buffer
+	target        http.ResponseWriter
+	headers       http.Header
+	statusCode    int
+	headersSent   bool
+	native        bool
+	nativeStarted bool
+	buffer        bytes.Buffer
 
 	responseID       string
 	itemID           string
@@ -65,8 +71,15 @@ type responsesStreamProxy struct {
 	terminalResponse       map[string]interface{}
 	nativeTerminalSeen     bool
 	nativeTerminalRecorded bool
+	nativeLastSequence     int64
+	nativePendingDone      []byte
+	nativeDoneForwarded    bool
+	nativeResponseSnapshot map[string]interface{}
 	beforeTerminal         func(map[string]interface{})
 	localConversationID    string
+	responseOwner          responseExecutionOwner
+	requestContext         context.Context
+	requestPayload         map[string]json.RawMessage
 }
 
 type responsesToolCallState struct {
@@ -100,6 +113,10 @@ type nativeResponsesStreamSink interface {
 	recordNativeTerminal(*nativeResponsesStreamTerminal)
 }
 
+type nativeResponsesSyntheticFailureSink interface {
+	markNativeResponsesSyntheticFailure()
+}
+
 func newResponsesStreamProxy(target http.ResponseWriter) *responsesStreamProxy {
 	return &responsesStreamProxy{
 		target:               target,
@@ -109,11 +126,17 @@ func newResponsesStreamProxy(target http.ResponseWriter) *responsesStreamProxy {
 		reasoningOutputIndex: -1,
 		toolCalls:            make(map[string]*responsesToolCallState),
 		toolCallOrder:        make([]string, 0, 4),
+		eventSeq:             -1,
+		nativeLastSequence:   -1,
 	}
 }
 
 func (p *responsesStreamProxy) Header() http.Header {
 	return p.headers
+}
+
+func (p *responsesStreamProxy) setResponseExecutionOwner(owner responseExecutionOwner) {
+	p.responseOwner = owner
 }
 
 func (p *responsesStreamProxy) WriteHeader(statusCode int) {
@@ -134,25 +157,46 @@ func (p *responsesStreamProxy) recordNativeTerminal(terminal *nativeResponsesStr
 	}
 	p.nativeTerminalRecorded = true
 	p.completed = true
-	p.responseID = terminal.responseID
+	if p.responseID == "" {
+		p.responseID = terminal.responseID
+	}
 	p.model = terminal.model
 	p.created = terminal.createdAt
 	if terminal.hasUsage {
 		p.usage = &models.Usage{
-			PromptTokens:        terminal.tokensInput,
-			CompletionTokens:    terminal.tokensOutput,
-			TotalTokens:         terminal.tokensTotal,
-			PromptTokensDetails: inputTokenDetailsFromTokenUsage(terminal.tokenUsage),
+			PromptTokens:            terminal.tokensInput,
+			CompletionTokens:        terminal.tokensOutput,
+			TotalTokens:             terminal.tokensTotal,
+			PromptTokensDetails:     inputTokenDetailsFromTokenUsage(terminal.tokenUsage),
+			CompletionTokensDetails: completionTokenDetailsFromTokenUsage(terminal.tokenUsage),
 		}
 	}
 	p.terminalResponse = terminal.response
 	p.completedResponse = nil
+	p.nativeResponseSnapshot = nil
 	if terminal.eventType == "response.completed" && terminal.status == "completed" {
 		p.completedResponse = terminal.response
 	}
 }
 
 func (p *responsesStreamProxy) transformNativeEventData(event streaming.SSEEvent) ([]byte, error) {
+	if len(bytes.TrimSpace(event.Data)) == 0 {
+		return nil, nil
+	}
+	responseID, err := validateResponsesEventIdentity(event.Data, event.Event, p.responseID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", errNativeResponsesInvalidIdentity, err)
+	}
+	if _, err := validateNativeResponsesEventSequence(event.Data, p.nativeLastSequence); err != nil {
+		return nil, fmt.Errorf("%w: %v", errNativeResponsesInvalidSequence, err)
+	}
+	p.responseID = responseID
+
+	if nativeResponsesTerminalHint(event) {
+		if _, ok := parseNativeResponsesStreamTerminal(event); !ok {
+			return nil, errNativeResponsesInvalidTerminal
+		}
+	}
 	// The first terminal event is authoritative. ProxySSE observes transformed
 	// data after writing it, so neutralize any later terminal before the
 	// observer can overwrite metrics or request-log state. The corresponding
@@ -192,6 +236,122 @@ func (p *responsesStreamProxy) transformNativeEventData(event streaming.SSEEvent
 	return transformed, nil
 }
 
+func validateNativeResponsesEventSequence(payload []byte, lastSequence int64) (int64, error) {
+	sequence, err := parseNativeResponsesEventSequence(payload)
+	if err != nil {
+		return -1, err
+	}
+	if sequence <= lastSequence {
+		return -1, fmt.Errorf("sequence_number %d must be greater than %d", sequence, lastSequence)
+	}
+	return sequence, nil
+}
+
+func parseNativeResponsesEventSequence(payload []byte) (int64, error) {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &envelope); err != nil || envelope == nil {
+		return -1, errors.New("event payload must be a JSON object")
+	}
+	rawSequence, present := envelope["sequence_number"]
+	if !present {
+		return -1, errors.New("sequence_number is required")
+	}
+	var number json.Number
+	if err := json.Unmarshal(rawSequence, &number); err != nil {
+		return -1, errors.New("sequence_number must be an exact non-negative integer")
+	}
+	sequence, err := number.Int64()
+	if err != nil || sequence < 0 {
+		return -1, errors.New("sequence_number must be an exact non-negative integer")
+	}
+	return sequence, nil
+}
+
+// validateResponsesEventIdentity locks the first explicit response identifier
+// and rejects later frames that try to move one stream to another response.
+// Lifecycle boundary events always carry response.id; unknown future events
+// may omit an identifier, but any identifier they do carry must remain stable.
+func validateResponsesEventIdentity(payload []byte, headerEventType string, lockedID string) (string, error) {
+	if len(bytes.TrimSpace(payload)) == 0 {
+		return lockedID, nil
+	}
+
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &envelope); err != nil || envelope == nil {
+		return lockedID, errors.New("event payload must be a JSON object")
+	}
+
+	dataEventType := normalizeNativeResponsesEventType(parseJSONStringRaw(envelope["type"]))
+	headerEventType = normalizeNativeResponsesEventType(headerEventType)
+	requiresResponseID := nativeResponsesFullResponseEvent(dataEventType) ||
+		nativeResponsesFullResponseEvent(headerEventType)
+
+	topLevelID, topLevelPresent, err := responsesEventNonEmptyString(envelope, "response_id")
+	if err != nil {
+		return lockedID, err
+	}
+
+	var nestedID string
+	var nestedPresent bool
+	if responseRaw, responsePresent := envelope["response"]; responsePresent {
+		var response map[string]json.RawMessage
+		if err := json.Unmarshal(responseRaw, &response); err != nil || response == nil {
+			if requiresResponseID {
+				return lockedID, errors.New("lifecycle event requires a response object")
+			}
+		} else {
+			nestedID, nestedPresent, err = responsesEventNonEmptyString(response, "id")
+			if err != nil {
+				return lockedID, err
+			}
+		}
+	}
+
+	if requiresResponseID && !nestedPresent {
+		return lockedID, errors.New("lifecycle event requires a non-empty response.id")
+	}
+	if topLevelPresent && nestedPresent && topLevelID != nestedID {
+		return lockedID, errors.New("event contains inconsistent response identifiers")
+	}
+
+	eventID := topLevelID
+	if eventID == "" {
+		eventID = nestedID
+	}
+	if lockedID != "" && eventID != "" && eventID != lockedID {
+		return lockedID, errors.New("response identifier changed during the stream")
+	}
+	if lockedID == "" && eventID != "" {
+		lockedID = eventID
+	}
+	return lockedID, nil
+}
+
+func nativeResponsesFullResponseEvent(eventType string) bool {
+	switch normalizeNativeResponsesEventType(eventType) {
+	case "response.created", "response.queued", "response.in_progress":
+		return true
+	default:
+		return canonicalNativeResponsesTerminalType(eventType) != ""
+	}
+}
+
+func responsesEventNonEmptyString(fields map[string]json.RawMessage, key string) (string, bool, error) {
+	raw, present := fields[key]
+	if !present {
+		return "", false, nil
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "", false, fmt.Errorf("%s must be a non-empty string", key)
+	}
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" || value != trimmed {
+		return "", false, fmt.Errorf("%s must be a non-empty string without surrounding whitespace", key)
+	}
+	return value, true, nil
+}
+
 func (p *responsesStreamProxy) Flush() {
 	_ = p.FlushError()
 }
@@ -203,24 +363,50 @@ func (p *responsesStreamProxy) FlushError() error {
 	if !p.headersSent {
 		return nil
 	}
-	return http.NewResponseController(p.target).Flush()
+	err := http.NewResponseController(p.target).Flush()
+	if err == nil && p.native && p.statusCode == http.StatusOK {
+		p.nativeStarted = true
+	}
+	return err
 }
 
 func (p *responsesStreamProxy) Write(b []byte) (int, error) {
 	if p.native {
 		p.sendHeadersIfNeeded()
+		if p.statusCode >= http.StatusBadRequest {
+			return p.target.Write(b)
+		}
+		p.nativeStarted = true
 		event := parseNativeResponsesSSEFrame(b)
 		trimmedData := bytes.TrimSpace(event.Data)
 		hasData := len(trimmedData) > 0
 		isDone := bytes.Equal(trimmedData, []byte("[DONE]"))
+		if isDone {
+			if p.nativeDoneForwarded {
+				return len(b), nil
+			}
+			if !p.nativeTerminalSeen {
+				if len(p.nativePendingDone) == 0 {
+					p.nativePendingDone = append([]byte(nil), b...)
+				}
+				return len(b), nil
+			}
+		}
 		if p.nativeTerminalSeen && hasData && !isDone {
 			return len(b), nil
 		}
 
 		written, err := p.target.Write(b)
-		if err == nil && written == len(b) && !p.nativeTerminalSeen {
-			if _, terminal := parseNativeResponsesStreamTerminal(event); terminal {
-				p.nativeTerminalSeen = true
+		if err == nil && written == len(b) {
+			p.observeNativeEvent(event)
+			if !p.nativeTerminalSeen {
+				if _, terminal := parseNativeResponsesStreamTerminal(event); terminal {
+					p.nativeTerminalSeen = true
+				}
+			}
+			if isDone {
+				p.nativeDoneForwarded = true
+				p.nativePendingDone = nil
 			}
 		}
 		return written, err
@@ -269,11 +455,32 @@ func parseNativeResponsesSSEFrame(frame []byte) streaming.SSEEvent {
 
 func (p *responsesStreamProxy) finalize() error {
 	if p.native {
-		if p.streamErr != nil {
+		if p.requestContext != nil {
+			if err := p.requestContext.Err(); err != nil {
+				return err
+			}
+		}
+		if !p.nativeStarted {
 			return p.streamErr
 		}
-		if !p.completed {
-			return fmt.Errorf("%w: native responses sse", streaming.ErrUpstreamStreamIncomplete)
+		if p.streamErr != nil {
+			if p.completed || p.nativeTerminalSeen || !shouldEmitNativeResponsesFailure(p.streamErr) {
+				return p.streamErr
+			}
+			if err := p.emitNativeFailed(); err != nil {
+				return errors.Join(p.streamErr, err)
+			}
+			return nil
+		}
+		if p.completed {
+			return p.flushPendingNativeDone()
+		}
+		if p.nativeTerminalSeen {
+			return fmt.Errorf("%w: native responses terminal was not recorded", streaming.ErrUpstreamStreamIncomplete)
+		}
+		streamErr := fmt.Errorf("%w: native responses sse", streaming.ErrUpstreamStreamIncomplete)
+		if err := p.emitNativeFailed(); err != nil {
+			return errors.Join(streamErr, err)
 		}
 		return nil
 	}
@@ -304,6 +511,201 @@ func (p *responsesStreamProxy) finalize() error {
 	return nil
 }
 
+func shouldEmitNativeResponsesFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, streaming.ErrNativeSSEDownstream) {
+		return false
+	}
+	if errors.Is(err, streaming.ErrUpstreamStreamIncomplete) ||
+		errors.Is(err, streaming.ErrStreamRecordTooLarge) ||
+		errors.Is(err, streaming.ErrNativeSSEInvalidData) ||
+		errors.Is(err, streaming.ErrNativeSSEUpstreamRead) ||
+		errors.Is(err, streaming.ErrNativeSSETransform) ||
+		isUpstreamTTFTTimeout(err) ||
+		isUpstreamTotalTimeout(err) {
+		return true
+	}
+	return false
+}
+
+func (p *responsesStreamProxy) observeNativeEvent(event streaming.SSEEvent) {
+	if sequence, err := parseNativeResponsesEventSequence(event.Data); err == nil {
+		p.nativeLastSequence = sequence
+	}
+	envelope := decodeNativeResponsesObject(event.Data)
+	if envelope == nil {
+		return
+	}
+	if p.responseID == "" {
+		p.responseID = nativeResponsesString(envelope["response_id"])
+	}
+	response, _ := envelope["response"].(map[string]interface{})
+	if response == nil {
+		return
+	}
+	if p.nativeResponseSnapshot == nil {
+		p.nativeResponseSnapshot = make(map[string]interface{}, len(response))
+		for key, value := range response {
+			p.nativeResponseSnapshot[key] = value
+		}
+	}
+	if p.responseID == "" {
+		p.responseID = nativeResponsesString(response["id"])
+	}
+	if p.model == "" {
+		p.model = nativeResponsesString(response["model"])
+	}
+	if p.created == 0 {
+		p.created = nativeResponsesInteger(response["created_at"])
+	}
+}
+
+func (p *responsesStreamProxy) emitNativeFailed() error {
+	if p.completed || p.nativeTerminalSeen {
+		return nil
+	}
+	if p.responseID == "" {
+		p.responseID = translatedResponseID("")
+	}
+	if p.model == "" {
+		p.model = responsesFallbackModel
+	}
+	response := make(map[string]interface{}, len(p.nativeResponseSnapshot)+8)
+	for key, value := range p.nativeResponseSnapshot {
+		response[key] = value
+	}
+	response["id"] = p.responseID
+	response["object"] = "response"
+	response["created_at"] = p.created
+	response["status"] = "failed"
+	response["model"] = p.model
+	response["output"] = []interface{}{}
+	response["incomplete_details"] = nil
+	response["usage"] = nil
+	response["error"] = map[string]interface{}{
+		"code":    "server_error",
+		"message": streaming.ChatStreamErrorMessage,
+	}
+	if _, ok := response["parallel_tool_calls"]; !ok {
+		response["parallel_tool_calls"] = true
+	}
+	if _, ok := response["tool_choice"]; !ok {
+		response["tool_choice"] = "auto"
+	}
+	if _, ok := response["tools"]; !ok {
+		response["tools"] = []interface{}{}
+	}
+	completeSyntheticResponsesEnvelope(response, p.requestPayload, false)
+	if p.beforeTerminal != nil {
+		p.beforeTerminal(response)
+	}
+	if sink, ok := p.target.(nativeResponsesSyntheticFailureSink); ok {
+		sink.markNativeResponsesSyntheticFailure()
+	}
+	if err := p.writeNativeFailedEvent(response); err != nil {
+		if !errors.Is(err, streaming.ErrStreamRecordTooLarge) {
+			return err
+		}
+		// Additive provider fields can fill an otherwise valid preceding event.
+		// A transport failure must still have room for one contract terminal.
+		response = p.minimalNativeFailedResponse()
+		if p.beforeTerminal != nil {
+			p.beforeTerminal(response)
+		}
+		if fallbackErr := p.writeNativeFailedEvent(response); fallbackErr != nil {
+			return errors.Join(err, fallbackErr)
+		}
+	}
+	// Mark the terminal only after its frame and flush both succeed. Synthetic
+	// failures are not retained as upstream lifecycle state because the gateway
+	// cannot know the provider's final object state after a broken transport.
+	p.nativeTerminalSeen = true
+	p.nativeTerminalRecorded = true
+	p.completed = true
+	p.nativeResponseSnapshot = nil
+	return p.flushPendingNativeDone()
+}
+
+func (p *responsesStreamProxy) minimalNativeFailedResponse() map[string]interface{} {
+	responseID := p.responseID
+	if len(responseID) > 1024 {
+		responseID = translatedResponseID("")
+	}
+	model := p.model
+	if len(model) > 1024 {
+		model = responsesFallbackModel
+	}
+	return completeSyntheticResponsesEnvelope(map[string]interface{}{
+		"id":         responseID,
+		"object":     "response",
+		"created_at": p.created,
+		"status":     "failed",
+		"model":      model,
+		"output":     []interface{}{},
+		"error": map[string]interface{}{
+			"code":    "server_error",
+			"message": streaming.ChatStreamErrorMessage,
+		},
+		"parallel_tool_calls": true,
+		"tool_choice":         "auto",
+		"tools":               []interface{}{},
+	}, p.requestPayload, false)
+}
+
+func (p *responsesStreamProxy) writeNativeFailedEvent(response map[string]interface{}) error {
+	p.sendHeadersIfNeeded()
+	sequence := p.nativeLastSequence
+	if sequence < int64(^uint64(0)>>1) {
+		sequence++
+	}
+	eventType := "response.failed"
+	event := map[string]interface{}{
+		"type":            eventType,
+		"sequence_number": sequence,
+		"response":        response,
+	}
+	data, err := json.Marshal(event)
+	if err != nil {
+		return fmt.Errorf("encode native responses failure: %w", err)
+	}
+	if responsesGeneratedSSERecordSize(eventType, data) > streaming.MaxStreamRecordBytes {
+		return fmt.Errorf("%w: native responses failure event", streaming.ErrStreamRecordTooLarge)
+	}
+	frame := []byte(fmt.Sprintf("event: %s\ndata: %s\n\n", eventType, data))
+	written, err := p.target.Write(frame)
+	if err != nil {
+		return err
+	}
+	if written != len(frame) {
+		return io.ErrShortWrite
+	}
+	if err := p.FlushError(); err != nil {
+		return fmt.Errorf("failed to flush native responses failure: %w", err)
+	}
+	return nil
+}
+
+func (p *responsesStreamProxy) flushPendingNativeDone() error {
+	if p.nativeDoneForwarded || len(p.nativePendingDone) == 0 {
+		return nil
+	}
+	written, err := p.target.Write(p.nativePendingDone)
+	if err != nil {
+		return err
+	}
+	if written != len(p.nativePendingDone) {
+		return io.ErrShortWrite
+	}
+	if err := p.FlushError(); err != nil {
+		return fmt.Errorf("failed to flush native responses done frame: %w", err)
+	}
+	p.nativeDoneForwarded = true
+	p.nativePendingDone = nil
+	return nil
+}
+
 func parseNativeResponsesStreamTerminal(event streaming.SSEEvent) (*nativeResponsesStreamTerminal, bool) {
 	if len(bytes.TrimSpace(event.Data)) == 0 {
 		return nil, false
@@ -315,12 +717,21 @@ func parseNativeResponsesStreamTerminal(event streaming.SSEEvent) (*nativeRespon
 	if err := json.Unmarshal(event.Data, &envelope); err != nil {
 		return nil, false
 	}
-	eventType := strings.ToLower(strings.TrimSpace(envelope.Type))
+	normalizedDataEventType := normalizeNativeResponsesEventType(envelope.Type)
+	normalizedHeaderEventType := normalizeNativeResponsesEventType(event.Event)
+	dataEventType := canonicalNativeResponsesTerminalType(normalizedDataEventType)
+	headerEventType := canonicalNativeResponsesTerminalType(normalizedHeaderEventType)
+	if (dataEventType != "" || headerEventType != "") &&
+		normalizedDataEventType != "" && normalizedHeaderEventType != "" &&
+		normalizedDataEventType != normalizedHeaderEventType {
+		return nil, false
+	}
+	eventType := dataEventType
 	if eventType == "" {
-		eventType = strings.ToLower(strings.TrimSpace(event.Event))
+		eventType = headerEventType
 	}
 	switch eventType {
-	case "response.completed", "response.incomplete", "response.failed", "response.cancelled", "response.canceled":
+	case "response.completed", "response.incomplete", "response.failed", "response.cancelled":
 	default:
 		return nil, false
 	}
@@ -331,31 +742,26 @@ func parseNativeResponsesStreamTerminal(event streaming.SSEEvent) (*nativeRespon
 	if err := decoder.Decode(&response); err != nil || response == nil {
 		return nil, false
 	}
-	status, _ := response["status"].(string)
-	status = strings.ToLower(strings.TrimSpace(status))
+	rawStatusValue, statusPresent := response["status"]
+	rawStatus, statusString := rawStatusValue.(string)
+	if statusPresent && !statusString {
+		return nil, false
+	}
+	status := canonicalNativeResponsesTerminalStatus(rawStatus)
 	eventStatus := strings.TrimPrefix(eventType, "response.")
-	if eventStatus == "canceled" {
-		eventStatus = "cancelled"
-	}
-	if status == "" {
+	if strings.TrimSpace(rawStatus) == "" {
 		status = eventStatus
-	} else if eventStatus != "completed" && status == "completed" {
-		// The terminal event type is authoritative. A failed/incomplete/cancelled
-		// event must never be promoted to a completed local response by a
-		// contradictory payload field.
-		status = eventStatus
+	} else if status == "" || status != eventStatus {
+		return nil, false
 	}
-	switch status {
-	case "completed", "incomplete", "failed", "cancelled":
-	case "canceled":
-		status = "cancelled"
-	default:
-		status = "unknown"
+	responseID := nativeResponsesString(response["id"])
+	if responseID == "" {
+		return nil, false
 	}
 	terminal := &nativeResponsesStreamTerminal{
 		eventType:         eventType,
 		status:            status,
-		responseID:        nativeResponsesString(response["id"]),
+		responseID:        responseID,
 		model:             nativeResponsesString(response["model"]),
 		createdAt:         nativeResponsesInteger(response["created_at"]),
 		response:          response,
@@ -381,6 +787,50 @@ func parseNativeResponsesStreamTerminal(event streaming.SSEEvent) (*nativeRespon
 	return terminal, true
 }
 
+func nativeResponsesTerminalHint(event streaming.SSEEvent) bool {
+	if canonicalNativeResponsesTerminalType(event.Event) != "" {
+		return true
+	}
+	var envelope struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(event.Data, &envelope); err != nil {
+		return false
+	}
+	return canonicalNativeResponsesTerminalType(envelope.Type) != ""
+}
+
+func canonicalNativeResponsesTerminalType(value string) string {
+	value = normalizeNativeResponsesEventType(value)
+	switch value {
+	case "response.completed", "response.incomplete", "response.failed", "response.cancelled":
+		return value
+	default:
+		return ""
+	}
+}
+
+func normalizeNativeResponsesEventType(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "response.canceled" {
+		return "response.cancelled"
+	}
+	return value
+}
+
+func canonicalNativeResponsesTerminalStatus(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "canceled" {
+		return "cancelled"
+	}
+	switch value {
+	case "completed", "incomplete", "failed", "cancelled":
+		return value
+	default:
+		return ""
+	}
+}
+
 func nativeResponsesTokenUsage(usage map[string]interface{}) models.TokenUsage {
 	result := models.TokenUsage{
 		InputTokens:  nativeResponsesTokenCount(usage["input_tokens"]),
@@ -389,6 +839,9 @@ func nativeResponsesTokenUsage(usage map[string]interface{}) models.TokenUsage {
 	if details, ok := usage["input_tokens_details"].(map[string]interface{}); ok {
 		result.CachedInputTokens = nativeResponsesTokenCount(details["cached_tokens"])
 		result.CacheWriteInputTokens = nativeResponsesTokenCount(details["cache_write_tokens"])
+	}
+	if details, ok := usage["output_tokens_details"].(map[string]interface{}); ok {
+		result.ReasoningOutputTokens = nativeResponsesTokenCount(details["reasoning_tokens"])
 	}
 	return result.Normalized()
 }
@@ -444,7 +897,7 @@ func (p *responsesStreamProxy) emitFailed(_ error) error {
 		return err
 	}
 
-	response := map[string]interface{}{
+	response := completeSyntheticResponsesEnvelope(map[string]interface{}{
 		"id":         p.responseID,
 		"object":     "response",
 		"created_at": p.created,
@@ -455,7 +908,7 @@ func (p *responsesStreamProxy) emitFailed(_ error) error {
 			"code":    streaming.ChatStreamErrorCode,
 			"message": streaming.ChatStreamErrorMessage,
 		},
-	}
+	}, p.requestPayload, true)
 	if p.beforeTerminal != nil {
 		p.beforeTerminal(response)
 	}
@@ -471,11 +924,14 @@ func (p *responsesStreamProxy) emitFailed(_ error) error {
 }
 
 func (p *responsesStreamProxy) processToolCallDelta(tc models.ToolCall) error {
+	if tc.ID != "" && tc.ID != strings.TrimSpace(tc.ID) {
+		return errResponsesStreamInvalidToolID
+	}
 	key := ""
 	if tc.Index != nil {
 		key = fmt.Sprintf("idx_%d", *tc.Index)
-	} else if strings.TrimSpace(tc.ID) != "" {
-		key = strings.TrimSpace(tc.ID)
+	} else if tc.ID != "" {
+		key = responsesCanonicalFunctionCallID(tc.ID)
 	} else if strings.TrimSpace(tc.Function.Name) != "" {
 		key = strings.TrimSpace(tc.Function.Name)
 	}
@@ -488,7 +944,7 @@ func (p *responsesStreamProxy) processToolCallDelta(tc models.ToolCall) error {
 		if len(p.toolCalls) >= responsesStreamMaxToolCalls {
 			return errResponsesStreamTooManyTools
 		}
-		rawID := strings.TrimSpace(tc.ID)
+		rawID := tc.ID
 		itemID := responsesCanonicalFunctionItemID(rawID)
 		callID := responsesCanonicalFunctionCallID(rawID)
 		if itemID == "" {
@@ -528,7 +984,7 @@ func (p *responsesStreamProxy) processToolCallDelta(tc models.ToolCall) error {
 			return err
 		}
 	}
-	if id := strings.TrimSpace(tc.ID); id != "" {
+	if id := tc.ID; id != "" {
 		if !st.Added {
 			if canonicalItemID := responsesCanonicalFunctionItemID(id); canonicalItemID != "" {
 				if err := p.replaceStateString(&st.ItemID, canonicalItemID); err != nil {
@@ -714,6 +1170,7 @@ func (p *responsesStreamProxy) processFrame(frame string) error {
 				"output_index":  0,
 				"content_index": p.textContentIndex,
 				"delta":         emittedDelta,
+				"logprobs":      []interface{}{},
 			}
 			if err := p.writeEvent(event); err != nil {
 				return err
@@ -765,6 +1222,7 @@ func (p *responsesStreamProxy) mergeUsage(update *models.Usage) {
 	p.usage.PromptTokens = current.InputTokens
 	p.usage.CompletionTokens = current.OutputTokens
 	p.usage.PromptTokensDetails = inputTokenDetailsFromTokenUsage(current)
+	p.usage.CompletionTokensDetails = completionTokenDetailsFromTokenUsage(current)
 	if update.TotalTokens > p.usage.TotalTokens {
 		p.usage.TotalTokens = update.TotalTokens
 	}
@@ -860,16 +1318,23 @@ func (p *responsesStreamProxy) ensureStarted() error {
 		p.model = responsesFallbackModel
 	}
 
+	response := completeSyntheticResponsesEnvelope(map[string]interface{}{
+		"id":         p.responseID,
+		"object":     "response",
+		"created_at": p.created,
+		"status":     "in_progress",
+		"model":      p.model,
+		"output":     []interface{}{},
+	}, p.requestPayload, true)
 	if err := p.writeEvent(map[string]interface{}{
-		"type": "response.created",
-		"response": map[string]interface{}{
-			"id":         p.responseID,
-			"object":     "response",
-			"created_at": p.created,
-			"status":     "in_progress",
-			"model":      p.model,
-			"output":     []interface{}{},
-		},
+		"type":     "response.created",
+		"response": response,
+	}); err != nil {
+		return err
+	}
+	if err := p.writeEvent(map[string]interface{}{
+		"type":     "response.in_progress",
+		"response": response,
 	}); err != nil {
 		return err
 	}
@@ -960,8 +1425,9 @@ func (p *responsesStreamProxy) ensureTextStarted() error {
 		"output_index":  0,
 		"content_index": p.textContentIndex,
 		"part": map[string]interface{}{
-			"type": "output_text",
-			"text": "",
+			"type":        "output_text",
+			"text":        "",
+			"annotations": []interface{}{},
 		},
 	})
 }
@@ -1027,6 +1493,7 @@ func (p *responsesStreamProxy) emitFinal(status, eventType, incompleteReason str
 			"output_index":  0,
 			"content_index": p.textContentIndex,
 			"text":          text,
+			"logprobs":      []interface{}{},
 		}); err != nil {
 			return err
 		}
@@ -1038,15 +1505,17 @@ func (p *responsesStreamProxy) emitFinal(status, eventType, incompleteReason str
 			"output_index":  0,
 			"content_index": p.textContentIndex,
 			"part": map[string]interface{}{
-				"type": "output_text",
-				"text": text,
+				"type":        "output_text",
+				"text":        text,
+				"annotations": []interface{}{},
 			},
 		}); err != nil {
 			return err
 		}
 		messageContent[p.textContentIndex] = map[string]interface{}{
-			"type": "output_text",
-			"text": text,
+			"type":        "output_text",
+			"text":        text,
+			"annotations": []interface{}{},
 		}
 	}
 
@@ -1229,32 +1698,15 @@ func (p *responsesStreamProxy) emitFinal(status, eventType, incompleteReason str
 	}
 
 	resp := map[string]interface{}{
-		"id":          p.responseID,
-		"object":      "response",
-		"created_at":  p.created,
-		"status":      status,
-		"model":       p.model,
-		"output_text": text,
-		"output":      outputItems,
+		"id":         p.responseID,
+		"object":     "response",
+		"created_at": p.created,
+		"status":     status,
+		"model":      p.model,
+		"output":     outputItems,
 	}
 	if p.usage != nil {
-		resp["usage"] = models.ResponsesUsage{
-			InputTokens:        p.usage.PromptTokens,
-			OutputTokens:       p.usage.CompletionTokens,
-			TotalTokens:        p.usage.TotalTokens,
-			InputTokensDetails: models.CloneInputTokensDetails(p.usage.PromptTokensDetails),
-		}
-	}
-	if p.reasoningStarted {
-		resp["reasoning"] = map[string]interface{}{
-			"effort": nil,
-			"summary": []map[string]interface{}{
-				{
-					"type": "summary_text",
-					"text": reasoning,
-				},
-			},
-		}
+		resp["usage"] = models.ResponsesUsageFromChat(p.usage)
 	}
 	if incompleteReason != "" {
 		resp["incomplete_details"] = map[string]interface{}{
@@ -1265,6 +1717,7 @@ func (p *responsesStreamProxy) emitFinal(status, eventType, incompleteReason str
 	if p.model == "" {
 		resp["model"] = responsesFallbackModel
 	}
+	completeSyntheticResponsesEnvelope(resp, p.requestPayload, true)
 	if p.beforeTerminal != nil {
 		p.beforeTerminal(resp)
 	}
@@ -1293,7 +1746,6 @@ func (p *responsesStreamProxy) writeEvent(event map[string]interface{}) error {
 	}
 	p.eventSeq++
 	event["sequence_number"] = p.eventSeq
-	event["event_id"] = fmt.Sprintf("%s%d", responsesEventIDPrefix, p.eventSeq)
 	b, err := json.Marshal(event)
 	if err != nil {
 		return err
@@ -1337,7 +1789,7 @@ func (p *responsesStreamProxy) sendHeadersIfNeeded() {
 }
 
 func responsesCanonicalFunctionItemID(raw string) string {
-	id := strings.TrimSpace(raw)
+	id := raw
 	if id == "" {
 		return ""
 	}
@@ -1354,7 +1806,7 @@ func responsesCanonicalFunctionItemID(raw string) string {
 }
 
 func responsesCanonicalFunctionCallID(raw string) string {
-	id := strings.TrimSpace(raw)
+	id := raw
 	if id == "" {
 		return ""
 	}
@@ -1367,5 +1819,5 @@ func responsesCanonicalFunctionCallID(raw string) string {
 	if strings.HasPrefix(id, "fc") {
 		return "call_" + strings.TrimPrefix(id, "fc")
 	}
-	return "call_" + id
+	return id
 }

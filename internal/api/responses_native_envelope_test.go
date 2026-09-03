@@ -119,6 +119,90 @@ func TestResponsesNativeNonStreamPreservesRawSuccessfulEnvelope(t *testing.T) {
 	}
 }
 
+func TestResponsesNativeNonStreamRejectsInvalidResponseID(t *testing.T) {
+	testCases := []struct {
+		name string
+		body string
+	}{
+		{name: "missing", body: `{"object":"response","status":"completed","future_secret":"must-not-leak"}`},
+		{name: "non string", body: `{"id":7,"object":"response","status":"completed","future_secret":"must-not-leak"}`},
+		{name: "blank", body: `{"id":"   ","object":"response","status":"completed","future_secret":"must-not-leak"}`},
+		{name: "padded", body: `{"id":" resp_padded ","object":"response","status":"completed","future_secret":"must-not-leak"}`},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(testCase.body))
+			}))
+			defer upstream.Close()
+
+			handler, cache := newNativeContinuationTestHandler(t, upstream.URL+"/v1", requestTypeResponses)
+			defer cache.Stop()
+			recorder := httptest.NewRecorder()
+			handler.Responses(recorder, httptest.NewRequest(
+				http.MethodPost,
+				"/v1/responses",
+				strings.NewReader(`{"model":"gpt-5.4","input":"hello","store":true}`),
+			))
+
+			if recorder.Code != http.StatusBadGateway {
+				t.Fatalf("status = %d, want 502; body=%s", recorder.Code, recorder.Body.String())
+			}
+			if contentType := recorder.Header().Get("Content-Type"); !strings.HasPrefix(contentType, "application/json") {
+				t.Fatalf("Content-Type = %q, want application/json", contentType)
+			}
+			if strings.Contains(recorder.Body.String(), "future_secret") || !json.Valid(recorder.Body.Bytes()) {
+				t.Fatalf("invalid native response leaked downstream: %q", recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestResponsesNativeNonStreamRejectsInvalidObjectKind(t *testing.T) {
+	testCases := []struct {
+		name string
+		body string
+	}{
+		{name: "missing", body: `{"id":"resp_missing_object","status":"completed","future_secret":"must-not-leak"}`},
+		{name: "non string", body: `{"id":"resp_numeric_object","object":7,"status":"completed","future_secret":"must-not-leak"}`},
+		{name: "blank", body: `{"id":"resp_blank_object","object":"","status":"completed","future_secret":"must-not-leak"}`},
+		{name: "padded", body: `{"id":"resp_padded_object","object":" response ","status":"completed","future_secret":"must-not-leak"}`},
+		{name: "wrong case", body: `{"id":"resp_case_object","object":"Response","status":"completed","future_secret":"must-not-leak"}`},
+		{name: "wrong kind", body: `{"id":"resp_wrong_object","object":"chat.completion","status":"completed","future_secret":"must-not-leak"}`},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(testCase.body))
+			}))
+			defer upstream.Close()
+
+			handler, cache := newNativeContinuationTestHandler(t, upstream.URL+"/v1", requestTypeResponses)
+			defer cache.Stop()
+			recorder := httptest.NewRecorder()
+			handler.Responses(recorder, httptest.NewRequest(
+				http.MethodPost,
+				"/v1/responses",
+				strings.NewReader(`{"model":"gpt-5.4","input":"hello","store":true}`),
+			))
+
+			if recorder.Code != http.StatusBadGateway {
+				t.Fatalf("status = %d, want 502; body=%s", recorder.Code, recorder.Body.String())
+			}
+			if contentType := recorder.Header().Get("Content-Type"); !strings.HasPrefix(contentType, "application/json") {
+				t.Fatalf("Content-Type = %q, want application/json", contentType)
+			}
+			if strings.Contains(recorder.Body.String(), "future_secret") || !json.Valid(recorder.Body.Bytes()) {
+				t.Fatalf("invalid native response leaked downstream: %q", recorder.Body.String())
+			}
+		})
+	}
+}
+
 func TestChatCompletionsToResponsesStillReturnsChatEnvelope(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

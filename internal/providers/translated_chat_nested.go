@@ -130,7 +130,7 @@ func translatedChatAnnotatedJSONSchema(
 		)
 	}
 	var schema map[string]interface{}
-	if err := json.Unmarshal(encoded, &schema); err != nil || schema == nil {
+	if err := decodeJSONPreserveNumbers(encoded, &schema); err != nil || schema == nil {
 		return nil, translatedChatNestedCompatibilityError(
 			providerID,
 			"response_format.json_schema.schema",

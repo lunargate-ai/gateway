@@ -44,6 +44,11 @@ providers:
   openai-second-account:
     type: "openai"
     api_key: "${OPENAI_API_KEY2}"
+    # Response-side compatibility shim only; outgoing requests are never
+    # rewritten. Defaults to false, including with compatibility_profile:
+    # deepseek. Enable only when complete literal <think>...</think> regions
+    # are part of the upstream response contract.
+    extract_reasoning_tags: false
 
   anthropic:
     api_key: "${ANTHROPIC_API_KEY}"
@@ -65,6 +70,15 @@ routing:
   default_strategy: "weighted"
 
   routes:
+    - name: "openai-native-responses"
+      match:
+        path: "/v1/responses"
+      targets:
+        - provider: openai
+          model: gpt-5.6-terra
+          upstream_request_type: responses
+          weight: 100
+
     - name: "complexity-tier-0-1"
       match:
         path: "/v1/chat/completions"
@@ -121,6 +135,7 @@ routing:
       fallback:
         - provider: anthropic
           model: claude-sonnet-4-6
+          weight: 100
 
 model_selection:
   enabled: true
@@ -160,6 +175,8 @@ caching:
   enabled: true
   ttl: 1h
   max_size: 1000
+  max_entry_bytes: 16777216 # 16 MiB
+  max_bytes: 67108864 # 64 MiB total
 
 # Retry Configuration
 retry:
@@ -186,14 +203,15 @@ security:
   #     - name: "dashboard"
   #       value: "${LUNARGATE_CLIENT_API_KEY}"
 
-# Data Sharing - Controls what data the gateway sends to the LunarGate Dashboard on app.lunargate.ai.
-# By default, ONLY metrics are sent (zero data leakage mode).
-# Enable to forward prompts/responses for log inspection in the dashboard.
-# WARNING: Enabling this means prompt/response content leaves your infrastructure.
+# Dashboard connectivity for collector export and optional remote control.
+# With `enabled: true` and both share flags false, the collector sends only its
+# fixed metadata/metrics allowlist. The remote-control sandbox is separate: when
+# enabled, each sandbox request and its bounded full response use the control
+# channel regardless of the two collector share flags.
 # Create the gateway API key in the "Gateways" section of https://app.lunargate.ai
 # and set it under `general.api_key`.
 data_sharing:
-  enabled: false              # Master switch - must be true for any sharing
+  enabled: false              # Master switch for collector and remote control
   share_prompts: false        # Forward user prompts to SaaS backend
   share_responses: false      # Forward LLM responses to SaaS backend
-  remote_control: false
+  remote_control: false       # Sandbox control channel; may carry request/response content

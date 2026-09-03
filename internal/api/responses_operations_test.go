@@ -91,6 +91,68 @@ func TestResponsesCompactSelectsCanonicalProviderWithoutFallback(t *testing.T) {
 	}
 }
 
+func TestResponsesCompactRejectsInvalidSuccessfulEnvelope(t *testing.T) {
+	testCases := []struct {
+		name        string
+		contentType string
+		body        string
+	}{
+		{name: "missing id", contentType: "application/json", body: `{"object":"response.compaction","future_secret":"must-not-leak"}`},
+		{name: "padded id", contentType: "application/json", body: `{"id":" resp_compacted ","object":"response.compaction","future_secret":"must-not-leak"}`},
+		{name: "wrong object", contentType: "application/json", body: `{"id":"resp_compacted","object":"response","future_secret":"must-not-leak"}`},
+		{name: "multiple values", contentType: "application/json", body: `{"id":"resp_compacted","object":"response.compaction"} {"future_secret":"must-not-leak"}`},
+		{name: "event stream", contentType: "text/event-stream", body: "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_compacted\",\"status\":\"completed\",\"future_secret\":\"must-not-leak\"}}\n\n"},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", testCase.contentType)
+				_, _ = io.WriteString(w, testCase.body)
+			}))
+			defer upstream.Close()
+
+			router, _, cache := newNativeLifecycleRouter(t, upstream.URL+"/v1", map[string]config.ProviderCapabilities{
+				"native": {ResponseCompaction: true},
+			})
+			defer cache.Stop()
+			response := performLifecycleRequest(t, router, http.MethodPost, "/v1/responses/compact", []byte(`{"model":"gpt-native","input":"hello"}`))
+
+			if response.Code != http.StatusBadGateway {
+				t.Fatalf("status = %d, want 502; body=%s", response.Code, response.Body.String())
+			}
+			if contentType := response.Header().Get("Content-Type"); !strings.HasPrefix(contentType, "application/json") {
+				t.Fatalf("Content-Type = %q, want application/json", contentType)
+			}
+			if strings.Contains(response.Body.String(), "future_secret") || !json.Valid(response.Body.Bytes()) {
+				t.Fatalf("invalid compaction response leaked downstream: %q", response.Body.String())
+			}
+		})
+	}
+}
+
+func TestResponsesCompactBoundsSuccessfulEnvelope(t *testing.T) {
+	oversized := `{"id":"resp_compacted","object":"response.compaction","padding":"` + strings.Repeat("x", maxNativeLifecycleResponseBytes) + `"}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, oversized)
+	}))
+	defer upstream.Close()
+
+	router, _, cache := newNativeLifecycleRouter(t, upstream.URL+"/v1", map[string]config.ProviderCapabilities{
+		"native": {ResponseCompaction: true},
+	})
+	defer cache.Stop()
+	response := performLifecycleRequest(t, router, http.MethodPost, "/v1/responses/compact", []byte(`{"model":"gpt-native","input":"hello"}`))
+
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body=%s", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "padding") || !json.Valid(response.Body.Bytes()) {
+		t.Fatalf("oversized compaction response leaked downstream: %q", response.Body.String())
+	}
+}
+
 func TestResponsesInputTokensUsesOnlyCapableProviderAndPreservesError(t *testing.T) {
 	var calls atomic.Int32
 	var upstreamBody string

@@ -2,6 +2,7 @@ package api
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -440,12 +441,124 @@ func TestStoredChatCompletionDeleteFailureRetainsBindingAndDoesNotRedirect(t *te
 	}
 }
 
+func TestStoredChatCompletionLifecycleRejectsInvalidEntityEnvelope(t *testing.T) {
+	const completionID = "chatcmpl_expected"
+	endpoints := []struct {
+		name   string
+		method string
+		body   string
+	}{
+		{name: "retrieve", method: http.MethodGet},
+		{name: "update", method: http.MethodPost, body: `{}`},
+		{name: "delete", method: http.MethodDelete},
+	}
+	commonInvalid := []struct {
+		name string
+		body string
+	}{
+		{name: "missing id", body: `{"object":"chat.completion","future_secret":true}`},
+		{name: "non-string id", body: `{"id":7,"object":"chat.completion","future_secret":true}`},
+		{name: "padded id", body: `{"id":" chatcmpl_expected","object":"chat.completion","future_secret":true}`},
+		{name: "mismatched id", body: `{"id":"chatcmpl_other","object":"chat.completion","future_secret":true}`},
+		{name: "missing object", body: `{"id":"chatcmpl_expected","future_secret":true}`},
+		{name: "wrong object", body: `{"id":"chatcmpl_expected","object":"response","future_secret":true}`},
+		{name: "multiple values", body: `{"id":"chatcmpl_expected","object":"chat.completion"}{"future_secret":true}`},
+	}
+
+	for _, endpoint := range endpoints {
+		cases := append([]struct {
+			name string
+			body string
+		}(nil), commonInvalid...)
+		if endpoint.method == http.MethodDelete {
+			cases = []struct {
+				name string
+				body string
+			}{
+				{name: "wrong object", body: `{"id":"chatcmpl_expected","object":"chat.completion","deleted":true,"future_secret":true}`},
+				{name: "missing deleted", body: `{"id":"chatcmpl_expected","object":"chat.completion.deleted","future_secret":true}`},
+				{name: "deleted false", body: `{"id":"chatcmpl_expected","object":"chat.completion.deleted","deleted":false,"future_secret":true}`},
+				{name: "non-boolean deleted", body: `{"id":"chatcmpl_expected","object":"chat.completion.deleted","deleted":"true","future_secret":true}`},
+				{name: "mismatched id", body: `{"id":"chatcmpl_other","object":"chat.completion.deleted","deleted":true,"future_secret":true}`},
+			}
+		}
+
+		for _, testCase := range cases {
+			t.Run(endpoint.name+"/"+testCase.name, func(t *testing.T) {
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusAccepted)
+					_, _ = io.WriteString(w, testCase.body)
+				}))
+				defer upstream.Close()
+
+				router, handler, cache := newStoredChatLifecycleRouterFromConfigs(t, map[string]config.ProviderConfig{
+					"native": storedChatProviderConfig(upstream.URL+"/v1", true),
+				})
+				defer cache.Stop()
+				if !handler.chatCompletionBindings.put(completionID, mustChatCompletionBinding(t, handler, "native")) {
+					t.Fatal("failed to seed owner binding")
+				}
+
+				response := performStoredChatLifecycleRequest(
+					t,
+					router,
+					endpoint.method,
+					"/v1/chat/completions/"+completionID,
+					endpoint.body,
+					nil,
+				)
+				if response.Code != http.StatusBadGateway {
+					t.Fatalf("status = %d, want 502; body=%s", response.Code, response.Body.String())
+				}
+				if contentType := response.Header().Get("Content-Type"); !strings.HasPrefix(contentType, "application/json") {
+					t.Fatalf("Content-Type = %q, want application/json", contentType)
+				}
+				if strings.Contains(response.Body.String(), "future_secret") || !json.Valid(response.Body.Bytes()) {
+					t.Fatalf("invalid lifecycle response leaked downstream: %q", response.Body.String())
+				}
+				if _, ok := handler.chatCompletionBindings.get(completionID); !ok {
+					t.Fatal("invalid lifecycle response removed the owner binding")
+				}
+			})
+		}
+	}
+}
+
+func TestStoredChatCompletionLifecycleBoundsEntityResponseBody(t *testing.T) {
+	const completionID = "chatcmpl_expected"
+	oversized := `{"id":"chatcmpl_expected","object":"chat.completion","padding":"` +
+		strings.Repeat("x", maxNativeLifecycleResponseBytes) + `"}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, oversized)
+	}))
+	defer upstream.Close()
+
+	router, handler, cache := newStoredChatLifecycleRouterFromConfigs(t, map[string]config.ProviderConfig{
+		"native": storedChatProviderConfig(upstream.URL+"/v1", true),
+	})
+	defer cache.Stop()
+	if !handler.chatCompletionBindings.put(completionID, mustChatCompletionBinding(t, handler, "native")) {
+		t.Fatal("failed to seed owner binding")
+	}
+
+	response := performStoredChatLifecycleRequest(t, router, http.MethodGet, "/v1/chat/completions/"+completionID, "", nil)
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body=%s", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "padding") || !json.Valid(response.Body.Bytes()) {
+		t.Fatalf("oversized lifecycle response leaked downstream: %q", response.Body.String())
+	}
+}
+
 func TestStoredChatCompletionNonStreamCreateBindingPolicy(t *testing.T) {
 	tests := []struct {
 		name         string
 		storeField   string
 		capability   bool
 		status       int
+		wantStatus   int
 		responseBody string
 		completionID string
 		wantBinding  bool
@@ -466,6 +579,65 @@ func TestStoredChatCompletionNonStreamCreateBindingPolicy(t *testing.T) {
 			status:       http.StatusOK,
 			responseBody: `{"id":"chatcmpl_stateless","object":"chat.completion","created":1,"model":"gpt-native","choices":[]}`,
 			completionID: "chatcmpl_stateless",
+		},
+		{
+			name:         "missing upstream ID",
+			storeField:   `,"store":true`,
+			capability:   true,
+			status:       http.StatusOK,
+			wantStatus:   http.StatusBadGateway,
+			responseBody: `{"object":"chat.completion","created":1,"model":"gpt-native","choices":[]}`,
+		},
+		{
+			name:         "padded upstream ID",
+			storeField:   `,"store":true`,
+			capability:   true,
+			status:       http.StatusOK,
+			wantStatus:   http.StatusBadGateway,
+			responseBody: `{"id":" chatcmpl_padded ","object":"chat.completion","created":1,"model":"gpt-native","choices":[]}`,
+			completionID: "chatcmpl_padded",
+		},
+		{
+			name:         "non-string upstream ID",
+			storeField:   `,"store":true`,
+			capability:   true,
+			status:       http.StatusOK,
+			wantStatus:   http.StatusBadGateway,
+			responseBody: `{"id":7,"object":"chat.completion","created":1,"model":"gpt-native","choices":[]}`,
+		},
+		{
+			name:         "missing upstream object",
+			storeField:   `,"store":true`,
+			capability:   true,
+			status:       http.StatusOK,
+			wantStatus:   http.StatusBadGateway,
+			responseBody: `{"id":"chatcmpl_missing_object","created":1,"model":"gpt-native","choices":[]}`,
+			completionID: "chatcmpl_missing_object",
+		},
+		{
+			name:         "padded upstream object",
+			storeField:   `,"store":true`,
+			capability:   true,
+			status:       http.StatusOK,
+			wantStatus:   http.StatusBadGateway,
+			responseBody: `{"id":"chatcmpl_padded_object","object":" chat.completion ","created":1,"model":"gpt-native","choices":[]}`,
+			completionID: "chatcmpl_padded_object",
+		},
+		{
+			name:         "wrong upstream object",
+			storeField:   `,"store":true`,
+			capability:   true,
+			status:       http.StatusOK,
+			wantStatus:   http.StatusBadGateway,
+			responseBody: `{"id":"chatcmpl_wrong_object","object":"response","created":1,"model":"gpt-native","choices":[]}`,
+			completionID: "chatcmpl_wrong_object",
+		},
+		{
+			name:         "store false keeps compatibility normalization",
+			storeField:   `,"store":false`,
+			capability:   true,
+			status:       http.StatusOK,
+			responseBody: `{"created":1,"model":"gpt-native","choices":[]}`,
 		},
 		{
 			name:         "store omitted",
@@ -508,8 +680,12 @@ func TestStoredChatCompletionNonStreamCreateBindingPolicy(t *testing.T) {
 			defer cache.Stop()
 			requestBody := `{"model":"native/gpt-native","messages":[{"role":"user","content":"hello"}]` + test.storeField + `}`
 			response := performStoredChatLifecycleRequest(t, router, http.MethodPost, "/v1/chat/completions", requestBody, nil)
-			if response.Code != test.status {
-				t.Fatalf("create status = %d, want %d; body=%s", response.Code, test.status, response.Body.String())
+			wantStatus := test.wantStatus
+			if wantStatus == 0 {
+				wantStatus = test.status
+			}
+			if response.Code != wantStatus {
+				t.Fatalf("create status = %d, want %d; body=%s", response.Code, wantStatus, response.Body.String())
 			}
 			if calls.Load() != 1 {
 				t.Fatalf("upstream calls = %d, want one", calls.Load())
@@ -537,6 +713,7 @@ func TestStoredChatCompletionStreamBindingRequiresSuccessfulTerminal(t *testing.
 		store       bool
 		capability  bool
 		completion  string
+		wantStatus  int
 		wantBinding bool
 	}{
 		{
@@ -575,6 +752,55 @@ func TestStoredChatCompletionStreamBindingRequiresSuccessfulTerminal(t *testing.
 			store:      true,
 			completion: "chatcmpl_stream_disabled",
 		},
+		{
+			name:       "padded upstream ID",
+			stream:     stableStream(" chatcmpl_stream_padded ") + "data: [DONE]\n\n",
+			store:      true,
+			capability: true,
+			completion: "chatcmpl_stream_padded",
+			wantStatus: http.StatusBadGateway,
+		},
+		{
+			name: "missing upstream ID",
+			stream: "data: {\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-native\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n" +
+				"data: [DONE]\n\n",
+			store:      true,
+			capability: true,
+			wantStatus: http.StatusBadGateway,
+		},
+		{
+			name: "missing upstream object",
+			stream: "data: {\"id\":\"chatcmpl_stream_missing_object\",\"created\":1,\"model\":\"gpt-native\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n" +
+				"data: [DONE]\n\n",
+			store:      true,
+			capability: true,
+			completion: "chatcmpl_stream_missing_object",
+			wantStatus: http.StatusBadGateway,
+		},
+		{
+			name: "padded upstream object",
+			stream: "data: {\"id\":\"chatcmpl_stream_padded_object\",\"object\":\" chat.completion.chunk \",\"created\":1,\"model\":\"gpt-native\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n" +
+				"data: [DONE]\n\n",
+			store:      true,
+			capability: true,
+			completion: "chatcmpl_stream_padded_object",
+			wantStatus: http.StatusBadGateway,
+		},
+		{
+			name: "wrong upstream object",
+			stream: "data: {\"id\":\"chatcmpl_stream_wrong_object\",\"object\":\"response\",\"created\":1,\"model\":\"gpt-native\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n" +
+				"data: [DONE]\n\n",
+			store:      true,
+			capability: true,
+			completion: "chatcmpl_stream_wrong_object",
+			wantStatus: http.StatusBadGateway,
+		},
+		{
+			name: "store false keeps compatibility normalization",
+			stream: "data: {\"created\":1,\"model\":\"gpt-native\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n" +
+				"data: [DONE]\n\n",
+			capability: true,
+		},
 	}
 
 	for _, test := range tests {
@@ -594,12 +820,85 @@ func TestStoredChatCompletionStreamBindingRequiresSuccessfulTerminal(t *testing.
 				test.store,
 			)
 			response := performStoredChatLifecycleRequest(t, router, http.MethodPost, "/v1/chat/completions", requestBody, nil)
-			if response.Code != http.StatusOK {
-				t.Fatalf("stream status = %d; body=%s", response.Code, response.Body.String())
+			wantStatus := test.wantStatus
+			if wantStatus == 0 {
+				wantStatus = http.StatusOK
+			}
+			if response.Code != wantStatus {
+				t.Fatalf("stream status = %d, want %d; body=%s", response.Code, wantStatus, response.Body.String())
 			}
 			_, bound := handler.chatCompletionBindings.get(test.completion)
 			if bound != test.wantBinding {
 				t.Fatalf("binding retained = %v, want %v; stream=%s", bound, test.wantBinding, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestStoredChatCompletionOwnerCollisionFailsClosed(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(map[bool]string{false: "non-stream", true: "stream"}[stream], func(t *testing.T) {
+			const completionID = "chatcmpl_shared"
+			var alphaCalls atomic.Int32
+			var betaCalls atomic.Int32
+			newUpstream := func(calls *atomic.Int32) *httptest.Server {
+				return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					calls.Add(1)
+					if r.Method != http.MethodPost || r.URL.Path != "/v1/chat/completions" {
+						t.Errorf("unexpected lifecycle request %s %s", r.Method, r.URL.Path)
+						w.WriteHeader(http.StatusInternalServerError)
+						return
+					}
+					if stream {
+						w.Header().Set("Content-Type", "text/event-stream")
+						_, _ = fmt.Fprintf(w,
+							"data: {\"id\":%q,\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-native\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n"+
+								"data: {\"id\":%q,\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-native\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"+
+								"data: [DONE]\n\n",
+							completionID,
+							completionID,
+						)
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = fmt.Fprintf(w, `{"id":%q,"object":"chat.completion","created":1,"model":"gpt-native","choices":[]}`, completionID)
+				}))
+			}
+
+			alpha := newUpstream(&alphaCalls)
+			defer alpha.Close()
+			beta := newUpstream(&betaCalls)
+			defer beta.Close()
+			router, handler, cache := newStoredChatLifecycleRouterFromConfigs(t, map[string]config.ProviderConfig{
+				"alpha": storedChatProviderConfig(alpha.URL+"/v1", true),
+				"beta":  storedChatProviderConfig(beta.URL+"/v1", true),
+			})
+			defer cache.Stop()
+
+			streamField := ""
+			if stream {
+				streamField = `,"stream":true`
+			}
+			body := `{"model":"gpt-native","messages":[{"role":"user","content":"hello"}],"store":true` + streamField + `}`
+			for _, provider := range []string{"alpha", "beta"} {
+				created := performStoredChatLifecycleRequest(t, router, http.MethodPost, "/v1/chat/completions", body, map[string]string{
+					"X-LunarGate-Provider": provider,
+				})
+				if created.Code != http.StatusOK {
+					t.Fatalf("provider %s create status = %d; body=%s", provider, created.Code, created.Body.String())
+				}
+			}
+			if _, lookup := handler.chatCompletionBindings.lookup(completionID); lookup != ownerLookupConflict {
+				t.Fatalf("owner lookup = %v, want conflict", lookup)
+			}
+
+			implicit := performStoredChatLifecycleRequest(t, router, http.MethodGet, "/v1/chat/completions/"+completionID, "", nil)
+			if implicit.Code != http.StatusBadRequest {
+				t.Fatalf("implicit lifecycle status = %d, want 400; body=%s", implicit.Code, implicit.Body.String())
+			}
+			assertLifecycleError(t, implicit.Body.Bytes(), "completion_id", "provider_binding_conflict")
+			if alphaCalls.Load() != 1 || betaCalls.Load() != 1 {
+				t.Fatalf("upstream calls after conflict: alpha=%d beta=%d, want one create each", alphaCalls.Load(), betaCalls.Load())
 			}
 		})
 	}

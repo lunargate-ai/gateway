@@ -115,6 +115,72 @@ func TestOpenAITranslator_PreservesCompleteNativeChatPayload(t *testing.T) {
 	}
 }
 
+func TestOpenAITranslator_PreservesNativeChatMessageNumberPrecision(t *testing.T) {
+	translator := NewOpenAITranslator(config.ProviderConfig{
+		APIKey:  "dummy",
+		BaseURL: "https://api.openai.com/v1",
+	})
+	raw := json.RawMessage(`{
+		"model":"gpt-5.4",
+		"messages":[{"role":"user","content":"hi","vendor_sequence":9007199254740993}]
+	}`)
+
+	request, err := translator.TranslateRequest(context.Background(), &models.UnifiedRequest{
+		RawJSON: raw,
+		Model:   "gpt-5.4",
+		Messages: []models.Message{{
+			Role:    "user",
+			Content: "hi",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+	body, err := io.ReadAll(request.Body)
+	if err != nil {
+		t.Fatalf("read request body: %v", err)
+	}
+	if !strings.Contains(string(body), `"vendor_sequence":9007199254740993`) {
+		t.Fatalf("large message number lost precision: %s", body)
+	}
+}
+
+func TestOpenAITranslator_PreservesNativeChatStreamOptionsNumberPrecision(t *testing.T) {
+	translator := NewOpenAITranslator(config.ProviderConfig{
+		APIKey:  "dummy",
+		BaseURL: "https://api.openai.com/v1",
+	})
+	raw := json.RawMessage(`{
+		"model":"gpt-5.4",
+		"messages":[{"role":"user","content":"hi"}],
+		"stream":true,
+		"stream_options":{"future_counter":9007199254740993}
+	}`)
+
+	request, err := translator.TranslateRequest(context.Background(), &models.UnifiedRequest{
+		RawJSON: raw,
+		Model:   "gpt-5.4",
+		Stream:  true,
+		Messages: []models.Message{{
+			Role:    "user",
+			Content: "hi",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+	body, err := io.ReadAll(request.Body)
+	if err != nil {
+		t.Fatalf("read request body: %v", err)
+	}
+	if !strings.Contains(string(body), `"future_counter":9007199254740993`) {
+		t.Fatalf("large stream_options number lost precision: %s", body)
+	}
+	if !strings.Contains(string(body), `"include_usage":true`) {
+		t.Fatalf("stream usage opt-in missing: %s", body)
+	}
+}
+
 func TestOpenAITranslator_PreservesCompleteNativeChatResponse(t *testing.T) {
 	translator := NewOpenAITranslator(config.ProviderConfig{})
 	body := `{
@@ -531,7 +597,7 @@ func TestOpenAITranslator_DeepSeekChatCompletionsNormalizesDeveloperRoleToSystem
 	}
 }
 
-func TestOpenAITranslator_DeepSeekResponsesNormalizesDeveloperRoleIntoInstructions(t *testing.T) {
+func TestOpenAITranslator_DeepSeekResponsesPreservesNormalizedDeveloperRoleOrder(t *testing.T) {
 	translator := NewOpenAITranslator(config.ProviderConfig{
 		Type:                 "openai",
 		APIKey:               "dummy",
@@ -561,22 +627,22 @@ func TestOpenAITranslator_DeepSeekResponsesNormalizesDeveloperRoleIntoInstructio
 		t.Fatalf("failed to unmarshal request payload: %v", err)
 	}
 
-	if got, _ := payload["instructions"].(string); got != "Act only through tools." {
-		t.Fatalf("expected deepseek developer prompt to move into instructions, got %q", got)
+	if _, exists := payload["instructions"]; exists {
+		t.Fatalf("did not expect ordered guidance to move into instructions: %#v", payload["instructions"])
 	}
 
 	input, ok := payload["input"].([]interface{})
-	if !ok {
-		t.Fatalf("expected responses payload to contain input array")
+	if !ok || len(input) != 2 {
+		t.Fatalf("expected two ordered responses input messages, got %#v", payload["input"])
 	}
-	for _, raw := range input {
-		item, _ := raw.(map[string]interface{})
-		if item == nil {
-			continue
-		}
-		if got, _ := item["role"].(string); got == "developer" {
-			t.Fatalf("did not expect developer role in deepseek responses payload")
-		}
+	first, _ := input[0].(map[string]interface{})
+	second, _ := input[1].(map[string]interface{})
+	if first["role"] != "system" || second["role"] != "user" {
+		t.Fatalf("deepseek message order/roles changed: %#v", input)
+	}
+	content, _ := first["content"].([]interface{})
+	if len(content) != 1 || content[0].(map[string]interface{})["text"] != "Act only through tools." {
+		t.Fatalf("normalized developer content changed: %#v", first["content"])
 	}
 }
 
@@ -682,7 +748,7 @@ func TestOpenAITranslator_ProfileOverridesNormalizeDeveloperRoleFalse(t *testing
 	}
 }
 
-func TestOpenAITranslator_ResponsesUpstreamFunctionCallIDsAreFCAndCallIDIsPreserved(t *testing.T) {
+func TestOpenAITranslator_ResponsesUpstreamOmitsSyntheticFunctionItemIDAndPreservesCallID(t *testing.T) {
 	translator := NewOpenAITranslator(config.ProviderConfig{
 		APIKey:  "dummy",
 		BaseURL: "https://api.openai.com/v1",
@@ -741,9 +807,8 @@ func TestOpenAITranslator_ResponsesUpstreamFunctionCallIDsAreFCAndCallIDIsPreser
 		t.Fatalf("expected function_call item in responses input")
 	}
 
-	itemID, _ := fnItem["id"].(string)
-	if !strings.HasPrefix(itemID, "fc") {
-		t.Fatalf("expected function_call id to start with fc, got %q", itemID)
+	if itemID, exists := fnItem["id"]; exists {
+		t.Fatalf("expected optional function_call item id to be omitted, got %#v", itemID)
 	}
 	callID, _ := fnItem["call_id"].(string)
 	if callID != "call_YFO4VrNVBrC7VbiGUrdPfpqZ" {

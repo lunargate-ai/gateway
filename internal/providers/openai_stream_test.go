@@ -173,6 +173,46 @@ func TestOpenAIStreamTranslator_FunctionArgumentsStayStableAndLossless(t *testin
 	assertStreamToolCall(t, doneOnly, 1, "call_def", "finish", "{}")
 }
 
+func TestOpenAIStreamTranslator_ToolIdentifiersAreExactAndOpaque(t *testing.T) {
+	t.Run("internal whitespace is preserved", func(t *testing.T) {
+		translator := newOpenAIStreamTranslatorForTest()
+		chunk, err := translator.ParseStreamChunk([]byte(`{"type":"response.output_item.added","response_id":"resp opaque","output_index":0,"item":{"id":"fc opaque","type":"function_call","call_id":"call opaque","name":"lookup","arguments":""}}`))
+		if err != nil {
+			t.Fatalf("parse exact identifiers: %v", err)
+		}
+		assertStreamToolCall(t, chunk, 0, "call opaque", "lookup", "")
+		if chunk.ID != "resp opaque" {
+			t.Fatalf("response id = %q, want exact internal whitespace", chunk.ID)
+		}
+	})
+
+	testCases := []struct {
+		name  string
+		event string
+	}{
+		{
+			name:  "padded response id",
+			event: `{"type":"response.output_text.delta","response_id":" resp_1 ","output_index":0,"content_index":0,"delta":"x"}`,
+		},
+		{
+			name:  "padded item id",
+			event: `{"type":"response.function_call_arguments.delta","response_id":"resp_1","item_id":" fc_1 ","output_index":0,"delta":"{"}`,
+		},
+		{
+			name:  "padded call id",
+			event: `{"type":"response.output_item.added","response_id":"resp_1","output_index":0,"item":{"id":"fc_1","type":"function_call","call_id":" call_1 ","name":"lookup","arguments":""}}`,
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			translator := newOpenAIStreamTranslatorForTest()
+			if chunk, err := translator.ParseStreamChunk([]byte(testCase.event)); err == nil || chunk != nil {
+				t.Fatalf("chunk=%#v err=%v, want closed failure", chunk, err)
+			}
+		})
+	}
+}
+
 func newOpenAIStreamTranslatorForTest() models.ProviderTranslator {
 	return NewOpenAIStreamTranslator(NewOpenAITranslator(config.ProviderConfig{
 		APIKey:  "dummy",

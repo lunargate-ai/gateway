@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/lunargate-ai/gateway/internal/config"
+	"github.com/lunargate-ai/gateway/internal/safeurl"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/mod/semver"
 )
@@ -100,6 +101,7 @@ func (c *Checker) Check(ctx context.Context) (CheckResult, error) {
 
 	resp, err := c.client.Do(req)
 	if err != nil {
+		err = safeurl.RedactTransportError(err, req.URL)
 		return CheckResult{}, fmt.Errorf("request latest version: %w", err)
 	}
 	defer resp.Body.Close()

@@ -115,7 +115,7 @@ func (h *Handler) validateChatCompatibility(target routing.Target, req *models.U
 		}
 	}
 	if strings.EqualFold(strings.TrimSpace(req.SourceRequestType), "responses") &&
-		strings.TrimSpace(req.PreviousResponseID) != "" &&
+		req.PreviousResponseID != "" &&
 		!strings.EqualFold(strings.TrimSpace(target.UpstreamRequestType), "responses") {
 		return &models.CompatibilityError{
 			Field:    "previous_response_id",

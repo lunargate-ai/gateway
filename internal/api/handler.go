@@ -46,6 +46,10 @@ type Handler struct {
 	chatCompletionBindings *chatCompletionBindingStore
 	conversationBindings   *conversationBindingStore
 	conversationsState     *conversationStateStore
+	responsesWebSockets    responsesWebSocketRegistry
+	runtime                *runtimeController
+	boundRuntime           *runtimeGeneration
+	runtimeRoot            *Handler
 }
 
 type trackedResponseWriter struct {
@@ -59,9 +63,10 @@ type trackedFlusherResponseWriter struct {
 }
 
 type capturedResponseWriter struct {
-	headers    http.Header
-	statusCode int
-	body       bytes.Buffer
+	headers       http.Header
+	statusCode    int
+	body          bytes.Buffer
+	responseOwner responseExecutionOwner
 }
 
 func (w *trackedResponseWriter) WriteHeader(statusCode int) {
@@ -109,12 +114,15 @@ func (w *capturedResponseWriter) Write(p []byte) (int, error) {
 	return w.body.Write(p)
 }
 
-func newProviderHTTPClient(timeout time.Duration) *http.Client {
+func (w *capturedResponseWriter) setResponseExecutionOwner(owner responseExecutionOwner) {
+	w.responseOwner = owner
+}
+
+func newProviderHTTPClient() *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxIdleConns = 2048
 	transport.MaxIdleConnsPerHost = 1024
 	transport.IdleConnTimeout = 90 * time.Second
-	transport.ResponseHeaderTimeout = timeout
 	return &http.Client{
 		Transport: transport,
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
@@ -237,7 +245,7 @@ func setTimingHeaders(w http.ResponseWriter, totalMS int64, overheadMS int64) {
 }
 
 func requestContextWithRetryPolicy(r *http.Request) context.Context {
-	ctx := r.Context()
+	ctx := providers.WithUpstreamRequestHeaders(r.Context(), r.Header)
 	if strings.EqualFold(strings.TrimSpace(r.Header.Get("X-LunarGate-No-Retry")), "true") {
 		ctx = resilience.WithRetryDisabled(ctx)
 	}
@@ -245,6 +253,20 @@ func requestContextWithRetryPolicy(r *http.Request) context.Context {
 		ctx = resilience.WithFallbackDisabled(ctx)
 	}
 	return ctx
+}
+
+// isClientRequestTermination distinguishes an inbound request ending from an
+// upstream timeout. context.Canceled retains its historical classification,
+// while DeadlineExceeded is client-owned only when the parent request ended.
+func isClientRequestTermination(ctx context.Context, err error) bool {
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	if ctx == nil {
+		return false
+	}
+	return errors.Is(ctx.Err(), context.Canceled) ||
+		errors.Is(ctx.Err(), context.DeadlineExceeded)
 }
 
 func (h *Handler) observeCircuitBreakerState(provider string, state string) {
@@ -277,7 +299,12 @@ func NewHandler(
 	selector *modelselect.Engine,
 	store *modelstore.Store,
 ) *Handler {
-	return &Handler{
+	providerConfigs := map[string]config.ProviderConfig{}
+	if registry != nil {
+		providerConfigs = registry.ConfigSnapshot()
+	}
+	providerClients := newProviderClientRegistry(providerConfigs)
+	handler := &Handler{
 		registry:               registry,
 		router:                 router,
 		fallback:               fallback,
@@ -287,20 +314,46 @@ func NewHandler(
 		collector:              collector,
 		selector:               selector,
 		store:                  store,
-		providerClients:        newProviderClientRegistry(nil),
+		providerClients:        providerClients,
 		responsesState:         newResponsesStateStore(30 * time.Minute),
 		responseBindings:       newResponseBindingStore(30 * time.Minute),
 		chatCompletionBindings: newChatCompletionBindingStore(30 * time.Minute),
 		conversationBindings:   newConversationBindingStore(30 * time.Minute),
 		conversationsState:     newConversationStateStore(30 * time.Minute),
 	}
+	handler.runtime = newRuntimeController(registry, router, selector, store, providerClients)
+	return handler
 }
 
 func (h *Handler) UpdateProviderConfigs(providerConfigs map[string]config.ProviderConfig) {
-	if h == nil || h.providerClients == nil {
+	owner := h.runtimeOwner()
+	if owner == nil {
 		return
 	}
-	h.providerClients.Update(providerConfigs)
+	if owner.runtime == nil {
+		if owner.providerClients != nil {
+			owner.providerClients.Update(providerConfigs)
+		}
+		return
+	}
+	if _, err := owner.runtime.updateProviders(providerConfigs); err != nil {
+		log.Error().Err(err).Msg("failed to update provider runtime; keeping previous runtime")
+	}
+}
+
+func (h *Handler) effectiveTargetModel(target routing.Target, requestModel string) string {
+	if model := strings.TrimSpace(target.Model); model != "" {
+		return model
+	}
+	if model := modelid.ModelName(requestModel); model != "" {
+		return model
+	}
+	if h != nil && h.registry != nil {
+		if translator, ok := h.registry.Get(target.Provider); ok {
+			return strings.TrimSpace(translator.DefaultModel())
+		}
+	}
+	return ""
 }
 
 // ChatCompletions handles POST /v1/chat/completions.
@@ -410,10 +463,11 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if strings.EqualFold(requestType, "responses") && originalPath != "" {
 		resolvePath = originalPath
 	}
-	resolved, err := h.router.Resolve(r.Context(), resolvePath, headers)
-	if err != nil && strings.EqualFold(requestType, "responses") && originalPath != "" && originalPath != r.URL.Path {
+	routingHeaders := routingHeadersForRequest(r, h.router.MatchHeaderNames(), headers)
+	resolved, err := h.router.Resolve(r.Context(), resolvePath, routingHeaders)
+	if errors.Is(err, routing.ErrNoRouteMatched) && strings.EqualFold(requestType, "responses") && originalPath != "" && originalPath != r.URL.Path {
 		resolvePath = r.URL.Path
-		resolved, err = h.router.Resolve(r.Context(), resolvePath, headers)
+		resolved, err = h.router.Resolve(r.Context(), resolvePath, routingHeaders)
 	}
 	if err != nil {
 		var unavailable *routing.RequestedTargetUnavailableError
@@ -492,19 +546,21 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// object, while caching store:false would violate the caller's policy.
 	noCache := r.Header.Get("X-LunarGate-No-Cache") == "true" || req.Store != nil
 	if !req.Stream && !noCache && h.cache.Enabled() {
-		cacheKey := middleware.GenerateKeyForTarget(&req, resolved.Target.Provider, resolved.Target.UpstreamRequestType)
+		lookupModelRaw := h.effectiveTargetModel(resolved.Target, req.Model)
+		cacheKey := h.runtimeCacheKey(
+			middleware.GenerateKeyForResolvedTargetWithHeaders(
+				&req,
+				resolved.Target.Provider,
+				lookupModelRaw,
+				resolved.Target.UpstreamRequestType,
+				r.Header,
+			),
+			resolved.Target.Provider,
+		)
 		if cached := h.cache.Get(cacheKey); cached != nil {
 			h.metrics.CacheHits.WithLabelValues("hit").Inc()
 			cacheHit = true
-			cachedModelRaw := strings.TrimSpace(resolved.Target.Model)
-			if cachedModelRaw == "" {
-				cachedModelRaw = modelid.ModelName(req.Model)
-				if cachedModelRaw == "" {
-					if translator, ok := h.registry.Get(resolved.Target.Provider); ok {
-						cachedModelRaw = strings.TrimSpace(translator.DefaultModel())
-					}
-				}
-			}
+			cachedModelRaw := lookupModelRaw
 			cachedModelCanonical := modelid.BuildCanonical(resolved.Target.Provider, cachedModelRaw)
 			userPtr, sessionIDPtr := extractUserAndSession(headers)
 			var tokensIn, tokensOut int
@@ -603,6 +659,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	requestCtx := requestContextWithRetryPolicy(r)
+	requestCtx = h.withCircuitBreakerTargetSnapshots(requestCtx, resolved)
 	// A stored Chat Completion is a stateful upstream operation. If the
 	// provider persisted the completion before returning a retryable failure,
 	// replaying it here could create duplicate stored objects. Keep ordinary
@@ -623,8 +680,9 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		errCode := "provider_error"
 		errMsg := "all LLM providers unavailable"
 		requestFailure := false
+		clientTerminated := isClientRequestTermination(r.Context(), err)
 		var upstreamFailure *upstreamHTTPError
-		if errors.Is(err, context.Canceled) {
+		if clientTerminated {
 			status = 499
 			errCode = "client_cancelled"
 			errMsg = "client disconnected"
@@ -656,6 +714,16 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 					Int("status_code", status).
 					Dur("duration", duration).
 					Msg("upstream provider failure after retries")
+			} else if failureStatus, failureType, failureMessage, ok := classifyProviderResponseError(err); ok {
+				status = failureStatus
+				errCode = failureType
+				errMsg = failureMessage
+				log.Warn().
+					Err(err).
+					Str("request_id", requestID).
+					Int("status_code", status).
+					Dur("duration", duration).
+					Msg("provider returned an invalid response")
 			} else {
 				log.Error().Err(err).
 					Str("request_id", requestID).
@@ -663,8 +731,8 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 					Msg("all providers failed")
 			}
 		}
-		if !errors.Is(err, context.Canceled) && !requestFailure {
-			h.metrics.ProviderErrors.WithLabelValues(resolved.Target.Provider, "all_failed").Inc()
+		if !clientTerminated && !requestFailure {
+			h.metrics.ProviderErrors.WithLabelValues(usedTarget.Provider, "all_failed").Inc()
 		}
 		setTimingHeaders(w, duration.Milliseconds(), upstreamStartMS)
 		if upstreamFailure != nil {
@@ -675,7 +743,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		if h.collector != nil {
 			errCodeForCollector := errCode
 			errMsgForCollector := err.Error()
-			if errors.Is(err, context.Canceled) {
+			if clientTerminated {
 				errMsgForCollector = "client disconnected"
 			} else if upstreamFailure != nil {
 				errMsgForCollector = upstreamFailure.message
@@ -780,6 +848,12 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	metricsModelRaw := boundedModelMetricLabel(usedTarget, usedModelRaw)
 	req.Model = usedModelCanonical
 	w.Header().Set("X-LunarGate-Model", usedModelCanonical)
+	if owner, ok := responseExecutionOwnerFromResponse(resp, usedTarget.Provider); ok {
+		owner.Route = resolved.RouteName
+		owner.Model = usedModelCanonical
+		owner.UpstreamRequestType = usedRequestTypes.upstream
+		setResponseExecutionOwner(w, owner)
+	}
 
 	usedProviderType := providerSnapshot.ProviderType
 	setTimingHeaders(w, -1, upstreamStartMS)
@@ -807,15 +881,18 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				translator = providers.NewOpenAIStreamTranslator(o)
 			}
 		}
+		if req.Store != nil && *req.Store &&
+			canonicalAPIRequestType(requestType) == requestTypeChatCompletions &&
+			canonicalAPIRequestType(usedRequestTypes.upstream) == requestTypeChatCompletions &&
+			strings.EqualFold(strings.TrimSpace(usedProviderType), "openai") &&
+			providerSnapshot.Capabilities.ChatCompletionsLifecycle {
+			translator = &storedChatCompletionStreamTranslator{ProviderTranslator: translator}
+		}
 
-		var streamedText strings.Builder
-		var streamedReasoning strings.Builder
-		toolCallByKey := make(map[string]*models.ToolCall, 8)
-		toolCallOrder := make([]string, 0, 8)
+		streamObservation := newChatStreamObservation(h.collector != nil && h.collector.ShareResponses())
 		tokensIn := 0
 		tokensOut := 0
 		streamTokenUsage := models.TokenUsage{}
-		var finishReason *string
 		var ttftMS int64 = -1
 		var ttltMS int64 = -1
 		var nativeTerminal *nativeResponsesStreamTerminal
@@ -829,73 +906,10 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			tokensIn = streamTokenUsage.InputTokens
 			tokensOut = streamTokenUsage.OutputTokens
 
-			hasContent := false
-			for _, c := range chunk.Choices {
-				if c.FinishReason != nil {
-					finishReason = c.FinishReason
-				}
-				if c.Delta == nil {
-					continue
-				}
-
-				if len(c.Delta.ToolCalls) > 0 {
-					hasContent = true
-					for _, tc := range c.Delta.ToolCalls {
-						key := ""
-						if tc.Index != nil {
-							key = fmt.Sprintf("idx:%d", *tc.Index)
-						} else if tc.ID != "" {
-							key = tc.ID
-						} else if tc.Function.Name != "" {
-							key = tc.Function.Name
-						}
-						if key == "" {
-							continue
-						}
-
-						existing := toolCallByKey[key]
-						if existing == nil {
-							copyTC := models.ToolCall{
-								Index: tc.Index,
-								ID:    tc.ID,
-								Type:  tc.Type,
-								Function: models.ToolCallFunction{
-									Name: tc.Function.Name,
-								},
-							}
-							toolCallByKey[key] = &copyTC
-							toolCallOrder = append(toolCallOrder, key)
-							existing = &copyTC
-						}
-
-						if existing.ID == "" {
-							existing.ID = tc.ID
-						}
-						if existing.Type == "" {
-							existing.Type = tc.Type
-						}
-						if existing.Index == nil {
-							existing.Index = tc.Index
-						}
-						if existing.Function.Name == "" {
-							existing.Function.Name = tc.Function.Name
-						}
-						if tc.Function.Arguments != "" {
-							existing.Function.Arguments += tc.Function.Arguments
-						}
-					}
-				}
-
-				if content, ok := c.Delta.Content.(string); ok && content != "" {
-					streamedText.WriteString(content)
-					hasContent = true
-				}
-				if c.Delta.ReasoningContent != "" {
-					streamedReasoning.WriteString(c.Delta.ReasoningContent)
-					hasContent = true
-				}
+			if streamObservation.isShared() && !h.collector.ShareResponses() {
+				streamObservation.disable()
 			}
-
+			hasContent := streamObservation.observe(chunk)
 			if hasContent {
 				now := time.Since(startTime).Milliseconds()
 				if ttftMS < 0 {
@@ -988,12 +1002,13 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			if recorder, ok := w.(interface{ RecordStreamError(error) }); ok {
 				recorder.RecordStreamError(streamErr)
 			}
+			clientTerminated := isClientRequestTermination(r.Context(), streamErr)
 			status = http.StatusBadGateway
 			errCode := "streaming_error"
 			errMsg := streamErr.Error()
 			var upstreamFailure *upstreamHTTPError
 
-			if errors.Is(streamErr, context.Canceled) {
+			if clientTerminated {
 				status = 499
 				errCode = "client_cancelled"
 				errMsg = "client disconnected"
@@ -1044,7 +1059,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 					Msg("streaming error")
 			}
 
-			if !trw.wroteHeader && !errors.Is(streamErr, context.Canceled) {
+			if !trw.wroteHeader && !clientTerminated {
 				if upstreamFailure != nil {
 					upstreamFailure.write(tw)
 				} else {
@@ -1149,55 +1164,22 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				},
 			}}
 
-			if h.collector.SharePrompts() || h.collector.ShareResponses() {
+			sharePrompts := h.collector.SharePrompts()
+			shareResponses := streamObservation.isShared() && h.collector.ShareResponses()
+			if !shareResponses {
+				streamObservation.disable()
+			}
+			if sharePrompts || shareResponses {
 				var reqObj interface{}
-				if h.collector.SharePrompts() {
+				if sharePrompts {
 					reqObj = buildCollectorRequestLogPayload(body, usedSampling)
 				}
 
 				var respObj interface{}
-				if h.collector.ShareResponses() && nativeTerminal != nil {
+				if shareResponses && nativeTerminal != nil {
 					respObj = nativeTerminal.collectorResponse
-				} else if h.collector.ShareResponses() {
-					usage := &models.Usage{
-						PromptTokens:        tokensIn,
-						CompletionTokens:    tokensOut,
-						TotalTokens:         models.SaturatingTokenSum(tokensIn, tokensOut),
-						PromptTokensDetails: inputTokenDetailsFromTokenUsage(streamTokenUsage),
-					}
-					if tokensIn == 0 && tokensOut == 0 {
-						usage = nil
-					}
-					unifiedResp := models.UnifiedResponse{
-						ID:      requestID,
-						Object:  "chat.completion",
-						Created: time.Now().Unix(),
-						Model:   usedModelCanonical,
-						Choices: []models.Choice{{
-							Index: 0,
-							Message: &models.Message{
-								Role:             "assistant",
-								Content:          streamedText.String(),
-								ReasoningContent: streamedReasoning.String(),
-								ToolCalls: func() []models.ToolCall {
-									if len(toolCallOrder) == 0 {
-										return nil
-									}
-									out := make([]models.ToolCall, 0, len(toolCallOrder))
-									for _, k := range toolCallOrder {
-										if tc := toolCallByKey[k]; tc != nil {
-											out = append(out, *tc)
-										}
-									}
-									return out
-								}(),
-							},
-							FinishReason: finishReason,
-						}},
-						Usage: usage,
-					}
-					respBytes, _ := json.Marshal(unifiedResp)
-					_ = json.Unmarshal(respBytes, &respObj)
+				} else if shareResponses {
+					respObj = streamObservation.collectorResponse(requestID, usedModelCanonical, streamTokenUsage)
 				}
 
 				events = append(events, observability.Event{
@@ -1230,9 +1212,9 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A native Responses endpoint may use any successful HTTP status. Keep its
-	// transport envelope intact while still parsing the minimal unified snapshot
-	// needed by metrics and local state handling.
+	// Native Responses create requires exact HTTP 200. Keep its successful
+	// transport envelope intact while still retaining the minimal unified
+	// snapshot needed by metrics and local state handling.
 	responseStatus := http.StatusOK
 	var responseHeaders http.Header
 	nativeResponsesRequest := strings.EqualFold(strings.TrimSpace(requestType), requestTypeResponses) &&
@@ -1254,9 +1236,10 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		upstreamFailure = readUpstreamHTTPError(resp, usedProviderType)
 		err = upstreamFailure
 	} else {
-		unified, err = providerSnapshot.Translator.ParseResponse(resp)
-		if err == nil {
-			normalizeUnifiedResponseUsage(unified)
+		var parsed bool
+		unified, parsed = parsedChatFromResponse(resp, usedTarget.Provider)
+		if !parsed {
+			err = &providerResponseParseError{cause: errors.New("parsed provider response not found")}
 		}
 	}
 	if err != nil {
@@ -1384,8 +1367,12 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		copyHeaders(w.Header(), responseHeaders)
 	}
 	if req.Store != nil && *req.Store {
+		completionID := ""
+		if parsedChatCompletionBindingID(resp, usedTarget.Provider) != "" {
+			completionID = unified.ID
+		}
 		h.retainNativeChatCompletionBinding(
-			unified.ID,
+			completionID,
 			requestType,
 			usedRequestTypes.upstream,
 			w.Header(),
@@ -1394,7 +1381,16 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// Cache the response
 	if !noCache && h.cache.Enabled() {
-		cacheKey := middleware.GenerateKeyForTarget(&req, usedTarget.Provider, usedTarget.UpstreamRequestType)
+		cacheKey := h.runtimeCacheKey(
+			middleware.GenerateKeyForResolvedTargetWithHeaders(
+				&req,
+				usedTarget.Provider,
+				usedModelRaw,
+				usedTarget.UpstreamRequestType,
+				r.Header,
+			),
+			usedTarget.Provider,
+		)
 		h.cache.Set(cacheKey, unified)
 	}
 
@@ -1555,7 +1551,10 @@ func (h *Handler) availableModels(ctx context.Context) []models.ModelInfo {
 
 // callProvider makes the actual HTTP request to the LLM provider.
 func (h *Handler) callProvider(ctx context.Context, target routing.Target, req *models.UnifiedRequest, beforeUpstream func()) (*http.Response, error) {
-	providerSnapshot, ok := h.registry.Snapshot(target.Provider)
+	providerSnapshot, ok := circuitBreakerTargetSnapshotFromContext(ctx, target)
+	if !ok {
+		providerSnapshot, ok = h.registry.Snapshot(target.Provider)
+	}
 	if !ok {
 		return nil, fmt.Errorf("unknown provider: %s", target.Provider)
 	}
@@ -1580,12 +1579,15 @@ func (h *Handler) callProvider(ctx context.Context, target routing.Target, req *
 	if err != nil {
 		return nil, resilience.NewRequestError(fmt.Errorf("failed to translate request for %s: %w", target.Provider, err))
 	}
+	if owner, ok := responseExecutionOwnerFromRequest(target.Provider, providerSnapshot, httpReq); ok {
+		httpReq = httpReq.WithContext(withResponseExecutionOwner(httpReq.Context(), owner))
+	}
 	if beforeUpstream != nil {
 		beforeUpstream()
 	}
 
 	clientCfg := providerClientConfig{
-		client:  newProviderHTTPClient(defaultUpstreamTimeout),
+		client:  newProviderHTTPClient(),
 		timeout: defaultUpstreamTimeout,
 		mode:    upstreamTimeoutModeTTFT,
 	}
@@ -1595,44 +1597,55 @@ func (h *Handler) callProvider(ctx context.Context, target routing.Target, req *
 		}
 	}
 
-	startedAt := time.Now()
-	resp, err := clientCfg.client.Do(httpReq)
+	resp, err := doProviderRequest(httpReq, clientCfg, target.Provider, "failed to call provider")
 	if err != nil {
-		if isHTTPTimeoutError(err) {
-			if clientCfg.mode == upstreamTimeoutModeTotal {
-				return nil, fmt.Errorf("%w: provider %s", errUpstreamTotalTimeout, target.Provider)
-			}
-			return nil, fmt.Errorf("%w: provider %s", errUpstreamTTFTTimeout, target.Provider)
+		return nil, err
+	}
+
+	// Only an exact 200 starts a streaming protocol. Classify other successful
+	// and redirect statuses inside this resilience attempt so retry, fallback,
+	// and circuit-breaker accounting see the invalid upstream response.
+	if reqCopy.Stream {
+		if resp.StatusCode != http.StatusOK && resp.StatusCode < http.StatusBadRequest {
+			_ = resp.Body.Close()
+			return nil, invalidProviderResponseStatus(target.Provider, resp.StatusCode)
 		}
-		return nil, fmt.Errorf("failed to call provider %s: %w", target.Provider, err)
+		return resp, nil
 	}
-	if resp.Request == nil {
-		resp.Request = httpReq
-	}
-
-	remaining := clientCfg.timeout - time.Since(startedAt)
-	if transport, ok := clientCfg.client.Transport.(*http.Transport); ok && transport.ResponseHeaderTimeout > 0 {
-		remaining = transport.ResponseHeaderTimeout - time.Since(startedAt)
-	}
-	if remaining <= 0 {
-		resp.Body.Close()
-		if clientCfg.mode == upstreamTimeoutModeTotal {
-			return nil, fmt.Errorf("%w: provider %s", errUpstreamTotalTimeout, target.Provider)
+	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode < http.StatusBadRequest {
+			_ = resp.Body.Close()
+			return nil, invalidProviderResponseStatus(target.Provider, resp.StatusCode)
 		}
-		return nil, fmt.Errorf("%w: provider %s", errUpstreamTTFTTimeout, target.Provider)
-	}
-	if clientCfg.mode == upstreamTimeoutModeTotal {
-		resp.Body = wrapBodyWithTotalTimeout(resp.Body, remaining)
-	} else {
-		resp.Body = wrapBodyWithTTFTTimeout(resp.Body, remaining)
+		return resp, nil // Let retry policy classify configured 4xx and all 5xx.
 	}
 
-	// For non-streaming, check status code. For streaming, let the streamer handle it.
-	if !reqCopy.Stream && resp.StatusCode != http.StatusOK {
-		return resp, nil // Let the retry logic check the status
+	var chatCompletionIDCapture *chatCompletionResponseIDCapture
+	requestTypes := chatAPIRequestTypes(reqCopy.SourceRequestType, target)
+	if reqCopy.Store != nil && *reqCopy.Store &&
+		requestTypes.client == requestTypeChatCompletions &&
+		requestTypes.upstream == requestTypeChatCompletions &&
+		strings.EqualFold(strings.TrimSpace(providerSnapshot.ProviderType), "openai") &&
+		providerSnapshot.Capabilities.ChatCompletionsLifecycle {
+		chatCompletionIDCapture = newChatCompletionResponseIDCapture(resp.Body)
+		if chatCompletionIDCapture != nil {
+			resp.Body = chatCompletionIDCapture
+		}
 	}
 
-	return resp, nil
+	parsed, err := parseChatProviderResponse(providerSnapshot.Translator, resp)
+	if err != nil {
+		return nil, err
+	}
+	normalizeUnifiedResponseUsage(parsed)
+	bindingID := ""
+	if chatCompletionIDCapture != nil {
+		bindingID = chatCompletionIDCapture.completionID()
+		if bindingID == "" || parsed.ID != bindingID {
+			return nil, &providerResponseParseError{cause: errors.New("stored Chat Completion response requires an exact non-empty string id")}
+		}
+	}
+	return responseWithParsedChat(resp, target.Provider, parsed, bindingID), nil
 }
 
 func invalidNativeResponsesCreateStatus(provider string, status int) *providers.ProviderError {
@@ -1644,7 +1657,8 @@ func invalidNativeResponsesCreateStatus(provider string, status int) *providers.
 	}
 }
 
-// extractHeaders pulls relevant headers into a map for route matching.
+// extractHeaders copies the fixed header allowlist shared by routing and
+// collector tags. Config-defined match headers are deliberately excluded.
 func extractHeaders(r *http.Request) map[string]string {
 	headers := make(map[string]string)
 	for _, key := range []string{
@@ -1670,6 +1684,31 @@ func extractHeaders(r *http.Request) map[string]string {
 	return headers
 }
 
+// routingHeadersForRequest adds only the extra headers referenced by routing
+// configuration. Canonical and synthetic values take precedence over raw
+// caller headers when the same name appears in both maps.
+func routingHeadersForRequest(r *http.Request, matchHeaderNames []string, canonical map[string]string) map[string]string {
+	headers := make(map[string]string, len(matchHeaderNames)+len(canonical))
+	if r != nil {
+		for _, rawName := range matchHeaderNames {
+			name := strings.ToLower(strings.TrimSpace(rawName))
+			if name == "" {
+				continue
+			}
+			if value := r.Header.Get(name); value != "" {
+				headers[name] = value
+			}
+		}
+	}
+	for rawName, value := range canonical {
+		name := strings.ToLower(strings.TrimSpace(rawName))
+		if name != "" {
+			headers[name] = value
+		}
+	}
+	return headers
+}
+
 func (h *Handler) enrichCollectorTags(headers map[string]string, provider string, model string, stream bool) map[string]string {
 	tags := make(map[string]string, len(headers)+4)
 	for k, v := range headers {
@@ -1687,7 +1726,7 @@ func (h *Handler) enrichCollectorTags(headers map[string]string, provider string
 		tags["x-lunargate-request-stream"] = "false"
 	}
 	if tr, ok := h.registry.Get(provider); ok {
-		if baseURL := strings.TrimSpace(tr.BaseURL()); baseURL != "" {
+		if baseURL, valid := sanitizeCollectorUpstreamBaseURL(tr.BaseURL()); valid {
 			tags["x-lunargate-upstream-base-url"] = baseURL
 		}
 	}
@@ -1740,7 +1779,7 @@ func (h *Handler) resolveCollectorInferenceParameters(provider string, req *mode
 	return params
 }
 
-func (h *Handler) executeChatCompletionsUnified(r *http.Request) (int, http.Header, *models.UnifiedResponse, []byte, error) {
+func (h *Handler) executeChatCompletionsUnified(r *http.Request) (int, http.Header, responseExecutionOwner, *models.UnifiedResponse, []byte, error) {
 	rec := newCapturedResponseWriter()
 	h.ChatCompletions(rec, r)
 
@@ -1752,22 +1791,22 @@ func (h *Handler) executeChatCompletionsUnified(r *http.Request) (int, http.Head
 	body := rec.body.Bytes()
 
 	if status >= 400 {
-		return status, headers, nil, body, nil
+		return status, headers, rec.responseOwner, nil, body, nil
 	}
 	var envelope struct {
 		Object string `json:"object"`
 	}
-	if err := json.Unmarshal(body, &envelope); err == nil && strings.EqualFold(strings.TrimSpace(envelope.Object), "response") {
-		return status, headers, &models.UnifiedResponse{
+	if err := json.Unmarshal(body, &envelope); err == nil && envelope.Object == "response" {
+		return status, headers, rec.responseOwner, &models.UnifiedResponse{
 			RawJSON: append(json.RawMessage(nil), body...),
 		}, nil, nil
 	}
 
 	var unified models.UnifiedResponse
 	if err := json.Unmarshal(body, &unified); err != nil {
-		return status, headers, nil, nil, err
+		return status, headers, rec.responseOwner, nil, nil, err
 	}
-	return status, headers, &unified, nil, nil
+	return status, headers, rec.responseOwner, &unified, nil, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

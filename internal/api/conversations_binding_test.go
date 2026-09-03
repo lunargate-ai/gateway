@@ -213,7 +213,7 @@ func TestBoundConversationBindingRejectsChangedProviderAccount(t *testing.T) {
 			handler.UpdateProviderConfigs(changedConfigs)
 
 			request := httptest.NewRequest(http.MethodGet, "/v1/conversations/conv_account", nil)
-			_, _, err = handler.boundConversationBinding(request, "conv_account")
+			_, _, err = handler.bindRuntime().boundConversationBinding(request, "conv_account")
 			resolutionErr, ok := err.(*conversationBindingResolutionError)
 			if !ok || resolutionErr.code != "provider_binding_stale" {
 				t.Fatalf("error = %#v, want provider_binding_stale", err)

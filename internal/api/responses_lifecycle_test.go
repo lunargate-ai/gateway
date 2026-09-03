@@ -173,15 +173,11 @@ func TestLocalResponsesLifecycleNonStream(t *testing.T) {
 	}
 
 	deleted := performLifecycleRequest(t, router, http.MethodDelete, "/v1/responses/"+responseID, nil)
-	if deleted.Code != http.StatusOK {
-		t.Fatalf("delete status = %d, want 200; body=%s", deleted.Code, deleted.Body.String())
+	if deleted.Code != http.StatusNoContent {
+		t.Fatalf("delete status = %d, want 204; body=%s", deleted.Code, deleted.Body.String())
 	}
-	if got := decodeLifecycleObject(t, deleted.Body.Bytes()); !reflect.DeepEqual(got, map[string]interface{}{
-		"id":      responseID,
-		"object":  "response",
-		"deleted": true,
-	}) {
-		t.Fatalf("delete body = %#v", got)
+	if deleted.Body.Len() != 0 {
+		t.Fatalf("delete body = %q, want empty", deleted.Body.String())
 	}
 	if _, ok := handler.responsesState.get(responseID); ok {
 		t.Fatalf("deleted response %q remains in continuation state", responseID)
@@ -228,8 +224,11 @@ func TestLocalResponsesLifecycleStoresCompletedStreamOnlyWhenEnabled(t *testing.
 		t.Fatalf("stream retrieve status = %d, want 200; body=%s", retrieve.Code, retrieve.Body.String())
 	}
 	retrieved := decodeLifecycleObject(t, retrieve.Body.Bytes())
-	if retrieved["status"] != "completed" || retrieved["output_text"] != "streamed answer" {
+	if retrieved["status"] != "completed" || responsesTextFromMapForTest(retrieved) != "streamed answer" {
 		t.Fatalf("retrieved streamed response = %#v", retrieved)
+	}
+	if _, exists := retrieved["output_text"]; exists {
+		t.Fatalf("retrieved translated response exposed SDK-only output_text: %#v", retrieved)
 	}
 	items := performLifecycleRequest(t, router, http.MethodGet, "/v1/responses/"+storedID+"/input_items", nil)
 	if items.Code != http.StatusOK {

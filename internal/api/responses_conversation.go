@@ -39,7 +39,18 @@ func (h *Handler) resolveResponsesConversationPayload(
 	if !present || bytes.Equal(bytes.TrimSpace(rawConversation), []byte("null")) {
 		return resolved, nil, nil
 	}
-	if previousResponseID := parseJSONStringRaw(resolved["previous_response_id"]); previousResponseID != "" {
+	_, previousResponsePresent, previousResponseErr := optionalOpaqueResourceID(
+		resolved["previous_response_id"],
+		"previous_response_id",
+	)
+	if previousResponseErr != nil {
+		return nil, nil, &responsesConversationRequestError{
+			message: previousResponseErr.Error(),
+			param:   "previous_response_id",
+			code:    "invalid_value",
+		}
+	}
+	if previousResponsePresent {
 		return nil, nil, &responsesConversationRequestError{
 			message: "conversation cannot be used together with previous_response_id",
 			param:   "conversation",
@@ -61,11 +72,7 @@ func (h *Handler) resolveResponsesConversationPayload(
 	}
 	if native {
 		if !h.providerSupportsResponseCapability(binding.Provider, responseNativeLifecycle) {
-			return nil, nil, &responsesConversationRequestError{
-				message: fmt.Sprintf("provider %q does not enable native Responses for conversations", binding.Provider),
-				param:   "conversation",
-				code:    "unsupported_feature",
-			}
+			return nil, nil, nativeResponsesConversationUnsupportedError(binding.Provider)
 		}
 		if err := validateNativeResponsesConversationProvider(r, resolved, binding.Provider); err != nil {
 			return nil, nil, err
@@ -96,7 +103,7 @@ func (h *Handler) resolveResponsesConversationPayload(
 	for _, item := range conversationItems {
 		var decoded interface{}
 		encoded, marshalErr := json.Marshal(item)
-		if marshalErr != nil || json.Unmarshal(encoded, &decoded) != nil {
+		if marshalErr != nil || decodeJSONStrict(bytes.NewReader(encoded), &decoded) != nil {
 			return nil, nil, fmt.Errorf("failed to prepare conversation history")
 		}
 		history = append(history, decoded)
@@ -125,6 +132,14 @@ func (h *Handler) resolveResponsesConversationPayload(
 		id:       conversationID,
 		rawInput: cloneResponsesRawMessage(payload["input"]),
 	}, nil
+}
+
+func nativeResponsesConversationUnsupportedError(provider string) *responsesConversationRequestError {
+	return &responsesConversationRequestError{
+		message: fmt.Sprintf("provider %q does not enable native Responses for conversations", strings.TrimSpace(provider)),
+		param:   "conversation",
+		code:    "unsupported_feature",
+	}
 }
 
 func validateNativeResponsesConversationProvider(
@@ -162,18 +177,21 @@ func parseResponsesConversationID(raw json.RawMessage) (string, error) {
 	}
 	if trimmed[0] == '"' {
 		var conversationID string
-		if err := json.Unmarshal(trimmed, &conversationID); err != nil || strings.TrimSpace(conversationID) == "" {
+		if err := json.Unmarshal(trimmed, &conversationID); err != nil {
+			return "", fmt.Errorf("conversation must contain a string id")
+		}
+		if !validOpaqueResourceID(conversationID) {
 			return "", fmt.Errorf("conversation must contain a non-empty id")
 		}
-		return strings.TrimSpace(conversationID), nil
+		return conversationID, nil
 	}
 	var conversation struct {
 		ID string `json:"id"`
 	}
-	if err := json.Unmarshal(trimmed, &conversation); err != nil || strings.TrimSpace(conversation.ID) == "" {
+	if err := json.Unmarshal(trimmed, &conversation); err != nil || !validOpaqueResourceID(conversation.ID) {
 		return "", fmt.Errorf("conversation must be a string or an object with a non-empty id")
 	}
-	return strings.TrimSpace(conversation.ID), nil
+	return conversation.ID, nil
 }
 
 func rawResponsesConversationID(raw json.RawMessage) string {
@@ -219,7 +237,7 @@ func (h *Handler) appendResponsesConversation(
 	association *responsesConversationAssociation,
 	completedResponse map[string]interface{},
 ) error {
-	if association == nil || association.native || strings.TrimSpace(association.id) == "" {
+	if association == nil || association.native || association.id == "" {
 		return nil
 	}
 	if h == nil || h.conversationsState == nil {
@@ -240,7 +258,7 @@ func attachResponsesConversation(
 	completedResponse map[string]interface{},
 	association *responsesConversationAssociation,
 ) {
-	if completedResponse == nil || association == nil || association.native || strings.TrimSpace(association.id) == "" {
+	if completedResponse == nil || association == nil || association.native || association.id == "" {
 		return
 	}
 	completedResponse["conversation"] = map[string]interface{}{"id": association.id}

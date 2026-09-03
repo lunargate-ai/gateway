@@ -92,7 +92,7 @@ func TestTranslatedSSEHandlersAcceptBoundaryEvent(t *testing.T) {
 	}
 }
 
-func TestOversizedChatRecordsEmitSafeFailure(t *testing.T) {
+func TestOversizedFirstChatRecordsDoNotCommitResponse(t *testing.T) {
 	tests := []struct {
 		name string
 		body func(*testing.T) string
@@ -135,16 +135,18 @@ func TestOversizedChatRecordsEmitSafeFailure(t *testing.T) {
 				StatusCode: http.StatusOK,
 				Body:       io.NopCloser(strings.NewReader(test.body(t))),
 			}
-			recorder := httptest.NewRecorder()
+			writer := &failingSSEWriter{}
 
-			err := test.run(recorder, response, translator)
+			err := test.run(writer, response, translator)
 			if !errors.Is(err, ErrStreamRecordTooLarge) {
 				t.Fatalf("oversize error = %v, want ErrStreamRecordTooLarge", err)
 			}
 			if translator.calls != 0 {
 				t.Fatalf("translator called %d times for oversized record", translator.calls)
 			}
-			assertSafeOversizeChatFailure(t, recorder.Body.String())
+			if writer.status != 0 || writer.body.Len() != 0 {
+				t.Fatalf("downstream was committed before validation: status=%d body=%q", writer.status, writer.body.String())
+			}
 		})
 	}
 }
@@ -191,7 +193,7 @@ func TestNDJSONHandlerAcceptsBoundaryRecord(t *testing.T) {
 
 func TestProxySSEEnforcesLimitWithoutForwardingPartialFrame(t *testing.T) {
 	t.Run("boundary", func(t *testing.T) {
-		body := streamLimitMultilineSSEEvent(t, MaxStreamRecordBytes)
+		body := nativeStreamLimitJSONEvent(t, MaxStreamRecordBytes)
 		response := &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}
 		writer := &failingSSEWriter{}
 
@@ -207,7 +209,7 @@ func TestProxySSEEnforcesLimitWithoutForwardingPartialFrame(t *testing.T) {
 	t.Run("oversize", func(t *testing.T) {
 		response := &http.Response{
 			StatusCode: http.StatusOK,
-			Body:       io.NopCloser(strings.NewReader(streamLimitMultilineSSEEvent(t, MaxStreamRecordBytes+1))),
+			Body:       io.NopCloser(strings.NewReader(nativeStreamLimitJSONEvent(t, MaxStreamRecordBytes+1))),
 		}
 		writer := &failingSSEWriter{}
 		observed := false
@@ -278,6 +280,17 @@ func streamLimitMultilineSSEEvent(t *testing.T, recordSize int) string {
 		t.Fatalf("record size %d is smaller than fixture overhead %d", recordSize, fixedSize)
 	}
 	return prefix + strings.Repeat("x", recordSize-fixedSize) + recordLineEnding + "\n"
+}
+
+func nativeStreamLimitJSONEvent(t *testing.T, recordSize int) string {
+	t.Helper()
+	const prefix = "event: limit\ndata: {\"padding\":\""
+	const suffix = "\"}\n"
+	fixedSize := len(prefix) + len(suffix)
+	if recordSize < fixedSize {
+		t.Fatalf("record size %d is smaller than native JSON fixture overhead %d", recordSize, fixedSize)
+	}
+	return prefix + strings.Repeat("x", recordSize-fixedSize) + suffix + "\n"
 }
 
 func assertSafeOversizeChatFailure(t *testing.T, body string) {

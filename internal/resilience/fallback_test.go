@@ -188,6 +188,94 @@ func TestFallbackExecutor_RequestErrorIsTerminalAndHealthy(t *testing.T) {
 	}
 }
 
+func TestFallbackExecutor_FallbackRequestErrorStopsCascade(t *testing.T) {
+	cbm := NewCircuitBreakerManager()
+	fallback := NewFallbackExecutor(NewRetrier(config.RetryConfig{
+		Enabled:         true,
+		MaxAttempts:     1,
+		RetryableErrors: []int{http.StatusInternalServerError},
+	}), cbm)
+	primary := routing.Target{Provider: "primary", Model: "model-a"}
+	firstBackup := routing.Target{Provider: "backup-a", Model: "model-b"}
+	secondBackup := routing.Target{Provider: "backup-b", Model: "model-c"}
+	calls := map[string]int{}
+	cause := errors.New("invalid fallback request translation")
+
+	_, usedTarget, fallbackUsed, retryCount, _, err := fallback.Execute(
+		context.Background(),
+		primary,
+		[]routing.Target{firstBackup, secondBackup},
+		func(_ context.Context, target routing.Target) (*http.Response, error) {
+			calls[target.Provider]++
+			switch target.Provider {
+			case primary.Provider:
+				return nil, errors.New("primary unavailable")
+			case firstBackup.Provider:
+				return nil, NewRequestError(cause)
+			default:
+				return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
+			}
+		},
+	)
+
+	if !errors.Is(err, cause) || !IsRequestError(err) {
+		t.Fatalf("error = %v, want classified fallback request error", err)
+	}
+	if usedTarget != firstBackup || !fallbackUsed {
+		t.Fatalf("usedTarget=%#v fallbackUsed=%v, want first backup/true", usedTarget, fallbackUsed)
+	}
+	if calls[primary.Provider] != 1 || calls[firstBackup.Provider] != 1 || calls[secondBackup.Provider] != 0 {
+		t.Fatalf("calls = %#v, want primary=1 first backup=1 second backup=0", calls)
+	}
+	if retryCount != 0 {
+		t.Fatalf("retryCount = %d, want 0", retryCount)
+	}
+	if counts := cbm.Get(firstBackup.Provider).Counts(); counts.TotalFailures != 0 {
+		t.Fatalf("fallback request error provider failures = %d, want 0", counts.TotalFailures)
+	}
+}
+
+func TestFallbackExecutor_FallbackCancellationStopsCascade(t *testing.T) {
+	fallback := NewFallbackExecutor(NewRetrier(config.RetryConfig{
+		Enabled:         true,
+		MaxAttempts:     1,
+		RetryableErrors: []int{http.StatusInternalServerError},
+	}), NewCircuitBreakerManager())
+	primary := routing.Target{Provider: "primary", Model: "model-a"}
+	firstBackup := routing.Target{Provider: "backup-a", Model: "model-b"}
+	secondBackup := routing.Target{Provider: "backup-b", Model: "model-c"}
+	calls := map[string]int{}
+
+	_, usedTarget, fallbackUsed, retryCount, _, err := fallback.Execute(
+		context.Background(),
+		primary,
+		[]routing.Target{firstBackup, secondBackup},
+		func(_ context.Context, target routing.Target) (*http.Response, error) {
+			calls[target.Provider]++
+			if target.Provider == primary.Provider {
+				return nil, errors.New("primary unavailable")
+			}
+			if target.Provider == firstBackup.Provider {
+				return nil, context.Canceled
+			}
+			return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
+		},
+	)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context cancellation", err)
+	}
+	if usedTarget != firstBackup || !fallbackUsed {
+		t.Fatalf("usedTarget=%#v fallbackUsed=%v, want first backup/true", usedTarget, fallbackUsed)
+	}
+	if calls[primary.Provider] != 1 || calls[firstBackup.Provider] != 1 || calls[secondBackup.Provider] != 0 {
+		t.Fatalf("calls = %#v, want primary=1 first backup=1 second backup=0", calls)
+	}
+	if retryCount != 0 {
+		t.Fatalf("retryCount = %d, want 0", retryCount)
+	}
+}
+
 func TestFallbackExecutor_Configured429FallsBackWithoutBreakerFailure(t *testing.T) {
 	cbm := NewCircuitBreakerManager()
 	fallback := NewFallbackExecutor(NewRetrier(config.RetryConfig{

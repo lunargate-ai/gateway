@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -179,12 +180,17 @@ func TestExecuteSandboxUsesConfiguredInboundAPIKey(t *testing.T) {
 }
 
 func TestClassifyDialErrorWrapsHandshakeStatus(t *testing.T) {
-	err := classifyDialError(
+	requestURL, err := url.Parse("wss://url-user:url-password@private.example.test/v1/remote-control/ws/gateway?token=query-secret#fragment-secret")
+	if err != nil {
+		t.Fatalf("parse request URL: %v", err)
+	}
+	err = classifyDialError(
 		io.EOF,
 		&http.Response{
 			StatusCode: http.StatusUnauthorized,
-			Body:       io.NopCloser(strings.NewReader(`{"detail":"Invalid gateway API key"}`)),
+			Body:       io.NopCloser(strings.NewReader(`{"detail":"backend-response-secret"}`)),
 		},
+		requestURL,
 	)
 
 	statusErr, ok := err.(*dialStatusError)
@@ -194,8 +200,10 @@ func TestClassifyDialErrorWrapsHandshakeStatus(t *testing.T) {
 	if statusErr.statusCode != http.StatusUnauthorized {
 		t.Fatalf("statusCode = %d, want %d", statusErr.statusCode, http.StatusUnauthorized)
 	}
-	if !strings.Contains(statusErr.Error(), "Invalid gateway API key") {
-		t.Fatalf("expected error to include response detail, got %q", statusErr.Error())
+	for _, secret := range []string{"url-user", "url-password", "query-secret", "fragment-secret", "backend-response-secret"} {
+		if strings.Contains(statusErr.Error(), secret) {
+			t.Fatalf("handshake error leaked %q: %s", secret, statusErr.Error())
+		}
 	}
 }
 

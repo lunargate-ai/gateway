@@ -148,19 +148,48 @@ func TestNativeConversationsCRUDPreservesEnvelopeAndBinding(t *testing.T) {
 
 func TestNativeConversationCreateBindsOnlySuccessfulValidBoundedResponses(t *testing.T) {
 	tests := []struct {
-		name        string
-		status      int
-		body        string
-		wantBinding bool
+		name          string
+		status        int
+		body          string
+		wantStatus    int
+		wantRawBody   bool
+		wantBindingID string
 	}{
-		{name: "successful valid ID", status: http.StatusOK, body: `{"id":"conv_valid","object":"conversation"}`, wantBinding: true},
-		{name: "upstream rejection", status: http.StatusBadRequest, body: `{"id":"conv_rejected","error":{"message":"bad"}}`},
-		{name: "invalid ID", status: http.StatusOK, body: `{"id":"response_not_conversation","object":"conversation"}`},
-		{name: "invalid JSON", status: http.StatusOK, body: `{"id":"conv_truncated"`},
 		{
-			name:   "response exceeds capture bound",
-			status: http.StatusOK,
-			body:   `{"id":"conv_large","padding":"` + strings.Repeat("x", maxNativeConversationCreateCaptureBytes) + `"}`,
+			name:          "successful valid response",
+			status:        http.StatusOK,
+			body:          `{"id":"conv_valid","object":"conversation"}`,
+			wantStatus:    http.StatusOK,
+			wantRawBody:   true,
+			wantBindingID: "conv_valid",
+		},
+		{
+			name:        "successful noncanonical nonempty ID stays lossless but unbound",
+			status:      http.StatusOK,
+			body:        `{"id":"third_party_conversation","object":"conversation"}`,
+			wantStatus:  http.StatusOK,
+			wantRawBody: true,
+		},
+		{
+			name:        "upstream rejection remains provider response",
+			status:      http.StatusBadRequest,
+			body:        `{"id":"conv_rejected","error":{"message":"bad"}}`,
+			wantStatus:  http.StatusBadRequest,
+			wantRawBody: true,
+		},
+		{name: "missing ID", status: http.StatusOK, body: `{"object":"conversation"}`, wantStatus: http.StatusBadGateway},
+		{name: "blank ID", status: http.StatusOK, body: `{"id":"  ","object":"conversation"}`, wantStatus: http.StatusBadGateway},
+		{name: "non-string ID", status: http.StatusOK, body: `{"id":7,"object":"conversation"}`, wantStatus: http.StatusBadGateway},
+		{name: "missing object", status: http.StatusOK, body: `{"id":"conv_missing_object"}`, wantStatus: http.StatusBadGateway},
+		{name: "wrong object", status: http.StatusOK, body: `{"id":"conv_wrong_object","object":"response"}`, wantStatus: http.StatusBadGateway},
+		{name: "invalid JSON", status: http.StatusOK, body: `{"id":"conv_truncated"`, wantStatus: http.StatusBadGateway},
+		{name: "trailing JSON", status: http.StatusOK, body: `{"id":"conv_first","object":"conversation"} {}`, wantStatus: http.StatusBadGateway},
+		{name: "JSON array", status: http.StatusOK, body: `[{"id":"conv_array","object":"conversation"}]`, wantStatus: http.StatusBadGateway},
+		{
+			name:       "response exceeds validation bound",
+			status:     http.StatusOK,
+			body:       `{"id":"conv_large","object":"conversation","padding":"` + strings.Repeat("x", maxNativeConversationResponseBytes) + `"}`,
+			wantStatus: http.StatusBadGateway,
 		},
 	}
 
@@ -178,18 +207,234 @@ func TestNativeConversationCreateBindsOnlySuccessfulValidBoundedResponses(t *tes
 			defer cache.Stop()
 
 			response := performNativeConversationRequest(t, router, http.MethodPost, "/v1/conversations", `{}`, nil)
-			if response.Code != test.status || response.Body.String() != test.body {
-				t.Fatalf("response = %d %q", response.Code, response.Body.String())
+			if response.Code != test.wantStatus {
+				t.Fatalf("response status = %d, want %d; body=%s", response.Code, test.wantStatus, response.Body.String())
 			}
-			var envelope struct {
-				ID string `json:"id"`
+			if test.wantRawBody {
+				if response.Body.String() != test.body {
+					t.Fatalf("response body = %q, want raw %q", response.Body.String(), test.body)
+				}
+			} else {
+				assertInvalidNativeConversationResponse(t, response)
 			}
-			_ = json.Unmarshal([]byte(test.body), &envelope)
-			_, bound := handler.conversationBindings.get(envelope.ID)
-			if bound != test.wantBinding {
-				t.Fatalf("bound = %v, want %v", bound, test.wantBinding)
+			if test.wantBindingID != "" {
+				if _, bound := handler.conversationBindings.get(test.wantBindingID); !bound {
+					t.Fatalf("expected binding for %q", test.wantBindingID)
+				}
+				return
+			}
+			for _, conversationID := range []string{
+				"third_party_conversation",
+				"conv_rejected",
+				"conv_missing_object",
+				"conv_wrong_object",
+				"conv_truncated",
+				"conv_first",
+				"conv_array",
+				"conv_large",
+			} {
+				if _, bound := handler.conversationBindings.get(conversationID); bound {
+					t.Fatalf("invalid response retained binding for %q", conversationID)
+				}
 			}
 		})
+	}
+}
+
+func TestNativeConversationCreateAcceptsExactResponseSizeLimit(t *testing.T) {
+	prefix := `{"id":"conv_exact_limit","object":"conversation","padding":"`
+	suffix := `"}`
+	body := prefix + strings.Repeat("x", maxNativeConversationResponseBytes-len(prefix)-len(suffix)) + suffix
+	if len(body) != maxNativeConversationResponseBytes {
+		t.Fatalf("fixture size = %d, want %d", len(body), maxNativeConversationResponseBytes)
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, body)
+	}))
+	defer upstream.Close()
+	router, handler, cache := newNativeLifecycleRouter(t, upstream.URL+"/v1", map[string]config.ProviderCapabilities{
+		"native": {Conversations: true},
+	})
+	defer cache.Stop()
+
+	response := performNativeConversationRequest(t, router, http.MethodPost, "/v1/conversations", `{}`, nil)
+	if response.Code != http.StatusOK || response.Body.String() != body {
+		t.Fatalf("response = %d with %d bytes, want 200 with %d raw bytes", response.Code, response.Body.Len(), len(body))
+	}
+	if _, bound := handler.conversationBindings.get("conv_exact_limit"); !bound {
+		t.Fatal("exact-limit valid response did not retain binding")
+	}
+}
+
+func TestNativeConversationReadAndUpdateRejectInvalidSuccessResponses(t *testing.T) {
+	const conversationID = "conv_expected"
+	tests := []struct {
+		name   string
+		method string
+		body   string
+	}{
+		{name: "get missing ID", method: http.MethodGet, body: `{"object":"conversation"}`},
+		{name: "get mismatched ID", method: http.MethodGet, body: `{"id":"conv_other","object":"conversation"}`},
+		{name: "get whitespace-padded ID", method: http.MethodGet, body: `{"id":" conv_expected ","object":"conversation"}`},
+		{name: "get wrong object", method: http.MethodGet, body: `{"id":"conv_expected","object":"response"}`},
+		{name: "get trailing object", method: http.MethodGet, body: `{"id":"conv_expected","object":"conversation"} {}`},
+		{name: "update missing ID", method: http.MethodPost, body: `{"object":"conversation"}`},
+		{name: "update mismatched ID", method: http.MethodPost, body: `{"id":"conv_other","object":"conversation"}`},
+		{name: "update wrong object", method: http.MethodPost, body: `{"id":"conv_expected","object":"conversation.updated"}`},
+		{
+			name:   "update response above limit",
+			method: http.MethodPost,
+			body:   `{"id":"conv_expected","object":"conversation","padding":"` + strings.Repeat("x", maxNativeConversationResponseBytes) + `"}`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, test.body)
+			}))
+			defer upstream.Close()
+			router, handler, cache := newNativeLifecycleRouter(t, upstream.URL+"/v1", map[string]config.ProviderCapabilities{
+				"native": {Conversations: true},
+			})
+			defer cache.Stop()
+			binding, err := handler.validateConversationProvider("native")
+			if err != nil {
+				t.Fatal(err)
+			}
+			handler.conversationBindings.put(conversationID, binding)
+
+			requestBody := ""
+			if test.method == http.MethodPost {
+				requestBody = `{"metadata":{"stage":"test"}}`
+			}
+			response := performNativeConversationRequest(
+				t,
+				router,
+				test.method,
+				"/v1/conversations/"+conversationID,
+				requestBody,
+				nil,
+			)
+			assertInvalidNativeConversationResponse(t, response)
+			if _, bound := handler.conversationBindings.get(conversationID); !bound {
+				t.Fatal("invalid read/update response removed native binding")
+			}
+		})
+	}
+}
+
+func TestNativeConversationDeleteValidatesConfirmationBeforeRemovingBinding(t *testing.T) {
+	const conversationID = "conv_delete_contract"
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "missing ID", body: `{"object":"conversation.deleted","deleted":true}`},
+		{name: "mismatched ID", body: `{"id":"conv_other","object":"conversation.deleted","deleted":true}`},
+		{name: "wrong object", body: `{"id":"conv_delete_contract","object":"conversation","deleted":true}`},
+		{name: "missing deleted", body: `{"id":"conv_delete_contract","object":"conversation.deleted"}`},
+		{name: "deleted false", body: `{"id":"conv_delete_contract","object":"conversation.deleted","deleted":false}`},
+		{name: "deleted non-boolean", body: `{"id":"conv_delete_contract","object":"conversation.deleted","deleted":"true"}`},
+		{name: "trailing object", body: `{"id":"conv_delete_contract","object":"conversation.deleted","deleted":true} {}`},
+		{
+			name: "response above limit",
+			body: `{"id":"conv_delete_contract","object":"conversation.deleted","deleted":true,"padding":"` +
+				strings.Repeat("x", maxNativeConversationResponseBytes) + `"}`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, test.body)
+			}))
+			defer upstream.Close()
+			router, handler, cache := newNativeLifecycleRouter(t, upstream.URL+"/v1", map[string]config.ProviderCapabilities{
+				"native": {Conversations: true},
+			})
+			defer cache.Stop()
+			binding, err := handler.validateConversationProvider("native")
+			if err != nil {
+				t.Fatal(err)
+			}
+			handler.conversationBindings.put(conversationID, binding)
+
+			response := performNativeConversationRequest(
+				t,
+				router,
+				http.MethodDelete,
+				"/v1/conversations/"+conversationID,
+				"",
+				nil,
+			)
+			assertInvalidNativeConversationResponse(t, response)
+			if _, bound := handler.conversationBindings.get(conversationID); !bound {
+				t.Fatal("invalid delete confirmation removed native binding")
+			}
+		})
+	}
+}
+
+func TestNativeConversationOwnerCollisionFailsClosed(t *testing.T) {
+	const conversationID = "conv_shared"
+	var alphaCalls atomic.Int32
+	var betaCalls atomic.Int32
+	newUpstream := func(calls *atomic.Int32) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls.Add(1)
+			if r.Method != http.MethodPost || r.URL.Path != "/v1/conversations" {
+				t.Errorf("unexpected lifecycle request %s %s", r.Method, r.URL.Path)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"id":"`+conversationID+`","object":"conversation"}`)
+		}))
+	}
+
+	alpha := newUpstream(&alphaCalls)
+	defer alpha.Close()
+	beta := newUpstream(&betaCalls)
+	defer beta.Close()
+	router, handler, cache := newNativeLifecycleRouterFromConfigs(t, map[string]config.ProviderConfig{
+		"alpha": {
+			Type:         "openai",
+			APIKey:       "alpha-secret",
+			BaseURL:      alpha.URL + "/v1",
+			DefaultModel: "gpt-native",
+			Capabilities: config.ProviderCapabilities{Conversations: true},
+		},
+		"beta": {
+			Type:         "openai",
+			APIKey:       "beta-secret",
+			BaseURL:      beta.URL + "/v1",
+			DefaultModel: "gpt-native",
+			Capabilities: config.ProviderCapabilities{Conversations: true},
+		},
+	})
+	defer cache.Stop()
+
+	for _, provider := range []string{"alpha", "beta"} {
+		created := performNativeConversationRequest(t, router, http.MethodPost, "/v1/conversations", `{}`, map[string]string{
+			"X-LunarGate-Provider": provider,
+		})
+		if created.Code != http.StatusOK {
+			t.Fatalf("provider %s create status = %d; body=%s", provider, created.Code, created.Body.String())
+		}
+	}
+	if _, lookup := handler.conversationBindings.lookup(conversationID); lookup != ownerLookupConflict {
+		t.Fatalf("owner lookup = %v, want conflict", lookup)
+	}
+
+	implicit := performNativeConversationRequest(t, router, http.MethodGet, "/v1/conversations/"+conversationID, "", nil)
+	assertConversationError(t, implicit, http.StatusBadRequest, "conversation_id", "provider_binding_conflict")
+	if alphaCalls.Load() != 1 || betaCalls.Load() != 1 {
+		t.Fatalf("upstream calls after conflict: alpha=%d beta=%d, want one create each", alphaCalls.Load(), betaCalls.Load())
 	}
 }
 
@@ -372,6 +617,234 @@ func TestNativeConversationItemsPreserveEnvelopeAndQuery(t *testing.T) {
 	}
 }
 
+func TestNativeConversationItemsRejectInvalidSuccessResponses(t *testing.T) {
+	const conversationID = "conv_items_contract"
+	tests := []struct {
+		name        string
+		method      string
+		path        string
+		requestBody string
+		response    string
+	}{
+		{
+			name:        "create missing list object",
+			method:      http.MethodPost,
+			path:        "/v1/conversations/conv_items_contract/items",
+			requestBody: `{"items":[{"type":"future_item","payload":{"keep":true}}]}`,
+			response:    `{"data":[{"id":"item_expected","type":"future_item"}]}`,
+		},
+		{
+			name:        "create wrong object",
+			method:      http.MethodPost,
+			path:        "/v1/conversations/conv_items_contract/items",
+			requestBody: `{"items":[{"type":"future_item"}]}`,
+			response:    `{"object":"conversation","data":[]}`,
+		},
+		{
+			name:        "create trailing JSON",
+			method:      http.MethodPost,
+			path:        "/v1/conversations/conv_items_contract/items",
+			requestBody: `{"items":[{"type":"future_item"}]}`,
+			response:    `{"object":"list","data":[]} {}`,
+		},
+		{
+			name:        "create response above limit",
+			method:      http.MethodPost,
+			path:        "/v1/conversations/conv_items_contract/items",
+			requestBody: `{"items":[{"type":"future_item"}]}`,
+			response: `{"object":"list","padding":"` +
+				strings.Repeat("x", maxNativeConversationResponseBytes) + `"}`,
+		},
+		{
+			name:     "list missing list object",
+			method:   http.MethodGet,
+			path:     "/v1/conversations/conv_items_contract/items",
+			response: `{"data":[],"has_more":false}`,
+		},
+		{
+			name:     "list wrong object",
+			method:   http.MethodGet,
+			path:     "/v1/conversations/conv_items_contract/items",
+			response: `{"object":"conversation.item.list","data":[]}`,
+		},
+		{
+			name:     "list is array instead of object",
+			method:   http.MethodGet,
+			path:     "/v1/conversations/conv_items_contract/items",
+			response: `[{"id":"item_expected","type":"future_item"}]`,
+		},
+		{
+			name:     "get missing item ID",
+			method:   http.MethodGet,
+			path:     "/v1/conversations/conv_items_contract/items/item_expected",
+			response: `{"type":"future_item"}`,
+		},
+		{
+			name:     "get non-string item ID",
+			method:   http.MethodGet,
+			path:     "/v1/conversations/conv_items_contract/items/item_expected",
+			response: `{"id":7,"type":"future_item"}`,
+		},
+		{
+			name:     "get whitespace-padded item ID",
+			method:   http.MethodGet,
+			path:     "/v1/conversations/conv_items_contract/items/item_expected",
+			response: `{"id":" item_expected ","type":"future_item"}`,
+		},
+		{
+			name:     "get mismatched item ID",
+			method:   http.MethodGet,
+			path:     "/v1/conversations/conv_items_contract/items/item_expected",
+			response: `{"id":"item_other","type":"future_item"}`,
+		},
+		{
+			name:     "delete item missing conversation ID",
+			method:   http.MethodDelete,
+			path:     "/v1/conversations/conv_items_contract/items/item_expected",
+			response: `{"object":"conversation"}`,
+		},
+		{
+			name:     "delete item returns item ID",
+			method:   http.MethodDelete,
+			path:     "/v1/conversations/conv_items_contract/items/item_expected",
+			response: `{"id":"item_expected","object":"conversation"}`,
+		},
+		{
+			name:     "delete item mismatched conversation ID",
+			method:   http.MethodDelete,
+			path:     "/v1/conversations/conv_items_contract/items/item_expected",
+			response: `{"id":"conv_other","object":"conversation"}`,
+		},
+		{
+			name:     "delete item wrong object",
+			method:   http.MethodDelete,
+			path:     "/v1/conversations/conv_items_contract/items/item_expected",
+			response: `{"id":"conv_items_contract","object":"conversation.deleted"}`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, test.response)
+			}))
+			defer upstream.Close()
+			router, handler, cache := newNativeLifecycleRouter(t, upstream.URL+"/v1", map[string]config.ProviderCapabilities{
+				"native": {Conversations: true},
+			})
+			defer cache.Stop()
+			binding, err := handler.validateConversationProvider("native")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !handler.conversationBindings.put(conversationID, binding) {
+				t.Fatal("failed to seed native conversation binding")
+			}
+
+			response := performNativeConversationRequest(
+				t,
+				router,
+				test.method,
+				test.path,
+				test.requestBody,
+				nil,
+			)
+			assertInvalidNativeConversationResponse(t, response)
+			retained, ok := handler.conversationBindings.get(conversationID)
+			if !ok || !sameConversationBindingOwner(retained, binding) {
+				t.Fatalf("invalid item response changed binding: got %#v, ok=%v; want %#v", retained, ok, binding)
+			}
+			if _, local := handler.conversationsState.get(conversationID); local {
+				t.Fatal("native item request mutated local conversation state")
+			}
+		})
+	}
+}
+
+func TestNativeConversationItemsAcceptExactResponseSizeLimit(t *testing.T) {
+	const conversationID = "conv_items_exact_limit"
+	prefix := `{"object":"list","padding":"`
+	suffix := `"}`
+	body := prefix + strings.Repeat("x", maxNativeConversationResponseBytes-len(prefix)-len(suffix)) + suffix
+	if len(body) != maxNativeConversationResponseBytes {
+		t.Fatalf("fixture size = %d, want %d", len(body), maxNativeConversationResponseBytes)
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, body)
+	}))
+	defer upstream.Close()
+	router, handler, cache := newNativeLifecycleRouter(t, upstream.URL+"/v1", map[string]config.ProviderCapabilities{
+		"native": {Conversations: true},
+	})
+	defer cache.Stop()
+	binding, err := handler.validateConversationProvider("native")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !handler.conversationBindings.put(conversationID, binding) {
+		t.Fatal("failed to seed native conversation binding")
+	}
+
+	response := performNativeConversationRequest(
+		t,
+		router,
+		http.MethodGet,
+		"/v1/conversations/"+conversationID+"/items",
+		"",
+		nil,
+	)
+	if response.Code != http.StatusOK || response.Body.String() != body {
+		t.Fatalf("response = %d with %d bytes, want 200 with %d raw bytes", response.Code, response.Body.Len(), len(body))
+	}
+	retained, ok := handler.conversationBindings.get(conversationID)
+	if !ok || !sameConversationBindingOwner(retained, binding) {
+		t.Fatalf("valid item list changed binding: got %#v, ok=%v; want %#v", retained, ok, binding)
+	}
+}
+
+func TestNativeConversationItemsPreserveUpstreamErrors(t *testing.T) {
+	const (
+		conversationID = "conv_items_error"
+		upstreamBody   = `{"error":{"message":"rate limited","future":{"retry":true}}}`
+	)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, upstreamBody)
+	}))
+	defer upstream.Close()
+	router, handler, cache := newNativeLifecycleRouter(t, upstream.URL+"/v1", map[string]config.ProviderCapabilities{
+		"native": {Conversations: true},
+	})
+	defer cache.Stop()
+	binding, err := handler.validateConversationProvider("native")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !handler.conversationBindings.put(conversationID, binding) {
+		t.Fatal("failed to seed native conversation binding")
+	}
+
+	response := performNativeConversationRequest(
+		t,
+		router,
+		http.MethodPost,
+		"/v1/conversations/"+conversationID+"/items",
+		`{"items":[{"type":"future_item"}]}`,
+		nil,
+	)
+	if response.Code != http.StatusTooManyRequests || response.Body.String() != upstreamBody {
+		t.Fatalf("response = %d %q, want raw upstream 429", response.Code, response.Body.String())
+	}
+	retained, ok := handler.conversationBindings.get(conversationID)
+	if !ok || !sameConversationBindingOwner(retained, binding) {
+		t.Fatalf("upstream error changed binding: got %#v, ok=%v; want %#v", retained, ok, binding)
+	}
+}
+
 func TestNativeConversationTransportIsSingleHopAndSanitized(t *testing.T) {
 	var redirectedCalls atomic.Int32
 	redirectTarget := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
@@ -450,5 +923,25 @@ func assertNativeConversationResponseHeaders(t *testing.T, response *httptest.Re
 	}
 	if response.Header().Get("Set-Cookie") != "" {
 		t.Fatal("unsafe Set-Cookie header was forwarded")
+	}
+}
+
+func assertInvalidNativeConversationResponse(t *testing.T, response *httptest.ResponseRecorder) {
+	t.Helper()
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("response status = %d, want 502; body=%s", response.Code, response.Body.String())
+	}
+	var envelope struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode sanitized error %q: %v", response.Body.String(), err)
+	}
+	if envelope.Error.Type != "provider_error" ||
+		envelope.Error.Message != "native conversation provider returned an invalid response object" {
+		t.Fatalf("unexpected sanitized error: %#v", envelope.Error)
 	}
 }

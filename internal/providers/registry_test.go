@@ -7,13 +7,18 @@ import (
 )
 
 func TestRegistry_UpdateProvidersConfig_RebuildsTranslatorState(t *testing.T) {
-	reg := NewRegistry(map[string]config.ProviderConfig{
+	initial := map[string]config.ProviderConfig{
 		"openai": {
 			Type:         "openai",
 			BaseURL:      "https://old.example/v1",
 			DefaultModel: "old-model",
 		},
-	})
+	}
+	reg := NewRegistry(initial)
+	before, ok := reg.Get("openai")
+	if !ok {
+		t.Fatal("expected initial openai translator")
+	}
 
 	if ok := reg.UpdateProvidersConfig(map[string]config.ProviderConfig{
 		"openai": {
@@ -38,6 +43,68 @@ func TestRegistry_UpdateProvidersConfig_RebuildsTranslatorState(t *testing.T) {
 	}
 	if got := translator.DefaultModel(); got != "new-model" {
 		t.Fatalf("expected updated default model, got %q", got)
+	}
+	if translatorAny == before {
+		t.Fatal("real provider config change reused the previous translator")
+	}
+}
+
+func TestRegistry_UpdateProvidersConfig_PreservesTranslatorOnIdenticalReload(t *testing.T) {
+	temperature := 0.25
+	configs := map[string]config.ProviderConfig{
+		"openai": {
+			Type:         "openai",
+			APIKey:       "test-key",
+			BaseURL:      "https://stable.example/v1",
+			DefaultModel: "stable-model",
+			Temperature:  &temperature,
+			Extra:        map[string]string{"header": "value"},
+			Models: config.ProviderModelsConfig{
+				Mode:   "static",
+				Static: []string{"stable-model", "other-model"},
+			},
+			Capabilities: config.ProviderCapabilities{
+				ResponsesLifecycle:    true,
+				ReasoningEffortLevels: []string{"low", "high"},
+				HostedTools:           []string{"web_search"},
+			},
+		},
+	}
+	reg := NewRegistry(configs)
+	before, ok := reg.Get("openai")
+	if !ok {
+		t.Fatal("expected initial openai translator")
+	}
+
+	reloadedTemperature := 0.25
+	identical := map[string]config.ProviderConfig{
+		"openai": {
+			Type:         "openai",
+			APIKey:       "test-key",
+			BaseURL:      "https://stable.example/v1",
+			DefaultModel: "stable-model",
+			Temperature:  &reloadedTemperature,
+			Extra:        map[string]string{"header": "value"},
+			Models: config.ProviderModelsConfig{
+				Mode:   "static",
+				Static: []string{"stable-model", "other-model"},
+			},
+			Capabilities: config.ProviderCapabilities{
+				ResponsesLifecycle:    true,
+				ReasoningEffortLevels: []string{"low", "high"},
+				HostedTools:           []string{"web_search"},
+			},
+		},
+	}
+	if changed := reg.UpdateProvidersConfig(identical); changed {
+		t.Fatal("identical provider reload reported a change")
+	}
+	after, ok := reg.Get("openai")
+	if !ok {
+		t.Fatal("expected openai translator after identical reload")
+	}
+	if after != before {
+		t.Fatal("identical provider reload rebuilt the translator")
 	}
 }
 

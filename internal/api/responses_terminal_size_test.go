@@ -26,7 +26,7 @@ func TestResponsesGeneratedSSERecordSizeMatchesTransportBoundary(t *testing.T) {
 
 func TestResponsesWebSocketTranslatedStreamFailsClosedBeforeOversizedTerminal(t *testing.T) {
 	const (
-		chunkCount = 128
+		chunkCount = 240
 		chunkSize  = 18 << 10
 	)
 	chunk := strings.Repeat("x", chunkSize)

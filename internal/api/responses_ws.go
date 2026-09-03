@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -120,6 +121,8 @@ type responsesWebSocketProxy struct {
 	terminalError      *responsesWebSocketEventError
 	cacheBasePayload   map[string]json.RawMessage
 	stateCached        bool
+	syntheticFailure   bool
+	lastSequence       int64
 }
 
 type responsesWebSocketCachedState struct {
@@ -150,22 +153,42 @@ func (e *responsesWebSocketEventError) Error() string {
 }
 
 func (h *Handler) ResponsesWebSocket(w http.ResponseWriter, r *http.Request) {
-	h.responsesWebSocket(w, r, nil)
+	h.bindRuntime().responsesWebSocket(w, r, nil)
 }
 
 func (h *Handler) responsesWebSocketHandler(policy responsesWebSocketMessagePolicy) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		h.responsesWebSocket(w, r, policy)
+		h.bindRuntime().responsesWebSocket(w, r, policy)
 	}
 }
 
 func (h *Handler) responsesWebSocket(w http.ResponseWriter, r *http.Request, policy responsesWebSocketMessagePolicy) {
+	connectionCtx, cancelConnection := context.WithCancel(r.Context())
+	webSockets := h.responsesWebSocketRegistryRef()
+	registration, ok := webSockets.register(cancelConnection)
+	if !ok {
+		cancelConnection()
+		writeError(w, http.StatusServiceUnavailable, errResponsesWebSocketShuttingDown.Error(), "server_error")
+		return
+	}
+	defer webSockets.unregister(registration)
+	r = r.Clone(connectionCtx)
+
 	conn, err := responsesWebSocketUpgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Warn().Err(err).Msg("responses websocket upgrade failed")
 		return
 	}
-	defer conn.Close()
+	if !webSockets.attach(registration, conn) {
+		return
+	}
+	var stopHeartbeat func()
+	defer func() {
+		_ = conn.Close()
+		if stopHeartbeat != nil {
+			stopHeartbeat()
+		}
+	}()
 
 	conn.SetReadLimit(maxRequestBodyBytes)
 	if err := conn.SetReadDeadline(time.Now().Add(responsesWebSocketPongTimeout)); err != nil {
@@ -175,8 +198,7 @@ func (h *Handler) responsesWebSocket(w http.ResponseWriter, r *http.Request, pol
 	conn.SetPongHandler(func(_ string) error {
 		return conn.SetReadDeadline(time.Now().Add(responsesWebSocketPongTimeout))
 	})
-	stopHeartbeat := startResponsesWebSocketHeartbeat(conn)
-	defer stopHeartbeat()
+	stopHeartbeat = startResponsesWebSocketHeartbeat(conn)
 
 	sessionID := strings.TrimSpace(r.Header.Get("x-lunargate-sessionid"))
 	if sessionID == "" {
@@ -259,7 +281,9 @@ func newResponsesWebSocketMessagePolicy(
 
 func startResponsesWebSocketHeartbeat(conn *websocket.Conn) func() {
 	done := make(chan struct{})
+	stopped := make(chan struct{})
 	go func() {
+		defer close(stopped)
 		ticker := time.NewTicker(responsesWebSocketPingInterval)
 		defer ticker.Stop()
 		for {
@@ -280,6 +304,7 @@ func startResponsesWebSocketHeartbeat(conn *websocket.Conn) func() {
 
 	return func() {
 		close(done)
+		<-stopped
 	}
 }
 
@@ -332,7 +357,7 @@ func (s *responsesWebSocketSession) handleCreate(h *Handler, baseReq *http.Reque
 			_ = s.writeErrorEvent(cacheErr)
 			return nil
 		}
-		return s.writeWarmupResponse(responseID, model)
+		return s.writeWarmupResponse(responseID, model, resolvedPayload)
 	}
 
 	body, err := marshalResponsesWebSocketHTTPBody(resolvedPayload)
@@ -413,13 +438,17 @@ func parseResponsesWebSocketCreateRequest(rawPayload []byte) (*responsesWebSocke
 		payload[key] = value
 	}
 
-	previousResponseID := parseJSONStringRaw(payload["previous_response_id"])
-	if rawPrevious, ok := payload["previous_response_id"]; ok && len(rawPrevious) > 0 && previousResponseID == "" {
+	previousResponseID, _, previousResponseErr := optionalOpaqueResourceID(
+		payload["previous_response_id"],
+		"previous_response_id",
+	)
+	if previousResponseErr != nil {
 		return nil, &responsesWebSocketEventError{
 			status:  http.StatusBadRequest,
 			errType: "invalid_request_error",
 			param:   "previous_response_id",
-			message: "previous_response_id must be a string",
+			code:    "invalid_value",
+			message: previousResponseErr.Error(),
 		}
 	}
 
@@ -454,6 +483,9 @@ func makeResponsesWebSocketHTTPRequest(baseReq *http.Request, body []byte, sessi
 	req.Body = io.NopCloser(bytes.NewReader(body))
 	req.ContentLength = int64(len(body))
 	req.Header = baseReq.Header.Clone()
+	// One WebSocket can carry many response.create messages. Reusing the
+	// handshake idempotency key for every create would collapse distinct calls.
+	req.Header.Del("Idempotency-Key")
 	req.Header.Set("Content-Type", "application/json")
 	if strings.TrimSpace(req.Header.Get("x-lunargate-sessionid")) == "" && strings.TrimSpace(sessionID) != "" {
 		req.Header.Set("x-lunargate-sessionid", strings.TrimSpace(sessionID))
@@ -463,8 +495,9 @@ func makeResponsesWebSocketHTTPRequest(baseReq *http.Request, body []byte, sessi
 
 func newResponsesWebSocketProxy(session *responsesWebSocketSession) *responsesWebSocketProxy {
 	return &responsesWebSocketProxy{
-		session: session,
-		headers: make(http.Header),
+		session:      session,
+		headers:      make(http.Header),
+		lastSequence: -1,
 	}
 }
 
@@ -474,6 +507,10 @@ func (p *responsesWebSocketProxy) Header() http.Header {
 
 func (p *responsesWebSocketProxy) WriteHeader(statusCode int) {
 	p.statusCode = statusCode
+}
+
+func (p *responsesWebSocketProxy) markNativeResponsesSyntheticFailure() {
+	p.syntheticFailure = true
 }
 
 func (p *responsesWebSocketProxy) Write(b []byte) (int, error) {
@@ -587,7 +624,7 @@ func (p *responsesWebSocketProxy) writeIncompleteStreamError() error {
 		code:    "upstream_stream_incomplete",
 		message: "response stream ended before a terminal event",
 	}
-	return p.session.writeErrorEvent(p.terminalError)
+	return p.session.writeErrorEventAfter(p.terminalError, p.lastSequence)
 }
 
 func (p *responsesWebSocketProxy) processSSEFrame(frame []byte) (bool, error) {
@@ -666,20 +703,45 @@ func responsesSSEData(frame []byte) ([]byte, bool) {
 }
 
 func (p *responsesWebSocketProxy) sendEvent(payload []byte) error {
+	responseID, identityErr := validateResponsesEventIdentity(payload, "", p.responseID)
+	if identityErr != nil {
+		p.done = true
+		p.terminalSeen = true
+		p.terminalError = &responsesWebSocketEventError{
+			status:  http.StatusBadGateway,
+			errType: "provider_error",
+			code:    "invalid_response_id",
+			message: "response stream returned an invalid or inconsistent response identifier",
+		}
+		return p.session.writeErrorEventAfter(p.terminalError, p.lastSequence)
+	}
+	sequence, sequenceErr := validateNativeResponsesEventSequence(payload, p.lastSequence)
+	if sequenceErr != nil {
+		p.done = true
+		p.terminalSeen = true
+		p.terminalError = &responsesWebSocketEventError{
+			status:  http.StatusBadGateway,
+			errType: "provider_error",
+			code:    "invalid_sequence_number",
+			message: "response stream returned an invalid or inconsistent sequence_number",
+		}
+		return p.session.writeErrorEventAfter(p.terminalError, p.lastSequence)
+	}
+	p.responseID = responseID
 	p.captureEventState(payload)
 	cachedTerminal := false
-	if p.terminalSeen && p.terminalError == nil && !p.stateCached && p.cacheBasePayload != nil {
+	if p.terminalSeen && p.terminalError == nil && !p.syntheticFailure && !p.stateCached && p.cacheBasePayload != nil {
 		terminalResponse := p.terminalResponse
 		if terminalResponse == nil {
 			terminalResponse = p.completedResponse
 		}
-		if terminalResponse != nil && strings.TrimSpace(p.responseID) != "" {
+		if terminalResponse != nil && p.responseID != "" {
 			nextState := withCompletedResponseHistory(p.cacheBasePayload, terminalResponse)
 			if cacheErr := p.session.cacheState(p.responseID, nextState); cacheErr != nil {
 				p.terminalError = cacheErr
 				p.terminalResponse = nil
 				p.completedResponse = nil
-				return p.session.writeErrorEvent(cacheErr)
+				return p.session.writeErrorEventAfter(cacheErr, p.lastSequence)
 			}
 			p.stateCached = true
 			cachedTerminal = true
@@ -692,6 +754,7 @@ func (p *responsesWebSocketProxy) sendEvent(payload []byte) error {
 		}
 		return err
 	}
+	p.lastSequence = sequence
 	return nil
 }
 
@@ -709,6 +772,10 @@ func (s *responsesWebSocketSession) writeMessage(messageType int, payload []byte
 }
 
 func (s *responsesWebSocketSession) writeErrorEvent(eventErr *responsesWebSocketEventError) error {
+	return s.writeErrorEventAfter(eventErr, -1)
+}
+
+func (s *responsesWebSocketSession) writeErrorEventAfter(eventErr *responsesWebSocketEventError, previousSequence int64) error {
 	if eventErr == nil {
 		eventErr = &responsesWebSocketEventError{
 			status:  http.StatusBadGateway,
@@ -716,8 +783,18 @@ func (s *responsesWebSocketSession) writeErrorEvent(eventErr *responsesWebSocket
 			message: "failed to process websocket request",
 		}
 	}
+	if previousSequence < -1 {
+		previousSequence = -1
+	}
+	message := nonEmptyOrDefault(strings.TrimSpace(eventErr.message), "failed to process websocket request")
+	code := strings.TrimSpace(eventErr.code)
+	param := strings.TrimSpace(eventErr.param)
 	payload := map[string]interface{}{
-		"type": "error",
+		"type":            "error",
+		"code":            nil,
+		"message":         message,
+		"param":           nil,
+		"sequence_number": previousSequence + 1,
 		"status": func() int {
 			if eventErr.status > 0 {
 				return eventErr.status
@@ -726,13 +803,15 @@ func (s *responsesWebSocketSession) writeErrorEvent(eventErr *responsesWebSocket
 		}(),
 		"error": map[string]interface{}{
 			"type":    nonEmptyOrDefault(strings.TrimSpace(eventErr.errType), "provider_error"),
-			"message": nonEmptyOrDefault(strings.TrimSpace(eventErr.message), "failed to process websocket request"),
+			"message": message,
 		},
 	}
-	if code := strings.TrimSpace(eventErr.code); code != "" {
+	if code != "" {
+		payload["code"] = code
 		payload["error"].(map[string]interface{})["code"] = code
 	}
-	if param := strings.TrimSpace(eventErr.param); param != "" {
+	if param != "" {
+		payload["param"] = param
 		payload["error"].(map[string]interface{})["param"] = param
 	}
 	b, err := json.Marshal(payload)
@@ -767,26 +846,6 @@ func parseResponsesHTTPError(status int, body []byte) *responsesWebSocketEventEr
 	return errResp
 }
 
-func extractResponsesEventResponseID(payload []byte) string {
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(payload, &raw); err != nil {
-		return ""
-	}
-	if responseID := parseJSONStringRaw(raw["response_id"]); responseID != "" {
-		return responseID
-	}
-
-	responseRaw, ok := raw["response"]
-	if !ok || len(responseRaw) == 0 {
-		return ""
-	}
-	var responseObj map[string]json.RawMessage
-	if err := json.Unmarshal(responseRaw, &responseObj); err != nil {
-		return ""
-	}
-	return parseJSONStringRaw(responseObj["id"])
-}
-
 func parseJSONStringRaw(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""
@@ -807,18 +866,27 @@ func (s *responsesWebSocketSession) resolveCreatePayload(createReq *responsesWeb
 		}
 	}
 
-	if strings.TrimSpace(createReq.previousResponseID) == "" {
+	if createReq.previousResponseID == "" {
 		return normalizeResponsesWebSocketPayload(createReq.payload)
 	}
+	if !validOpaqueResourceID(createReq.previousResponseID) {
+		return nil, &responsesWebSocketEventError{
+			status:  http.StatusBadRequest,
+			errType: "invalid_request_error",
+			code:    "invalid_value",
+			param:   "previous_response_id",
+			message: "previous_response_id must be a non-empty identifier without surrounding whitespace",
+		}
+	}
 
-	state, ok := s.cachedStates[strings.TrimSpace(createReq.previousResponseID)]
+	state, ok := s.cachedStates[createReq.previousResponseID]
 	if !ok {
 		return nil, &responsesWebSocketEventError{
 			status:  http.StatusBadRequest,
 			errType: "invalid_request_error",
 			code:    "previous_response_not_found",
 			param:   "previous_response_id",
-			message: fmt.Sprintf("Previous response with id '%s' not found.", strings.TrimSpace(createReq.previousResponseID)),
+			message: fmt.Sprintf("Previous response with id '%s' not found.", createReq.previousResponseID),
 		}
 	}
 	merged, err := mergeResponsesWebSocketPayloads(state.payload, createReq.payload)
@@ -826,7 +894,7 @@ func (s *responsesWebSocketSession) resolveCreatePayload(createReq *responsesWeb
 		return nil, err
 	}
 	if _, ok := responsesWebSocketCachedStateSize(
-		strings.TrimSpace(createReq.previousResponseID),
+		createReq.previousResponseID,
 		merged,
 		s.cachedStateLimit(),
 	); !ok {
@@ -837,11 +905,19 @@ func (s *responsesWebSocketSession) resolveCreatePayload(createReq *responsesWeb
 }
 
 func (s *responsesWebSocketSession) cacheState(responseID string, payload map[string]json.RawMessage) *responsesWebSocketEventError {
-	id := strings.TrimSpace(responseID)
-	if id == "" || len(payload) == 0 {
+	if len(payload) == 0 {
 		return nil
 	}
-	stateSize, ok := responsesWebSocketCachedStateSize(id, payload, s.cachedStateLimit())
+	if !validOpaqueResourceID(responseID) {
+		return &responsesWebSocketEventError{
+			status:  http.StatusBadGateway,
+			errType: "provider_error",
+			code:    "invalid_response_id",
+			param:   "response_id",
+			message: "upstream response id must be a non-empty identifier without surrounding whitespace",
+		}
+	}
+	stateSize, ok := responsesWebSocketCachedStateSize(responseID, payload, s.cachedStateLimit())
 	if !ok {
 		s.clearCachedStates()
 		return responsesWebSocketStateTooLargeError()
@@ -852,8 +928,8 @@ func (s *responsesWebSocketSession) cacheState(responseID string, payload map[st
 	if len(s.cachedStates) >= responsesWebSocketMaxCachedStates {
 		s.clearCachedStates()
 	}
-	s.cachedStates[id] = &responsesWebSocketCachedState{
-		responseID: id,
+	s.cachedStates[responseID] = &responsesWebSocketCachedState{
+		responseID: responseID,
 		payload:    cloneResponsesRawMap(payload),
 		sizeBytes:  stateSize,
 	}
@@ -862,17 +938,16 @@ func (s *responsesWebSocketSession) cacheState(responseID string, payload map[st
 }
 
 func (s *responsesWebSocketSession) evictState(responseID string) {
-	if s == nil {
+	if s == nil || !validOpaqueResourceID(responseID) {
 		return
 	}
-	id := strings.TrimSpace(responseID)
-	if state := s.cachedStates[id]; state != nil {
+	if state := s.cachedStates[responseID]; state != nil {
 		s.cachedStateBytes -= state.sizeBytes
 		if s.cachedStateBytes < 0 {
 			s.cachedStateBytes = 0
 		}
 	}
-	delete(s.cachedStates, id)
+	delete(s.cachedStates, responseID)
 	if len(s.cachedStates) == 0 {
 		s.cachedStateBytes = 0
 	}
@@ -918,30 +993,35 @@ func responsesWebSocketStateTooLargeError() *responsesWebSocketEventError {
 	}
 }
 
-func (s *responsesWebSocketSession) writeWarmupResponse(responseID string, model string) error {
+func (s *responsesWebSocketSession) writeWarmupResponse(
+	responseID string,
+	model string,
+	requestPayload map[string]json.RawMessage,
+) error {
 	createdAt := time.Now().Unix()
 	created := map[string]interface{}{
-		"type": "response.created",
-		"response": map[string]interface{}{
+		"type":            "response.created",
+		"sequence_number": 0,
+		"response": completeSyntheticResponsesEnvelope(map[string]interface{}{
 			"id":         responseID,
 			"object":     "response",
 			"created_at": createdAt,
 			"status":     "in_progress",
 			"model":      model,
 			"output":     []interface{}{},
-		},
+		}, requestPayload, true),
 	}
 	completed := map[string]interface{}{
-		"type": "response.completed",
-		"response": map[string]interface{}{
-			"id":          responseID,
-			"object":      "response",
-			"created_at":  createdAt,
-			"status":      "completed",
-			"model":       model,
-			"output":      []interface{}{},
-			"output_text": "",
-		},
+		"type":            "response.completed",
+		"sequence_number": 1,
+		"response": completeSyntheticResponsesEnvelope(map[string]interface{}{
+			"id":         responseID,
+			"object":     "response",
+			"created_at": createdAt,
+			"status":     "completed",
+			"model":      model,
+			"output":     []interface{}{},
+		}, requestPayload, true),
 	}
 	for _, event := range []map[string]interface{}{created, completed} {
 		b, err := json.Marshal(event)
@@ -1060,46 +1140,34 @@ func responsesCompletedResponseToInputItems(response map[string]interface{}) []i
 	}
 
 	items := make([]interface{}, 0, len(rawOutput))
-	for _, rawItem := range rawOutput {
-		item, _ := rawItem.(map[string]interface{})
-		if item == nil {
-			continue
-		}
-
-		switch strings.TrimSpace(responsesValueString(item["type"])) {
-		case "message":
-			role := strings.TrimSpace(responsesValueString(item["role"]))
-			if role == "" {
-				role = "assistant"
-			}
-			content, ok := item["content"].([]interface{})
-			if !ok {
-				continue
-			}
-			items = append(items, map[string]interface{}{
-				"type":    "message",
-				"role":    role,
-				"content": cloneResponsesInterfaceSlice(content),
-			})
-		case "function_call":
-			callID := strings.TrimSpace(responsesValueString(item["call_id"]))
-			if callID == "" {
-				callID = strings.TrimSpace(responsesValueString(item["id"]))
-			}
-			name := strings.TrimSpace(responsesValueString(item["name"]))
-			if callID == "" || name == "" {
-				continue
-			}
-			items = append(items, map[string]interface{}{
-				"type":      "function_call",
-				"id":        callID,
-				"call_id":   callID,
-				"name":      name,
-				"arguments": responsesValueString(item["arguments"]),
-			})
-		}
+	for _, item := range rawOutput {
+		items = append(items, cloneResponsesContinuationValue(item))
 	}
 	return items
+}
+
+// Manual Responses history must replay every output item verbatim. Output item
+// kinds are additive (reasoning, computer use, hosted tools, and future kinds),
+// so rebuilding only currently known shapes silently removes model context.
+func cloneResponsesContinuationValue(value interface{}) interface{} {
+	switch typed := value.(type) {
+	case map[string]interface{}:
+		cloned := make(map[string]interface{}, len(typed))
+		for key, nested := range typed {
+			cloned[key] = cloneResponsesContinuationValue(nested)
+		}
+		return cloned
+	case []interface{}:
+		cloned := make([]interface{}, len(typed))
+		for index, nested := range typed {
+			cloned[index] = cloneResponsesContinuationValue(nested)
+		}
+		return cloned
+	case json.RawMessage:
+		return cloneResponsesRawMessage(typed)
+	default:
+		return value
+	}
 }
 
 func responsesInputRawToItems(raw json.RawMessage) ([]interface{}, error) {
@@ -1140,8 +1208,7 @@ func responsesInputValueToItems(value interface{}) ([]interface{}, error) {
 }
 
 func (p *responsesWebSocketProxy) captureEventState(payload []byte) {
-	responseID := extractResponsesEventResponseID(payload)
-	if responseID != "" {
+	if responseID, err := validateResponsesEventIdentity(payload, "", p.responseID); err == nil {
 		p.responseID = responseID
 	}
 
@@ -1154,7 +1221,7 @@ func (p *responsesWebSocketProxy) captureEventState(payload []byte) {
 		p.done = true
 		p.terminalSeen = true
 		var response map[string]interface{}
-		if err := json.Unmarshal(raw["response"], &response); err != nil || response == nil {
+		if err := decodeJSONStrict(bytes.NewReader(raw["response"]), &response); err != nil || response == nil {
 			p.terminalError = &responsesWebSocketEventError{
 				status:  http.StatusBadGateway,
 				errType: "provider_error",
@@ -1183,7 +1250,7 @@ func (p *responsesWebSocketProxy) captureEventState(payload []byte) {
 	p.done = true
 	p.terminalSeen = true
 	var response map[string]interface{}
-	if err := json.Unmarshal(raw["response"], &response); err != nil {
+	if err := decodeJSONStrict(bytes.NewReader(raw["response"]), &response); err != nil {
 		return
 	}
 	p.completedResponse = response
@@ -1220,20 +1287,11 @@ func cloneResponsesInterfaceSlice(src []interface{}) []interface{} {
 		return out
 	}
 	var out []interface{}
-	if err := json.Unmarshal(b, &out); err != nil {
+	if err := decodeJSONStrict(bytes.NewReader(b), &out); err != nil {
 		out = make([]interface{}, 0, len(src))
 		out = append(out, src...)
 	}
 	return out
-}
-
-func responsesValueString(value interface{}) string {
-	switch typed := value.(type) {
-	case string:
-		return typed
-	default:
-		return fmt.Sprintf("%v", value)
-	}
 }
 
 func responsesWebSocketEventErrorFromError(err error) *responsesWebSocketEventError {

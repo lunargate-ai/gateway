@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 )
@@ -14,11 +15,15 @@ func limitRequestBody(w http.ResponseWriter, r *http.Request) {
 
 func decodeJSONStrict(reader io.Reader, dst interface{}) error {
 	decoder := json.NewDecoder(reader)
+	decoder.UseNumber()
 	if err := decoder.Decode(dst); err != nil {
 		return err
 	}
 	var extra json.RawMessage
 	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return errors.New("request body must contain a single JSON value")
+		}
 		return err
 	}
 	return nil

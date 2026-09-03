@@ -6,7 +6,6 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
-	"time"
 )
 
 func TestProviderHTTPClientDoesNotFollowRedirects(t *testing.T) {
@@ -24,7 +23,7 @@ func TestProviderHTTPClientDoesNotFollowRedirects(t *testing.T) {
 	}))
 	defer redirectSource.Close()
 
-	resp, err := newProviderHTTPClient(time.Second).Get(redirectSource.URL)
+	resp, err := newProviderHTTPClient().Get(redirectSource.URL)
 	if err != nil {
 		t.Fatalf("provider request failed: %v", err)
 	}

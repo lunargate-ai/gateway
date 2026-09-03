@@ -198,8 +198,8 @@ func TestStreamAnthropicResponseRecognizesWrappedEOF(t *testing.T) {
 		providerResp,
 		providers.NewAnthropicStreamTranslator(base),
 	)
-	if !errors.Is(err, ErrUpstreamStreamIncomplete) {
-		t.Fatalf("error = %v, want ErrUpstreamStreamIncomplete", err)
+	if !errors.Is(err, ErrUpstreamStreamEmpty) {
+		t.Fatalf("error = %v, want ErrUpstreamStreamEmpty", err)
 	}
 }
 
@@ -576,6 +576,9 @@ func TestStreamResponseStopsReadingAfterDownstreamFailure(t *testing.T) {
 			if !errors.Is(err, errInjectedDownstreamFailure) {
 				t.Fatalf("error = %v, want injected downstream failure", err)
 			}
+			if strings.Contains(writer.body.String(), ChatStreamErrorCode) {
+				t.Fatalf("downstream failure triggered a synthetic terminal: %q", writer.body.String())
+			}
 			if body.reads != tt.wantReads {
 				t.Fatalf("upstream reads = %d, want %d", body.reads, tt.wantReads)
 			}
@@ -629,6 +632,9 @@ func TestStreamAnthropicResponseStopsReadingAfterDownstreamFailure(t *testing.T)
 			)
 			if !errors.Is(err, errInjectedDownstreamFailure) {
 				t.Fatalf("error = %v, want injected downstream failure", err)
+			}
+			if strings.Contains(writer.body.String(), ChatStreamErrorCode) {
+				t.Fatalf("downstream failure triggered a synthetic terminal: %q", writer.body.String())
 			}
 			if body.reads != 2 {
 				t.Fatalf("upstream reads = %d, want 2", body.reads)
@@ -780,6 +786,9 @@ func TestStreamNDJSONResponseStopsReadingAfterDownstreamFailure(t *testing.T) {
 			if !errors.Is(err, errInjectedDownstreamFailure) {
 				t.Fatalf("error = %v, want injected downstream failure", err)
 			}
+			if strings.Contains(writer.body.String(), ChatStreamErrorCode) {
+				t.Fatalf("downstream failure triggered a synthetic terminal: %q", writer.body.String())
+			}
 			if body.reads != tt.wantReads {
 				t.Fatalf("upstream reads = %d, want %d", body.reads, tt.wantReads)
 			}
@@ -791,7 +800,9 @@ func TestStreamNDJSONResponseStopsReadingAfterDownstreamFailure(t *testing.T) {
 }
 
 func TestStreamNDJSONResponseClosesUpstreamAfterHeaderFlushFailure(t *testing.T) {
-	body := &stepReadCloser{chunks: []string{"must not be read"}}
+	body := &stepReadCloser{chunks: []string{
+		"{\"model\":\"qwen\",\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true}\n",
+	}}
 	writer := newFailAfterNWriter(0, 1)
 	base := providers.NewOllamaTranslator(config.ProviderConfig{BaseURL: "http://localhost:11434"})
 	providerResp := &http.Response{StatusCode: http.StatusOK, Body: body}
@@ -805,8 +816,8 @@ func TestStreamNDJSONResponseClosesUpstreamAfterHeaderFlushFailure(t *testing.T)
 	if !errors.Is(err, errInjectedDownstreamFailure) {
 		t.Fatalf("error = %v, want injected downstream failure", err)
 	}
-	if body.reads != 0 {
-		t.Fatalf("upstream reads = %d, want 0", body.reads)
+	if body.reads != 1 {
+		t.Fatalf("upstream reads = %d, want 1 validated record before committing headers", body.reads)
 	}
 	if !body.closed {
 		t.Fatal("upstream body was not closed")

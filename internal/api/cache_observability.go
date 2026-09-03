@@ -13,12 +13,9 @@ import (
 
 const dynamicModelMetricLabel = "_dynamic"
 
-func boundedModelMetricLabel(target routing.Target, resolvedModel string) string {
-	if strings.TrimSpace(target.Model) == "" {
-		return dynamicModelMetricLabel
-	}
-	if model := strings.TrimSpace(resolvedModel); model != "" {
-		return model
+func boundedModelMetricLabel(target routing.Target, _ string) string {
+	if configuredModel := strings.TrimSpace(target.Model); configuredModel != "" {
+		return configuredModel
 	}
 	return dynamicModelMetricLabel
 }

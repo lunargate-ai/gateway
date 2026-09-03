@@ -25,7 +25,18 @@ func mergeObservedTokenUsage(current *models.TokenUsage, update *models.Usage) {
 	if next.CacheWriteInputTokens1h > current.CacheWriteInputTokens1h {
 		current.CacheWriteInputTokens1h = next.CacheWriteInputTokens1h
 	}
+	if next.ReasoningOutputTokens > current.ReasoningOutputTokens {
+		current.ReasoningOutputTokens = next.ReasoningOutputTokens
+	}
 	*current = current.Normalized()
+}
+
+func completionTokenDetailsFromTokenUsage(usage models.TokenUsage) *models.CompletionTokensDetails {
+	usage = usage.Normalized()
+	if usage.ReasoningOutputTokens == 0 {
+		return nil
+	}
+	return &models.CompletionTokensDetails{ReasoningTokens: usage.ReasoningOutputTokens}
 }
 
 func inputTokenDetailsFromTokenUsage(usage models.TokenUsage) *models.InputTokensDetails {

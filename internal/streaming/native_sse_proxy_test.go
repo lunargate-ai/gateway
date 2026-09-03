@@ -87,7 +87,7 @@ func TestProxySSETransformsDataBeforeForwardingAndObservation(t *testing.T) {
 		": terminal comment\r\n\r\n",
 	}, "")
 	response := &http.Response{
-		StatusCode: http.StatusAccepted,
+		StatusCode: http.StatusOK,
 		Body:       io.NopCloser(strings.NewReader(rawStream)),
 	}
 	writer := &failingSSEWriter{}
@@ -116,8 +116,8 @@ func TestProxySSETransformsDataBeforeForwardingAndObservation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProxySSEWithDataTransformer returned error: %v", err)
 	}
-	if writer.status != http.StatusAccepted {
-		t.Fatalf("status = %d, want %d", writer.status, http.StatusAccepted)
+	if writer.status != http.StatusOK {
+		t.Fatalf("status = %d, want %d", writer.status, http.StatusOK)
 	}
 	if got := writer.body.String(); got != wantStream {
 		t.Fatalf("transformed stream\n got: %q\nwant: %q", got, wantStream)
@@ -140,7 +140,7 @@ func TestProxySSEStopsReadingAfterDownstreamWriteFailure(t *testing.T) {
 		return strings.Contains(string(event.Data), `"type":"response.completed"`)
 	})
 
-	if err == nil || !strings.Contains(err.Error(), "downstream write failed") {
+	if !errors.Is(err, ErrNativeSSEDownstream) || !strings.Contains(err.Error(), "downstream write failed") {
 		t.Fatalf("error = %v, want downstream write failure", err)
 	}
 	if body.reads != 2 {
@@ -161,15 +161,15 @@ func TestProxySSEStopsReadingAfterDownstreamFlushFailure(t *testing.T) {
 	}}
 	// The first flush publishes headers; the second follows the first frame.
 	writer := &failingSSEWriter{failFlushAt: 2}
-	response := &http.Response{StatusCode: http.StatusAccepted, Body: body}
+	response := &http.Response{StatusCode: http.StatusOK, Body: body}
 
 	err := NewHandler().ProxySSE(context.Background(), writer, response, "openai", nil)
 
-	if err == nil || !strings.Contains(err.Error(), "downstream flush failed") {
+	if !errors.Is(err, ErrNativeSSEDownstream) || !strings.Contains(err.Error(), "downstream flush failed") {
 		t.Fatalf("error = %v, want downstream flush failure", err)
 	}
-	if body.reads != 1 {
-		t.Fatalf("upstream reads = %d, want 1 (no read after failed flush)", body.reads)
+	if body.reads != 2 {
+		t.Fatalf("upstream reads = %d, want 2 (preflight stops after first useful record)", body.reads)
 	}
 	if !body.closed {
 		t.Fatal("upstream body was not closed")

@@ -7,11 +7,106 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	chimw "github.com/go-chi/chi/v5/middleware"
 	"github.com/lunargate-ai/gateway/internal/config"
 	"github.com/lunargate-ai/gateway/internal/security"
 )
+
+func TestRateLimiterReportsAvailableTokensAndRetryTiming(t *testing.T) {
+	now := time.Date(2026, time.September, 3, 12, 0, 0, 0, time.UTC)
+	rl := NewRateLimiter(config.RateLimitConfig{
+		Enabled:           true,
+		RequestsPerMinute: 60,
+		BurstSize:         2,
+	})
+	rl.now = func() time.Time { return now }
+
+	handler := rl.Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	request := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		req.RemoteAddr = "192.0.2.10:1234"
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, req)
+		return response
+	}
+
+	first := request()
+	if first.Code != http.StatusNoContent {
+		t.Fatalf("first status = %d, want %d", first.Code, http.StatusNoContent)
+	}
+	if got := first.Header().Get("X-RateLimit-Limit"); got != "60" {
+		t.Fatalf("first limit = %q, want 60", got)
+	}
+	if got := first.Header().Get("X-RateLimit-Remaining"); got != "1" {
+		t.Fatalf("first remaining = %q, want 1", got)
+	}
+	if got := first.Header().Get("Retry-After"); got != "" {
+		t.Fatalf("first Retry-After = %q, want empty", got)
+	}
+
+	now = now.Add(750 * time.Millisecond)
+	second := request()
+	if second.Code != http.StatusNoContent {
+		t.Fatalf("second status = %d, want %d", second.Code, http.StatusNoContent)
+	}
+	if got := second.Header().Get("X-RateLimit-Remaining"); got != "0" {
+		t.Fatalf("second remaining = %q, want floor(0.75) = 0", got)
+	}
+	if got := second.Header().Get("Retry-After"); got != "" {
+		t.Fatalf("second Retry-After = %q, want empty", got)
+	}
+
+	rejected := request()
+	if rejected.Code != http.StatusTooManyRequests {
+		t.Fatalf("rejected status = %d, want %d", rejected.Code, http.StatusTooManyRequests)
+	}
+	if got := rejected.Header().Get("X-RateLimit-Limit"); got != "60" {
+		t.Fatalf("rejected limit = %q, want 60", got)
+	}
+	if got := rejected.Header().Get("X-RateLimit-Remaining"); got != "0" {
+		t.Fatalf("rejected remaining = %q, want 0", got)
+	}
+	if got := rejected.Header().Get("Retry-After"); got != "1" {
+		t.Fatalf("rejected Retry-After = %q, want 1", got)
+	}
+}
+
+func TestRateLimiterRetryAfterCeilsTimeToNextToken(t *testing.T) {
+	now := time.Date(2026, time.September, 3, 12, 0, 0, 0, time.UTC)
+	rl := NewRateLimiter(config.RateLimitConfig{
+		Enabled:           true,
+		RequestsPerMinute: 20,
+		BurstSize:         1,
+	})
+	rl.now = func() time.Time { return now }
+
+	handler := rl.Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	request := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		req.RemoteAddr = "192.0.2.20:1234"
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, req)
+		return response
+	}
+
+	if first := request(); first.Code != http.StatusNoContent {
+		t.Fatalf("first status = %d, want %d", first.Code, http.StatusNoContent)
+	}
+	now = now.Add(1100 * time.Millisecond)
+	rejected := request()
+	if rejected.Code != http.StatusTooManyRequests {
+		t.Fatalf("rejected status = %d, want %d", rejected.Code, http.StatusTooManyRequests)
+	}
+	if got := rejected.Header().Get("Retry-After"); got != "2" {
+		t.Fatalf("Retry-After = %q, want ceil(1.9) = 2", got)
+	}
+}
 
 func TestRateLimitKeyIgnoresUnverifiedCredentialHeaders(t *testing.T) {
 	first := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
@@ -100,6 +195,46 @@ func TestRateLimiterConfigSnapshotOwnsBuckets(t *testing.T) {
 	}
 	if newBucket.maxTokens != 5 || newBucket.refillRate != 10 {
 		t.Fatalf("new bucket used mixed config: max=%v refill=%v", newBucket.maxTokens, newBucket.refillRate)
+	}
+}
+
+func TestRateLimiterUpdateConfigPreservesBucketsOnIdenticalReload(t *testing.T) {
+	now := time.Date(2026, time.September, 3, 12, 0, 0, 0, time.UTC)
+	cfg := config.RateLimitConfig{Enabled: true, RequestsPerMinute: 60, BurstSize: 1}
+	rl := NewRateLimiter(cfg)
+	rl.now = func() time.Time { return now }
+
+	handler := rl.Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	request := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		req.RemoteAddr = "192.0.2.40:1234"
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, req)
+		return response
+	}
+
+	if first := request(); first.Code != http.StatusNoContent {
+		t.Fatalf("first status = %d, want %d", first.Code, http.StatusNoContent)
+	}
+	before := rl.current.Load()
+	rl.UpdateConfig(cfg)
+	if after := rl.current.Load(); after != before {
+		t.Fatal("identical reload replaced the rate-limit snapshot")
+	}
+	if second := request(); second.Code != http.StatusTooManyRequests {
+		t.Fatalf("post-reload status = %d, want exhausted bucket 429", second.Code)
+	}
+
+	changed := cfg
+	changed.BurstSize = 2
+	rl.UpdateConfig(changed)
+	if after := rl.current.Load(); after == before {
+		t.Fatal("real config change did not replace the rate-limit snapshot")
+	}
+	if reset := request(); reset.Code != http.StatusNoContent {
+		t.Fatalf("post-change status = %d, want reset bucket success", reset.Code)
 	}
 }
 

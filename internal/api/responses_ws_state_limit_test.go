@@ -143,7 +143,8 @@ func TestResponsesWebSocketProxy_ReplacesOversizedTerminalWithStateError(t *test
 		proxy := newResponsesWebSocketProxy(session)
 		proxy.cacheBasePayload = map[string]json.RawMessage{"model": json.RawMessage(`"gpt"`)}
 		terminal, err := json.Marshal(map[string]interface{}{
-			"type": "response.completed",
+			"type":            "response.completed",
+			"sequence_number": 0,
 			"response": map[string]interface{}{
 				"id":     "resp_large",
 				"status": "completed",
@@ -199,7 +200,7 @@ func TestResponsesWebSocketProxy_ClearsCachedTerminalAfterWriteFailure(t *testin
 	}
 	proxy := newResponsesWebSocketProxy(session)
 	proxy.cacheBasePayload = map[string]json.RawMessage{"model": json.RawMessage(`"gpt"`)}
-	terminal := []byte(`{"type":"response.completed","response":{"id":"resp_write_failed","status":"completed","output":[]}}`)
+	terminal := []byte(`{"type":"response.completed","sequence_number":0,"response":{"id":"resp_write_failed","status":"completed","output":[]}}`)
 
 	if err := proxy.sendEvent(terminal); err == nil {
 		t.Fatal("sendEvent with closed session succeeded")

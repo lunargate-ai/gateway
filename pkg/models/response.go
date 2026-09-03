@@ -24,10 +24,11 @@ type Choice struct {
 }
 
 type Usage struct {
-	PromptTokens        int                 `json:"prompt_tokens"`
-	CompletionTokens    int                 `json:"completion_tokens"`
-	TotalTokens         int                 `json:"total_tokens"`
-	PromptTokensDetails *InputTokensDetails `json:"prompt_tokens_details,omitempty"`
+	PromptTokens            int                      `json:"prompt_tokens"`
+	CompletionTokens        int                      `json:"completion_tokens"`
+	TotalTokens             int                      `json:"total_tokens"`
+	PromptTokensDetails     *InputTokensDetails      `json:"prompt_tokens_details,omitempty"`
+	CompletionTokensDetails *CompletionTokensDetails `json:"completion_tokens_details,omitempty"`
 }
 
 // InputTokensDetails is the provider-neutral prompt-cache decomposition used
@@ -38,6 +39,17 @@ type InputTokensDetails struct {
 	CacheWriteTokens   int `json:"cache_write_tokens,omitempty"`
 	CacheWriteTokens5m int `json:"-"`
 	CacheWriteTokens1h int `json:"-"`
+}
+
+// CompletionTokensDetails is the provider-neutral decomposition exposed by
+// OpenAI-compatible Chat Completions usage. Prediction and audio counters stay
+// available to Chat clients, while reasoning tokens also map directly to the
+// Responses API output token details.
+type CompletionTokensDetails struct {
+	AcceptedPredictionTokens int `json:"accepted_prediction_tokens,omitempty"`
+	AudioTokens              int `json:"audio_tokens,omitempty"`
+	ReasoningTokens          int `json:"reasoning_tokens,omitempty"`
+	RejectedPredictionTokens int `json:"rejected_prediction_tokens,omitempty"`
 }
 
 type Logprobs struct {

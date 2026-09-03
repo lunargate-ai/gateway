@@ -65,7 +65,7 @@ func openAIResponsesTerminalFinishReason(
 			return nil, openAIResponsesInvalidStatusError("incomplete response is missing incomplete_details.reason")
 		}
 		switch strings.ToLower(strings.TrimSpace(response.IncompleteDetails.Reason)) {
-		case models.ResponsesIncompleteReasonMaxOutputTokens:
+		case models.ResponsesIncompleteReasonMaxOutputTokens, models.ResponsesIncompleteReasonMaxMessages:
 			finishReason := "length"
 			return &finishReason, nil
 		case models.ResponsesIncompleteReasonContentFilter:

@@ -27,6 +27,7 @@ var (
 	errOpenAIStreamTooManyTools   = errors.New("OpenAI Responses stream exceeds 128 tool calls")
 	errOpenAIStreamTooManyAliases = errors.New("OpenAI Responses stream tool aliases exceed limit")
 	errOpenAIStreamAliasConflict  = errors.New("OpenAI Responses stream tool alias is ambiguous")
+	errOpenAIStreamInvalidID      = errors.New("OpenAI Responses stream identifier is invalid")
 )
 
 // openAIStreamTranslator keeps Responses API snapshot events from being
@@ -40,6 +41,7 @@ type openAIStreamTranslator struct {
 	created int64
 
 	textParts      map[openAIStreamPartKey]*openAIStreamPartState
+	refusalParts   map[openAIStreamPartKey]*openAIStreamPartState
 	reasoningParts map[openAIStreamPartKey]*openAIStreamPartState
 
 	toolAliases        map[string]*openAIStreamToolState
@@ -77,6 +79,7 @@ func NewOpenAIStreamTranslator(base *OpenAITranslator) models.ProviderTranslator
 	return &openAIStreamTranslator{
 		base:               base,
 		textParts:          make(map[openAIStreamPartKey]*openAIStreamPartState, 4),
+		refusalParts:       make(map[openAIStreamPartKey]*openAIStreamPartState, 1),
 		reasoningParts:     make(map[openAIStreamPartKey]*openAIStreamPartState, 4),
 		toolAliases:        make(map[string]*openAIStreamToolState, 8),
 		toolsByOutputIndex: make(map[int]*openAIStreamToolState, 4),
@@ -127,6 +130,10 @@ func (t *openAIStreamTranslator) ParseStreamChunk(data []byte) (*models.StreamCh
 		return t.textDeltaChunk(raw, interfaceToString(raw["delta"]))
 	case "response.output_text.done":
 		return t.textSnapshotChunk(raw, interfaceToString(raw["text"]))
+	case "response.refusal.delta":
+		return t.refusalDeltaChunk(raw, interfaceToString(raw["delta"]))
+	case "response.refusal.done":
+		return t.refusalSnapshotChunk(raw, interfaceToString(raw["refusal"]))
 	case "response.content_part.added", "response.content_part.done":
 		return t.contentPartSnapshotChunk(raw)
 	case "response.reasoning_summary_text.delta":
@@ -162,7 +169,11 @@ func (t *openAIStreamTranslator) Models() []models.ModelInfo {
 }
 
 func (t *openAIStreamTranslator) updateResponseMetadata(raw map[string]interface{}) error {
-	if responseID := responsesEventResponseID(raw); responseID != "" {
+	responseID, err := responsesEventResponseID(raw)
+	if err != nil {
+		return err
+	}
+	if responseID != "" {
 		if err := t.replaceStateString(&t.id, responseID); err != nil {
 			return err
 		}
@@ -251,6 +262,36 @@ func (t *openAIStreamTranslator) textSnapshotChunk(raw map[string]interface{}, s
 		return nil, nil
 	}
 	return t.messageChunk(&models.Message{Content: tail}), nil
+}
+
+func (t *openAIStreamTranslator) refusalDeltaChunk(raw map[string]interface{}, delta string) (*models.StreamChunk, error) {
+	if delta == "" {
+		return nil, nil
+	}
+	key := openAIStreamPartPosition(raw, "refusal")
+	state, err := t.resolvePartState(t.refusalParts, key)
+	if err != nil {
+		return nil, err
+	}
+	if err := t.appendStateString(&state.content, delta); err != nil {
+		return nil, err
+	}
+	return t.messageChunk(&models.Message{Refusal: delta}), nil
+}
+
+func (t *openAIStreamTranslator) refusalSnapshotChunk(raw map[string]interface{}, snapshot string) (*models.StreamChunk, error) {
+	if snapshot == "" {
+		return nil, nil
+	}
+	key := openAIStreamPartPosition(raw, "refusal")
+	tail, err := t.snapshotTail(t.refusalParts, key, snapshot)
+	if err != nil {
+		return nil, err
+	}
+	if tail == "" {
+		return nil, nil
+	}
+	return t.messageChunk(&models.Message{Refusal: tail}), nil
 }
 
 func (t *openAIStreamTranslator) reasoningDeltaChunk(raw map[string]interface{}, kind, delta string) (*models.StreamChunk, error) {
@@ -374,6 +415,8 @@ func (t *openAIStreamTranslator) contentPartSnapshotChunk(raw map[string]interfa
 	switch partType {
 	case "output_text", "text":
 		return t.textSnapshotChunk(raw, text)
+	case "refusal":
+		return t.refusalSnapshotChunk(raw, interfaceToString(part["refusal"]))
 	case "reasoning_summary_text", "summary_text":
 		return t.reasoningSnapshotChunk(raw, "reasoning_summary", text)
 	case "reasoning", "reasoning_text":
@@ -416,28 +459,40 @@ func (t *openAIStreamTranslator) messageOutputItemSnapshotChunk(raw, item map[st
 		return t.textSnapshotChunk(raw, text)
 	}
 
-	var tails strings.Builder
+	var textTails strings.Builder
+	var refusalTails strings.Builder
 	for contentIndex, rawPart := range content {
 		part, _ := rawPart.(map[string]interface{})
 		if part == nil {
 			continue
 		}
 		partType := strings.TrimSpace(interfaceToString(part["type"]))
-		if partType != "output_text" && partType != "text" {
-			continue
-		}
 		position := cloneOpenAIStreamEventPosition(raw, "content_index", contentIndex)
-		key := openAIStreamPartPosition(position, "output_text")
-		tail, err := t.snapshotTail(t.textParts, key, interfaceToString(part["text"]))
-		if err != nil {
-			return nil, err
+		switch partType {
+		case "output_text", "text":
+			key := openAIStreamPartPosition(position, "output_text")
+			tail, err := t.snapshotTail(t.textParts, key, interfaceToString(part["text"]))
+			if err != nil {
+				return nil, err
+			}
+			textTails.WriteString(tail)
+		case "refusal":
+			key := openAIStreamPartPosition(position, "refusal")
+			tail, err := t.snapshotTail(t.refusalParts, key, interfaceToString(part["refusal"]))
+			if err != nil {
+				return nil, err
+			}
+			refusalTails.WriteString(tail)
 		}
-		tails.WriteString(tail)
 	}
-	if tails.Len() == 0 {
+	if textTails.Len() == 0 && refusalTails.Len() == 0 {
 		return nil, nil
 	}
-	return t.messageChunk(&models.Message{Content: tails.String()}), nil
+	message := &models.Message{Refusal: refusalTails.String()}
+	if textTails.Len() > 0 {
+		message.Content = textTails.String()
+	}
+	return t.messageChunk(message), nil
 }
 
 func (t *openAIStreamTranslator) reasoningOutputItemSnapshotChunk(raw, item map[string]interface{}) (*models.StreamChunk, error) {
@@ -527,7 +582,10 @@ func (t *openAIStreamTranslator) functionArgumentsSnapshotChunk(raw, item map[st
 }
 
 func (t *openAIStreamTranslator) resolveToolState(raw, item map[string]interface{}) (*openAIStreamToolState, error) {
-	aliases := openAIStreamToolAliases(raw, item)
+	aliases, err := openAIStreamToolAliases(raw, item)
+	if err != nil {
+		return nil, err
+	}
 	var resolved *openAIStreamToolState
 	for _, alias := range aliases {
 		if state := t.toolAliases[alias]; state != nil {
@@ -579,18 +637,30 @@ func (t *openAIStreamTranslator) updateToolState(state *openAIStreamToolState, r
 		t.toolsByOutputIndex[outputIndex] = state
 	}
 
-	if itemID := strings.TrimSpace(interfaceToString(raw["item_id"])); itemID != "" {
+	itemID, err := openAIStreamIdentifier(raw, "item_id")
+	if err != nil {
+		return err
+	}
+	if itemID != "" {
 		if err := t.replaceStateString(&state.itemID, itemID); err != nil {
 			return err
 		}
 	}
 	if item != nil {
-		if itemID := strings.TrimSpace(interfaceToString(item["id"])); itemID != "" {
+		itemID, err := openAIStreamIdentifier(item, "id")
+		if err != nil {
+			return err
+		}
+		if itemID != "" {
 			if err := t.replaceStateString(&state.itemID, itemID); err != nil {
 				return err
 			}
 		}
-		if callID := strings.TrimSpace(interfaceToString(item["call_id"])); callID != "" {
+		callID, err := openAIStreamIdentifier(item, "call_id")
+		if err != nil {
+			return err
+		}
+		if callID != "" {
 			if err := t.replaceStateString(&state.callID, callID); err != nil {
 				return err
 			}
@@ -634,9 +704,11 @@ func (t *openAIStreamTranslator) updateToolState(state *openAIStreamToolState, r
 }
 
 func (t *openAIStreamTranslator) addToolAlias(state *openAIStreamToolState, alias string) error {
-	alias = strings.TrimSpace(alias)
 	if alias == "" {
 		return nil
+	}
+	if alias != strings.TrimSpace(alias) {
+		return fmt.Errorf("%w: alias must not contain surrounding whitespace", errOpenAIStreamInvalidID)
 	}
 	if existing := t.toolAliases[alias]; existing != nil {
 		if existing != state {
@@ -670,20 +742,47 @@ func (t *openAIStreamTranslator) toolCallChunk(state *openAIStreamToolState, arg
 	}}})
 }
 
-func openAIStreamToolAliases(raw, item map[string]interface{}) []string {
+func openAIStreamToolAliases(raw, item map[string]interface{}) ([]string, error) {
 	aliases := make([]string, 0, 3)
-	if itemID := strings.TrimSpace(interfaceToString(raw["item_id"])); itemID != "" {
+	itemID, err := openAIStreamIdentifier(raw, "item_id")
+	if err != nil {
+		return nil, err
+	}
+	if itemID != "" {
 		aliases = append(aliases, itemID)
 	}
 	if item != nil {
-		if itemID := strings.TrimSpace(interfaceToString(item["id"])); itemID != "" {
+		itemID, err := openAIStreamIdentifier(item, "id")
+		if err != nil {
+			return nil, err
+		}
+		if itemID != "" {
 			aliases = append(aliases, itemID)
 		}
-		if callID := strings.TrimSpace(interfaceToString(item["call_id"])); callID != "" {
+		callID, err := openAIStreamIdentifier(item, "call_id")
+		if err != nil {
+			return nil, err
+		}
+		if callID != "" {
 			aliases = append(aliases, callID)
 		}
 	}
-	return aliases
+	return aliases, nil
+}
+
+func openAIStreamIdentifier(values map[string]interface{}, key string) (string, error) {
+	if values == nil {
+		return "", nil
+	}
+	value, present := values[key]
+	if !present {
+		return "", nil
+	}
+	id, ok := value.(string)
+	if !ok || id == "" || id != strings.TrimSpace(id) {
+		return "", fmt.Errorf("%w: %s must be a non-empty exact string", errOpenAIStreamInvalidID, key)
+	}
+	return id, nil
 }
 
 func openAIStreamToolName(raw, item map[string]interface{}) string {
@@ -708,7 +807,6 @@ func openAIStreamOutputIndex(raw map[string]interface{}) (int, bool) {
 }
 
 func openAIStreamCallIDFromItemID(itemID string) string {
-	itemID = strings.TrimSpace(itemID)
 	if strings.HasPrefix(itemID, "fc_") {
 		return "call_" + strings.TrimPrefix(itemID, "fc_")
 	}

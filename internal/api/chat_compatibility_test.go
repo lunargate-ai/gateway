@@ -194,6 +194,63 @@ func TestChatCompletionsRejectsUnmappedResponsesControlBeforeUpstream(t *testing
 	}
 }
 
+func TestChatCompletionsRejectsLossyResponsesMessageBeforeUpstream(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"unexpected","object":"response","output":[]}`))
+	}))
+	defer upstream.Close()
+
+	handler, _ := newObservedOpenAIHandler(t, upstream.URL, config.TargetConfig{
+		Provider:            "openai-responses",
+		Model:               "gpt-5.4",
+		Weight:              1,
+		UpstreamRequestType: requestTypeResponses,
+	}, nil, config.CacheConfig{Enabled: false})
+	recorder := httptest.NewRecorder()
+	handler.ChatCompletions(recorder, httptest.NewRequest(
+		http.MethodPost,
+		"/v1/chat/completions",
+		bytes.NewBufferString(`{"model":"gpt-5.4","messages":[{"role":"user","name":"alice","content":"hi"}]}`),
+	))
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response models.ErrorResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if response.Error.Param == nil || *response.Error.Param != "messages[0].name" {
+		t.Fatalf("error param = %#v, want messages[0].name", response.Error.Param)
+	}
+	if calls := upstreamCalls.Load(); calls != 0 {
+		t.Fatalf("upstream calls = %d, want 0", calls)
+	}
+}
+
+func TestCompatibleChatFallbacksDropResponsesTargetForLossyMessages(t *testing.T) {
+	handler := &Handler{registry: providers.NewRegistry(map[string]config.ProviderConfig{
+		"openai-responses": {Type: "openai"},
+		"openai-chat":      {Type: "openai"},
+	})}
+	request := &models.UnifiedRequest{
+		SourceRequestType: requestTypeChatCompletions,
+		RawJSON:           json.RawMessage(`{"model":"model","messages":[{"role":"user","name":"alice","content":"hi"}]}`),
+		Messages:          []models.Message{{Role: "user", Name: "alice", Content: "hi"}},
+	}
+
+	got := handler.compatibleChatFallbacks([]routing.Target{
+		{Provider: "openai-responses", Model: "gpt-5.4", UpstreamRequestType: requestTypeResponses},
+		{Provider: "openai-chat", Model: "gpt-5.4", UpstreamRequestType: requestTypeChatCompletions},
+	}, request)
+	if len(got) != 1 || got[0].Provider != "openai-chat" {
+		t.Fatalf("compatible fallbacks = %#v, want only native Chat target", got)
+	}
+}
+
 func TestChatCompletionsRejectsUnsupportedOllamaToolChoiceBeforeUpstream(t *testing.T) {
 	var upstreamCalls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

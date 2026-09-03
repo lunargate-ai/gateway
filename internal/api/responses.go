@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/lunargate-ai/gateway/internal/modelid"
+	"github.com/lunargate-ai/gateway/internal/routing"
 	"github.com/lunargate-ai/gateway/pkg/models"
 	"github.com/rs/zerolog/log"
 )
@@ -76,7 +78,7 @@ func responsesResponseToMap(resp *models.ResponsesResponse) (map[string]interfac
 		return nil, err
 	}
 	var payload map[string]interface{}
-	if err := json.Unmarshal(body, &payload); err != nil {
+	if err := decodeJSONStrict(bytes.NewReader(body), &payload); err != nil {
 		return nil, err
 	}
 	return payload, nil
@@ -97,7 +99,7 @@ func nativeResponsesEnvelope(resp *models.UnifiedResponse) (map[string]interface
 	if err := json.Unmarshal(document, &envelope); err != nil {
 		return nil, nil, false, err
 	}
-	if !strings.EqualFold(strings.TrimSpace(envelope.Object), "response") {
+	if envelope.Object != "response" {
 		return nil, nil, false, nil
 	}
 
@@ -111,25 +113,142 @@ func nativeResponsesEnvelope(resp *models.UnifiedResponse) (map[string]interface
 	if err := decoder.Decode(&extra); err != io.EOF {
 		return nil, nil, false, err
 	}
+	responseID, ok := payload["id"].(string)
+	if !ok || strings.TrimSpace(responseID) == "" || responseID != strings.TrimSpace(responseID) {
+		return nil, nil, false, errors.New("native Responses object requires a non-empty string id")
+	}
 	return payload, raw, true, nil
 }
 
-func (h *Handler) resolveResponsesHTTPPayload(payload map[string]json.RawMessage) (map[string]json.RawMessage, error) {
-	previousResponseID := parseJSONStringRaw(payload["previous_response_id"])
-	if previousResponseID == "" {
-		return cloneResponsesRawMap(payload), nil
+func (h *Handler) retainNativeResponseOwner(
+	responseID string,
+	headers http.Header,
+	owner responseExecutionOwner,
+) ownerClaimResult {
+	_, result := h.claimResponseOwner(responseID, headers, owner, false)
+	if result.retained() || result == ownerClaimConflict {
+		// Native ownership and local emulation must never coexist for one ID.
+		// A conflict tombstone is authoritative even if older local state exists.
+		if h != nil && h.responsesState != nil {
+			h.responsesState.discard(responseID)
+		}
+	}
+	return result
+}
+
+func (h *Handler) retainLocalResponseSnapshot(
+	responseID string,
+	headers http.Header,
+	owner responseExecutionOwner,
+	requestPayload map[string]json.RawMessage,
+	completedResponse map[string]interface{},
+) ownerClaimResult {
+	if h == nil || h.responsesState == nil || completedResponse == nil {
+		return ownerClaimUnavailable
+	}
+	binding, result := h.claimResponseOwner(responseID, headers, owner, true)
+	if result == ownerClaimConflict {
+		h.responsesState.discard(responseID)
+		return result
+	}
+	if !result.retained() {
+		return result
+	}
+
+	stored := h.responsesState.putCompleted(responseID, requestPayload, completedResponse)
+	if !stored {
+		// Never leave an older snapshot reachable when replacement retention
+		// fails for the same upstream ID.
+		h.responsesState.discard(responseID)
+		return ownerClaimUnavailable
+	}
+	current, lookup := h.responseBindings.lookup(responseID)
+	if lookup != ownerLookupBound || !sameResponseBindingOwner(current, binding) {
+		// A competing claim can race the snapshot write. Rechecking after the
+		// write prevents stale state from surviving the conflict tombstone.
+		h.responsesState.discard(responseID)
+		if lookup == ownerLookupConflict {
+			return ownerClaimConflict
+		}
+		return ownerClaimUnavailable
+	}
+	return result
+}
+
+func (h *Handler) resolveResponsesHTTPPayload(
+	r *http.Request,
+	payload map[string]json.RawMessage,
+) (map[string]json.RawMessage, responseBinding, bool, error) {
+	previousResponseID, previousResponsePresent, err := optionalOpaqueResourceID(
+		payload["previous_response_id"],
+		"previous_response_id",
+	)
+	if err != nil {
+		return nil, responseBinding{}, false, &responseBindingResolutionError{
+			message: err.Error(),
+			param:   "previous_response_id",
+			code:    "invalid_value",
+		}
+	}
+	if !previousResponsePresent {
+		return cloneResponsesRawMap(payload), responseBinding{}, false, nil
+	}
+	if h != nil && h.responseBindings != nil {
+		binding, lookup := h.responseBindings.lookup(previousResponseID)
+		switch lookup {
+		case ownerLookupConflict:
+			if h.responsesState != nil {
+				h.responsesState.discard(previousResponseID)
+			}
+			return nil, responseBinding{}, false, responseOwnerConflictError(previousResponseID, "previous_response_id")
+		case ownerLookupBound:
+			if err := h.validateClaimedResponseOwner(
+				r,
+				previousResponseID,
+				binding,
+				responseNativeLifecycle,
+				!binding.LocalSnapshot,
+			); err != nil {
+				return nil, responseBinding{}, false, err
+			}
+			if !binding.LocalSnapshot {
+				return cloneResponsesRawMap(payload), binding, true, nil
+			}
+			if h.responsesState == nil {
+				return nil, responseBinding{}, false, responsePreviousNotFoundError(previousResponseID)
+			}
+			basePayload, ok := h.responsesState.get(previousResponseID)
+			if !ok {
+				return nil, responseBinding{}, false, responsePreviousNotFoundError(previousResponseID)
+			}
+			merged, err := mergeResponsesWebSocketPayloads(basePayload, payload)
+			if err != nil {
+				return nil, responseBinding{}, false, err
+			}
+			return merged, binding, true, nil
+		}
 	}
 	if h == nil || h.responsesState == nil {
-		return cloneResponsesRawMap(payload), nil
+		return cloneResponsesRawMap(payload), responseBinding{}, false, nil
 	}
-	basePayload, ok := h.responsesState.get(previousResponseID)
-	if !ok {
-		// A native Responses target may own this ID even when it is not in the
-		// gateway's bounded local continuation cache. Compatibility validation
-		// rejects it later if the selected target requires local translation.
-		return cloneResponsesRawMap(payload), nil
+	if h.responsesState.discard(previousResponseID) {
+		// Local continuation state is valid only while its matching owner binding
+		// is retained. Replaying an orphan would route its history as a new request
+		// and could disclose it to a different provider account.
+		return nil, responseBinding{}, false, responsePreviousNotFoundError(previousResponseID)
 	}
-	return mergeResponsesWebSocketPayloads(basePayload, payload)
+	// A native Responses target may own this ID even when it is not in the
+	// gateway's bounded owner cache. Compatibility validation rejects it later
+	// if the selected target requires local translation.
+	return cloneResponsesRawMap(payload), responseBinding{}, false, nil
+}
+
+func responsePreviousNotFoundError(responseID string) error {
+	return &responseBindingResolutionError{
+		message: "previous response with id '" + responseID + "' was not found",
+		param:   "previous_response_id",
+		code:    "previous_response_not_found",
+	}
 }
 
 func parseResponsesRequest(w http.ResponseWriter, r *http.Request) (*models.ResponsesRequest, bool) {
@@ -222,16 +341,107 @@ func makeResponsesChatRequest(r *http.Request, unifiedReq *models.UnifiedRequest
 	return chatReq, nil
 }
 
+func (h *Handler) nativeConversationResponsesTargetAvailable(
+	r *http.Request,
+	req *models.UnifiedRequest,
+	provider string,
+) (matched bool, available bool) {
+	if h == nil || h.router == nil || r == nil {
+		return false, false
+	}
+	headers := extractHeaders(r)
+	requestModel := ""
+	if req != nil {
+		requestModel = strings.TrimSpace(req.Model)
+	}
+	explicitProvider := strings.TrimSpace(r.Header.Get("X-LunarGate-Provider"))
+	headerModel := strings.TrimSpace(r.Header.Get("X-LunarGate-Model"))
+	autoSelection := strings.EqualFold(requestModel, "lunargate/auto") ||
+		strings.EqualFold(headerModel, "lunargate/auto")
+	if headerModel != "" {
+		if selectedProvider, selectedModel, ok := modelid.SplitCanonical(headerModel); ok {
+			explicitProvider = selectedProvider
+			requestModel = modelid.BuildCanonical(selectedProvider, selectedModel)
+		} else if explicitProvider != "" {
+			requestModel = modelid.BuildCanonical(explicitProvider, headerModel)
+		} else {
+			requestModel = headerModel
+		}
+	}
+	if explicitProvider != "" && requestModel != "" {
+		if _, _, ok := modelid.SplitCanonical(requestModel); !ok {
+			requestModel = modelid.BuildCanonical(explicitProvider, requestModel)
+		}
+	}
+	if autoSelection {
+		requestModel = ""
+		delete(headers, "x-lunargate-model")
+		if strings.EqualFold(explicitProvider, "lunargate") {
+			explicitProvider = ""
+			delete(headers, "x-lunargate-provider")
+		}
+	} else if requestModel != "" {
+		headers["x-lunargate-model"] = requestModel
+	}
+	if explicitProvider != "" {
+		headers["x-lunargate-provider"] = explicitProvider
+	}
+	if h.collector != nil {
+		if value := strings.TrimSpace(h.collector.GatewayLat()); value != "" {
+			headers["x-lunargate-gateway-lat"] = value
+		}
+		if value := strings.TrimSpace(h.collector.GatewayLon()); value != "" {
+			headers["x-lunargate-gateway-lon"] = value
+		}
+	}
+	userSpecifiedModel := requestModel != ""
+	if h.selector != nil && h.selector.Enabled() {
+		cfg := h.selector.Config()
+		if cfg.OverrideUserModel || !userSpecifiedModel {
+			routingRequest := req
+			if req != nil {
+				requestCopy := *req
+				requestCopy.Model = requestModel
+				routingRequest = &requestCopy
+			}
+			h.selector.EnrichHeaders(routingRequest, headers)
+		}
+	}
+	routingHeaders := routingHeadersForRequest(r, h.router.MatchHeaderNames(), headers)
+	originalPath := strings.TrimSpace(r.Header.Get("X-LunarGate-Original-Path"))
+	if originalPath == "" {
+		originalPath = r.URL.Path
+	}
+	matched, available = h.router.FirstMatchingRouteTargetAvailable(
+		originalPath,
+		routingHeaders,
+		provider,
+		requestTypeResponses,
+	)
+	if !matched && originalPath != r.URL.Path {
+		return h.router.FirstMatchingRouteTargetAvailable(
+			r.URL.Path,
+			routingHeaders,
+			provider,
+			requestTypeResponses,
+		)
+	}
+	return matched, available
+}
+
 func (h *Handler) handleResponsesStream(
 	w http.ResponseWriter,
 	chatReq *http.Request,
-	requestPayload map[string]json.RawMessage,
+	stateRequestPayload map[string]json.RawMessage,
+	responseRequestPayload map[string]json.RawMessage,
 	store bool,
 	conversation *responsesConversationAssociation,
 ) {
 	proxy := newResponsesStreamProxy(w)
+	proxy.requestContext = chatReq.Context()
+	proxy.requestPayload = cloneResponsesRawMap(responseRequestPayload)
 	if conversation != nil && !conversation.native {
-		proxy.localConversationID = strings.TrimSpace(conversation.id)
+		proxy.localConversationID = conversation.id
 	}
 	proxy.beforeTerminal = func(response map[string]interface{}) {
 		attachResponsesConversation(response, conversation)
@@ -256,8 +466,11 @@ func (h *Handler) handleResponsesStream(
 	}
 	terminalResponse := proxy.terminalResponse
 	if proxy.native {
-		if terminalResponse != nil && h.retainNativeResponseBinding(proxy.responseID, proxy.headers) {
-			return
+		if terminalResponse != nil {
+			claim := h.retainNativeResponseOwner(proxy.responseID, proxy.headers, proxy.responseOwner)
+			if claim.retained() || claim == ownerClaimConflict {
+				return
+			}
 		}
 		// A native non-completed response without lifecycle support cannot be
 		// advanced locally, so retain only completed native snapshots.
@@ -266,17 +479,18 @@ func (h *Handler) handleResponsesStream(
 	if h.responsesState == nil || terminalResponse == nil {
 		return
 	}
-	h.responsesState.putCompleted(proxy.responseID, requestPayload, terminalResponse)
+	h.retainLocalResponseSnapshot(proxy.responseID, proxy.headers, proxy.responseOwner, stateRequestPayload, terminalResponse)
 }
 
 func (h *Handler) handleResponsesNonStream(
 	w http.ResponseWriter,
 	chatReq *http.Request,
-	requestPayload map[string]json.RawMessage,
+	stateRequestPayload map[string]json.RawMessage,
+	responseRequestPayload map[string]json.RawMessage,
 	store bool,
 	conversation *responsesConversationAssociation,
 ) {
-	status, headers, unifiedResp, errorBody, err := h.executeChatCompletionsUnified(chatReq)
+	status, headers, responseOwner, unifiedResp, errorBody, err := h.executeChatCompletionsUnified(chatReq)
 	copyHeaders(w.Header(), headers)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "failed to parse provider response", "provider_error")
@@ -304,12 +518,13 @@ func (h *Handler) handleResponsesNonStream(
 			return
 		}
 		responseID, _ := completedResponse["id"].(string)
-		if store && h != nil && strings.TrimSpace(responseID) != "" {
-			if !h.retainNativeResponseBinding(responseID, headers) && h.responsesState != nil {
-				h.responsesState.putCompleted(responseID, requestPayload, completedResponse)
+		if store && h != nil && responseID != "" {
+			claim := h.retainNativeResponseOwner(responseID, headers, responseOwner)
+			if !claim.retained() && claim != ownerClaimConflict {
+				h.retainLocalResponseSnapshot(responseID, headers, responseOwner, stateRequestPayload, completedResponse)
 			}
 		}
-		if conversation != nil && !conversation.native && strings.TrimSpace(conversation.id) != "" {
+		if conversation != nil && !conversation.native && conversation.id != "" {
 			rawResponse, err = json.Marshal(completedResponse)
 			if err != nil {
 				writeError(w, http.StatusInternalServerError, "failed to prepare response", "internal_error")
@@ -329,6 +544,7 @@ func (h *Handler) handleResponsesNonStream(
 		writeError(w, http.StatusInternalServerError, "failed to prepare response", "internal_error")
 		return
 	}
+	completeSyntheticResponsesEnvelope(completedResponse, responseRequestPayload, true)
 	attachResponsesConversation(completedResponse, conversation)
 	if err := h.appendResponsesConversation(conversation, completedResponse); err != nil {
 		conversationID := ""
@@ -339,7 +555,7 @@ func (h *Handler) handleResponsesNonStream(
 		return
 	}
 	if store && h != nil && h.responsesState != nil && resp != nil {
-		h.responsesState.putCompleted(resp.ID, requestPayload, completedResponse)
+		h.retainLocalResponseSnapshot(resp.ID, headers, responseOwner, stateRequestPayload, completedResponse)
 	}
 	writeJSON(w, status, completedResponse)
 }
@@ -377,9 +593,16 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 	}
 	resolvedPayload := conversationPayload
 	resolvedReq := responsesReq
+	var continuationBinding responseBinding
+	continuationBound := false
 	if conversation == nil || !conversation.native {
-		resolvedPayload, err = h.resolveResponsesHTTPPayload(conversationPayload)
+		resolvedPayload, continuationBinding, continuationBound, err = h.resolveResponsesHTTPPayload(r, conversationPayload)
 		if err != nil {
+			var bindingErr *responseBindingResolutionError
+			if errors.As(err, &bindingErr) {
+				writeResponseBindingResolutionError(w, bindingErr)
+				return
+			}
 			writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 			return
 		}
@@ -410,11 +633,65 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 	}
 	if conversation != nil && conversation.native {
 		chatReq.Header.Set("X-LunarGate-Provider", conversation.nativeBinding.Provider)
+		chatReq = chatReq.WithContext(routing.WithPinnedProviderProtocol(
+			chatReq.Context(),
+			routing.Target{
+				Provider:            conversation.nativeBinding.Provider,
+				UpstreamRequestType: requestTypeResponses,
+			},
+		))
+		if matched, available := h.nativeConversationResponsesTargetAvailable(
+			chatReq,
+			unifiedReq,
+			conversation.nativeBinding.Provider,
+		); matched && !available {
+			requestErr := nativeResponsesConversationUnsupportedError(conversation.nativeBinding.Provider)
+			writeErrorDetail(
+				w,
+				http.StatusBadRequest,
+				requestErr.message,
+				"invalid_request_error",
+				&requestErr.param,
+				&requestErr.code,
+			)
+			return
+		}
+	} else if continuationBound {
+		chatReq.Header.Set("X-LunarGate-Provider", continuationBinding.Provider)
+		if continuationBinding.Route != "" {
+			chatReq.Header.Set("X-LunarGate-Route", continuationBinding.Route)
+		}
+		if continuationBinding.Model != "" {
+			chatReq.Header.Set("X-LunarGate-Model", continuationBinding.Model)
+		}
+		chatReq = chatReq.WithContext(routing.WithPinnedTarget(
+			chatReq.Context(),
+			continuationBinding.Route,
+			routing.Target{
+				Provider:            continuationBinding.Provider,
+				Model:               continuationBinding.Model,
+				UpstreamRequestType: continuationBinding.UpstreamRequestType,
+			},
+		))
 	}
 
 	if unifiedReq.Stream {
-		h.handleResponsesStream(w, chatReq, resolvedPayload, responsesReq.Store == nil || *responsesReq.Store, conversation)
+		h.handleResponsesStream(
+			w,
+			chatReq,
+			resolvedPayload,
+			requestPayload,
+			responsesReq.Store == nil || *responsesReq.Store,
+			conversation,
+		)
 		return
 	}
-	h.handleResponsesNonStream(w, chatReq, resolvedPayload, responsesReq.Store == nil || *responsesReq.Store, conversation)
+	h.handleResponsesNonStream(
+		w,
+		chatReq,
+		resolvedPayload,
+		requestPayload,
+		responsesReq.Store == nil || *responsesReq.Store,
+		conversation,
+	)
 }

@@ -76,8 +76,11 @@ func TestResponsesStreamProxy_MapsIncompleteFinishReasons(t *testing.T) {
 			if details == nil || details["reason"] != tc.wantReason {
 				t.Fatalf("incomplete_details = %#v, want reason %q", details, tc.wantReason)
 			}
-			if incompleteResponse["output_text"] != "partial answer" {
-				t.Fatalf("output_text = %#v, want partial answer", incompleteResponse["output_text"])
+			if got := responsesTextFromMapForTest(incompleteResponse); got != "partial answer" {
+				t.Fatalf("output text = %q, want partial answer", got)
+			}
+			if _, exists := incompleteResponse["output_text"]; exists {
+				t.Fatalf("incomplete response exposed SDK-only output_text: %#v", incompleteResponse)
 			}
 			usage, _ := incompleteResponse["usage"].(map[string]interface{})
 			if usage == nil || usage["input_tokens"] != float64(7) || usage["output_tokens"] != float64(5) || usage["total_tokens"] != float64(12) {

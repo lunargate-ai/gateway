@@ -2,14 +2,18 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/lunargate-ai/gateway/internal/config"
 )
 
 func TestTrackedFlusherPropagatesNativeResponsesFlushError(t *testing.T) {
@@ -105,8 +109,9 @@ func TestResponsesNativeStreamProxiesEnvelopeAndStoresTerminalState(t *testing.T
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
 	}
-	if got := recorder.Body.String(); got != rawStream {
-		t.Fatalf("native SSE changed\n got: %q\nwant: %q", got, rawStream)
+	wantStream := strings.TrimSuffix(rawStream, ": trailing comment\n\n")
+	if got := recorder.Body.String(); got != wantStream {
+		t.Fatalf("native SSE through first terminal changed\n got: %q\nwant: %q", got, wantStream)
 	}
 	if got := recorder.Header().Get("X-OpenAI-Request-ID"); got != "stream-request-id" {
 		t.Fatalf("safe request header = %q", got)
@@ -160,7 +165,7 @@ func TestResponsesNativeStreamAttachesLocalConversationBeforeStateUpdate(t *test
 	createdFrame := strings.Join([]string{
 		"event: response.created\r\n",
 		"id: upstream-created-event\r\n",
-		`data: {"type":"response.created","response":{"id":"` + responseID + `","object":"response","status":"in_progress","model":"gpt-5.4","output":[]}}` + "\r\n\r\n",
+		`data: {"type":"response.created","sequence_number":0,"response":{"id":"` + responseID + `","object":"response","status":"in_progress","model":"gpt-5.4","output":[]}}` + "\r\n\r\n",
 	}, "")
 	terminalFrame := strings.Join([]string{
 		"event: response.completed\r\n",
@@ -319,7 +324,7 @@ func TestResponsesNativeStreamDoesNotStoreNonCompletedTerminalAsCompleted(t *tes
 		t.Run(testCase.status, func(t *testing.T) {
 			responseID := "resp_" + testCase.status
 			rawStream := fmt.Sprintf(
-				"event: %s\ndata: {\"type\":%q,\"response\":{\"id\":%q,\"object\":\"response\",\"status\":%q,\"model\":\"gpt-5.4\",\"output\":[],\"future_terminal_field\":true}}\n\n",
+				"event: %s\ndata: {\"type\":%q,\"sequence_number\":0,\"response\":{\"id\":%q,\"object\":\"response\",\"status\":%q,\"model\":\"gpt-5.4\",\"output\":[],\"future_terminal_field\":true}}\n\n",
 				testCase.eventType,
 				testCase.eventType,
 				responseID,
@@ -353,12 +358,12 @@ func TestResponsesNativeStreamDoesNotStoreNonCompletedTerminalAsCompleted(t *tes
 	}
 }
 
-func TestResponsesNativeStreamPrematureEOFDoesNotAppendSyntheticEvents(t *testing.T) {
+func TestResponsesNativeStreamPrematureEOFEmitsFailedTerminal(t *testing.T) {
 	rawStream := strings.Join([]string{
 		`event: response.created` + "\n",
-		`data: {"type":"response.created","response":{"id":"resp_early_eof","object":"response","status":"in_progress","model":"gpt-5.4","output":[]}}` + "\n\n",
+		`data: {"type":"response.created","sequence_number":7,"response":{"id":"resp_early_eof","object":"response","created_at":1788372000,"status":"in_progress","model":"gpt-5.4","output":[],"parallel_tool_calls":true,"tool_choice":"auto","tools":[]}}` + "\n\n",
 		`event: response.output_text.delta` + "\n",
-		`data: {"type":"response.output_text.delta","response_id":"resp_early_eof","delta":"partial"}` + "\n\n",
+		`data: {"type":"response.output_text.delta","sequence_number":8,"response_id":"resp_early_eof","delta":"partial"}` + "\n\n",
 	}, "")
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -378,10 +383,155 @@ func TestResponsesNativeStreamPrematureEOFDoesNotAppendSyntheticEvents(t *testin
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want already-sent 200; body=%s", recorder.Code, recorder.Body.String())
 	}
-	if got := recorder.Body.String(); got != rawStream {
-		t.Fatalf("premature stream was rewritten or received a synthetic event\n got: %q\nwant: %q", got, rawStream)
+	body := recorder.Body.String()
+	if !strings.HasPrefix(body, rawStream) {
+		t.Fatalf("premature stream prefix changed\n got: %q\nwant prefix: %q", body, rawStream)
+	}
+	if got := strings.Count(body, "event: response.failed\n"); got != 1 {
+		t.Fatalf("response.failed count = %d, want 1; body=%q", got, body)
+	}
+	failedEvent := decodeNativeResponsesSSEEvent(t, body, "response.failed")
+	if len(failedEvent["event_id"]) != 0 {
+		t.Fatalf("response.failed gained non-contract event_id: %s", failedEvent["event_id"])
+	}
+	if got := parseJSONIntegerForTest(t, failedEvent["sequence_number"]); got != 9 {
+		t.Fatalf("failure sequence_number = %d, want 9", got)
+	}
+	var failedResponse map[string]json.RawMessage
+	if err := json.Unmarshal(failedEvent["response"], &failedResponse); err != nil {
+		t.Fatalf("decode failed response: %v", err)
+	}
+	if got := parseJSONStringRaw(failedResponse["id"]); got != "resp_early_eof" {
+		t.Fatalf("failed response id = %q", got)
+	}
+	if got := parseJSONStringRaw(failedResponse["status"]); got != "failed" {
+		t.Fatalf("failed response status = %q", got)
+	}
+	if got := parseJSONStringRaw(failedResponse["model"]); got != "gpt-5.4" {
+		t.Fatalf("failed response model = %q", got)
+	}
+	if string(failedResponse["parallel_tool_calls"]) != "true" ||
+		parseJSONStringRaw(failedResponse["tool_choice"]) != "auto" ||
+		string(failedResponse["tools"]) != "[]" {
+		t.Fatalf("failed response lost required response fields: %s", failedEvent["response"])
+	}
+	var failure map[string]string
+	if err := json.Unmarshal(failedResponse["error"], &failure); err != nil {
+		t.Fatalf("decode failure detail: %v", err)
+	}
+	if failure["code"] != "server_error" || failure["message"] == "" {
+		t.Fatalf("failure detail = %#v", failure)
 	}
 	if _, _, stored := handler.responsesState.getCompleted("resp_early_eof"); stored {
 		t.Fatal("premature stream was stored as completed")
 	}
 }
+
+func TestResponsesNativeStreamReadErrorEmitsFailedTerminal(t *testing.T) {
+	rawBeforeDone := "event: response.created\n" +
+		"data: {\"type\":\"response.created\",\"sequence_number\":3,\"response\":{\"id\":\"resp_read_error\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"gpt-5.4\",\"output\":[]}}\n\n"
+	// An upstream client/body deadline is a provider-side read failure while the
+	// inbound request context remains live, so it must still reach the client.
+	upstreamErr := context.DeadlineExceeded
+
+	handler, cache := newNativeContinuationTestHandler(t, "http://native-read-error.invalid/v1", requestTypeResponses)
+	defer cache.Stop()
+	providerConfig := config.ProviderConfig{
+		Type:    "openai",
+		APIKey:  "dummy",
+		BaseURL: "http://native-read-error.invalid/v1",
+	}
+	handler.UpdateProviderConfigs(map[string]config.ProviderConfig{"openai": providerConfig})
+	clientConfig, ok := handler.providerClients.Get("openai")
+	if !ok {
+		t.Fatal("provider client config was not installed")
+	}
+	clientConfig.client.Transport = nativeStreamRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body: &nativeStreamReadErrorBody{
+				reader: strings.NewReader(rawBeforeDone),
+				err:    upstreamErr,
+			},
+			Request: request,
+		}, nil
+	})
+
+	recorder := httptest.NewRecorder()
+	handler.Responses(recorder, httptest.NewRequest(
+		http.MethodPost,
+		"/v1/responses",
+		strings.NewReader(`{"model":"gpt-5.4","input":"hello","stream":true}`),
+	))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want already-sent 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := recorder.Body.String()
+	if !strings.HasPrefix(body, rawBeforeDone) {
+		t.Fatalf("forwarded prefix changed: %q", body)
+	}
+	if strings.Count(body, "event: response.failed\n") != 1 {
+		t.Fatalf("expected exactly one failure: %q", body)
+	}
+	if _, _, stored := handler.responsesState.getCompleted("resp_read_error"); stored {
+		t.Fatal("synthetic native failure was retained as provider lifecycle state")
+	}
+	if _, stored := handler.responseBindings.get("resp_read_error"); stored {
+		t.Fatal("synthetic native failure retained an owner binding")
+	}
+}
+
+func TestResponsesNativeStreamCancellationDoesNotWriteFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	recorder := httptest.NewRecorder()
+	proxy := newResponsesStreamProxy(recorder)
+	proxy.enableNativePassthrough()
+	proxy.requestContext = ctx
+	rawFrame := []byte("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_cancelled\",\"status\":\"in_progress\"}}\n\n")
+	if _, err := proxy.Write(rawFrame); err != nil {
+		t.Fatalf("write initial frame: %v", err)
+	}
+	cancel()
+	proxy.RecordStreamError(fmt.Errorf("native SSE read error: %w", errors.New("connection closed")))
+	if err := proxy.finalize(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("finalize error = %v, want context.Canceled", err)
+	}
+	if got := recorder.Body.String(); got != string(rawFrame) {
+		t.Fatalf("canceled stream received synthetic output: %q", got)
+	}
+}
+
+type nativeStreamReadErrorBody struct {
+	reader *strings.Reader
+	err    error
+}
+
+func (b *nativeStreamReadErrorBody) Read(payload []byte) (int, error) {
+	if b.reader != nil && b.reader.Len() > 0 {
+		return b.reader.Read(payload)
+	}
+	return 0, b.err
+}
+
+func (b *nativeStreamReadErrorBody) Close() error { return nil }
+
+type nativeStreamRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f nativeStreamRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+func parseJSONIntegerForTest(t *testing.T, raw json.RawMessage) int64 {
+	t.Helper()
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var value interface{}
+	if err := decoder.Decode(&value); err != nil {
+		t.Fatalf("decode integer: %v", err)
+	}
+	return nativeResponsesInteger(value)
+}
+
+var _ io.ReadCloser = (*nativeStreamReadErrorBody)(nil)

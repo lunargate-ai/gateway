@@ -7,9 +7,6 @@ import (
 	"net/url"
 	"sort"
 	"strings"
-
-	"github.com/go-chi/chi/v5"
-	"github.com/rs/zerolog/log"
 )
 
 type chatCompletionBindingResolutionError struct {
@@ -105,19 +102,29 @@ func (h *Handler) retainNativeChatCompletionBinding(
 	}
 	binding.Route = strings.TrimSpace(headers.Get("X-LunarGate-Route"))
 	binding.Model = strings.TrimSpace(headers.Get("X-LunarGate-Model"))
-	return h.chatCompletionBindings.put(completionID, binding)
+	return h.chatCompletionBindings.claim(completionID, binding).retained()
 }
 
 func (h *Handler) boundChatCompletionBinding(r *http.Request, completionID string) (chatCompletionBinding, bool, error) {
 	if h == nil || h.chatCompletionBindings == nil {
 		return chatCompletionBinding{}, false, nil
 	}
-	binding, ok := h.chatCompletionBindings.get(completionID)
-	if !ok {
+	requestedProvider := strings.TrimSpace(r.Header.Get("X-LunarGate-Provider"))
+	binding, lookup := h.chatCompletionBindings.lookup(completionID)
+	if lookup == ownerLookupConflict {
+		if requestedProvider != "" {
+			return chatCompletionBinding{}, false, nil
+		}
+		return chatCompletionBinding{}, false, chatCompletionBindingError(
+			fmt.Sprintf("chat completion %q has conflicting provider ownership", completionID),
+			"completion_id",
+			"provider_binding_conflict",
+		)
+	}
+	if lookup != ownerLookupBound {
 		return chatCompletionBinding{}, false, nil
 	}
 
-	requestedProvider := strings.TrimSpace(r.Header.Get("X-LunarGate-Provider"))
 	if requestedProvider != "" && requestedProvider != binding.Provider {
 		return chatCompletionBinding{}, false, chatCompletionBindingError(
 			fmt.Sprintf("chat completion %q belongs to provider %q, not %q", completionID, binding.Provider, requestedProvider),
@@ -196,6 +203,9 @@ func (h *Handler) chatCompletionListBinding(r *http.Request) (chatCompletionBind
 // ListStoredChatCompletions proxies the native stored Chat Completions list
 // to one explicitly and deterministically selected OpenAI provider account.
 func (h *Handler) ListStoredChatCompletions(w http.ResponseWriter, r *http.Request) {
+	if _, validAfter := clientOptionalResourceID(w, r.URL.Query().Get("after"), "after"); !validAfter {
+		return
+	}
 	body, ok := readResponseOperationBody(w, r)
 	if !ok {
 		return
@@ -205,7 +215,7 @@ func (h *Handler) ListStoredChatCompletions(w http.ResponseWriter, r *http.Reque
 		writeChatCompletionBindingResolutionError(w, err)
 		return
 	}
-	h.proxyChatCompletionLifecycleRequest(w, r, binding, http.MethodGet, "chat/completions", body, false, "")
+	h.proxyChatCompletionLifecycleRequest(w, r, binding, http.MethodGet, "chat/completions", body, false, "", "")
 }
 
 // RetrieveStoredChatCompletion proxies a stored Chat Completion lookup to its
@@ -239,7 +249,15 @@ func (h *Handler) handleChatCompletionIDRequest(
 	suffix string,
 	deleteBindingOnSuccess bool,
 ) {
-	completionID := strings.TrimSpace(chi.URLParam(r, "completion_id"))
+	completionID, validID := clientURLResourceID(w, r, "completion_id")
+	if !validID {
+		return
+	}
+	if suffix == "/messages" {
+		if _, validAfter := clientOptionalResourceID(w, r.URL.Query().Get("after"), "after"); !validAfter {
+			return
+		}
+	}
 	body, ok := readResponseOperationBody(w, r)
 	if !ok {
 		return
@@ -263,7 +281,7 @@ func (h *Handler) handleChatCompletionIDRequest(
 	}
 
 	path := "chat/completions/" + url.PathEscape(completionID) + suffix
-	h.proxyChatCompletionLifecycleRequest(w, r, binding, method, path, body, deleteBindingOnSuccess, completionID)
+	h.proxyChatCompletionLifecycleRequest(w, r, binding, method, path, body, deleteBindingOnSuccess, completionID, suffix)
 }
 
 func (h *Handler) proxyChatCompletionLifecycleRequest(
@@ -275,6 +293,7 @@ func (h *Handler) proxyChatCompletionLifecycleRequest(
 	body []byte,
 	deleteBindingOnSuccess bool,
 	completionID string,
+	suffix string,
 ) {
 	rawQuery := ""
 	if r != nil && r.URL != nil {
@@ -289,14 +308,35 @@ func (h *Handler) proxyChatCompletionLifecycleRequest(
 	}
 	response, err := h.nativeResponseRequest(r.Context(), method, responseBinding, path, rawQuery, body, r.Header)
 	if err != nil {
-		log.Error().Err(err).Str("provider", binding.Provider).Msg("native Chat Completions lifecycle request failed")
-		writeError(w, http.StatusBadGateway, "upstream Chat Completions provider request failed", "provider_error")
+		writeNativeLifecycleTransportError(
+			w,
+			r.Context(),
+			binding.Provider,
+			err,
+			"native Chat Completions lifecycle request failed",
+			"upstream Chat Completions provider request failed",
+		)
 		return
 	}
-	if deleteBindingOnSuccess && response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
-		h.chatCompletionBindings.delete(completionID)
+	contract := nativeResponseBodyContract{}
+	if completionID != "" && suffix == "" {
+		contract = nativeResponseBodyContract{
+			expectedID:     completionID,
+			expectedObject: "chat.completion",
+			requireID:      true,
+			requireJSON:    true,
+		}
+		if deleteBindingOnSuccess {
+			contract.expectedObject = "chat.completion.deleted"
+			contract.requireDeleted = true
+			contract.onValidated = func() {
+				if h != nil && h.chatCompletionBindings != nil {
+					h.chatCompletionBindings.deleteIfOwned(completionID, binding)
+				}
+			}
+		}
 	}
-	h.proxyNativeResponse(w, r, responseBinding, response)
+	h.proxyNativeResponseWithContract(w, r, responseBinding, response, contract)
 }
 
 func chatCompletionBindingError(message string, param string, code string) error {

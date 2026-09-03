@@ -3,6 +3,9 @@ package api
 import (
 	"container/list"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +16,7 @@ import (
 const (
 	defaultChatCompletionBindingMaxEntries = 1000
 	defaultChatCompletionBindingMaxBytes   = 1 << 20
+	maxChatCompletionIDCaptureBytes        = 16 << 20
 )
 
 // chatCompletionBinding identifies the configured provider account that owns
@@ -38,6 +42,7 @@ type chatCompletionBindingStore struct {
 
 type chatCompletionBindingEntry struct {
 	binding   chatCompletionBinding
+	ambiguous bool
 	expiresAt time.Time
 	size      int
 	element   *list.Element
@@ -57,13 +62,102 @@ func newChatCompletionBindingStore(ttl time.Duration) *chatCompletionBindingStor
 	}
 }
 
-func (s *chatCompletionBindingStore) put(completionID string, binding chatCompletionBinding) bool {
-	completionID = strings.TrimSpace(completionID)
+func (s *chatCompletionBindingStore) claim(completionID string, binding chatCompletionBinding) ownerClaimResult {
+	binding = normalizeChatCompletionBinding(binding)
+	if s == nil || !validOpaqueResourceID(completionID) || binding.Provider == "" || binding.AccountFingerprint == "" || s.maxEntries <= 0 {
+		return ownerClaimUnavailable
+	}
+	size := chatCompletionBindingSize(completionID, binding)
+	if size > s.maxBytes {
+		return ownerClaimUnavailable
+	}
+
+	now := s.currentTime()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanupExpiredLocked(now)
+	if existing := s.entries[completionID]; existing != nil {
+		if existing.ambiguous {
+			existing.expiresAt = now.Add(s.ttl)
+			s.order.MoveToBack(existing.element)
+			return ownerClaimConflict
+		}
+		if sameChatCompletionBindingOwner(existing.binding, binding) {
+			existing.expiresAt = now.Add(s.ttl)
+			s.order.MoveToBack(existing.element)
+			return ownerClaimRefreshed
+		}
+		s.markConflictLocked(completionID, existing, now)
+		return ownerClaimConflict
+	}
+	for len(s.entries) >= s.maxEntries || s.totalBytes+size > s.maxBytes {
+		if !s.removeOldestLocked() {
+			return ownerClaimUnavailable
+		}
+	}
+	element := s.order.PushBack(completionID)
+	s.entries[completionID] = &chatCompletionBindingEntry{
+		binding:   binding,
+		expiresAt: now.Add(s.ttl),
+		size:      size,
+		element:   element,
+	}
+	s.totalBytes += size
+	return ownerClaimed
+}
+
+func normalizeChatCompletionBinding(binding chatCompletionBinding) chatCompletionBinding {
 	binding.Provider = strings.TrimSpace(binding.Provider)
 	binding.Route = strings.TrimSpace(binding.Route)
 	binding.Model = strings.TrimSpace(binding.Model)
 	binding.AccountFingerprint = strings.TrimSpace(binding.AccountFingerprint)
-	if s == nil || completionID == "" || binding.Provider == "" || binding.AccountFingerprint == "" || s.maxEntries <= 0 {
+	return binding
+}
+
+func sameChatCompletionBindingOwner(first, second chatCompletionBinding) bool {
+	return first.Provider == second.Provider && first.AccountFingerprint == second.AccountFingerprint
+}
+
+func (s *chatCompletionBindingStore) markConflictLocked(
+	completionID string,
+	entry *chatCompletionBindingEntry,
+	now time.Time,
+) {
+	if entry == nil {
+		return
+	}
+	tombstoneSize := len(completionID)
+	s.totalBytes += tombstoneSize - entry.size
+	entry.binding = chatCompletionBinding{}
+	entry.ambiguous = true
+	entry.expiresAt = now.Add(s.ttl)
+	entry.size = tombstoneSize
+	s.order.MoveToBack(entry.element)
+}
+
+func (s *chatCompletionBindingStore) lookup(completionID string) (chatCompletionBinding, ownerLookupResult) {
+	if s == nil || !validOpaqueResourceID(completionID) {
+		return chatCompletionBinding{}, ownerLookupMissing
+	}
+
+	now := s.currentTime()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanupExpiredLocked(now)
+	entry := s.entries[completionID]
+	if entry == nil {
+		return chatCompletionBinding{}, ownerLookupMissing
+	}
+	s.order.MoveToBack(entry.element)
+	if entry.ambiguous {
+		return chatCompletionBinding{}, ownerLookupConflict
+	}
+	return entry.binding, ownerLookupBound
+}
+
+func (s *chatCompletionBindingStore) put(completionID string, binding chatCompletionBinding) bool {
+	binding = normalizeChatCompletionBinding(binding)
+	if s == nil || !validOpaqueResourceID(completionID) || binding.Provider == "" || binding.AccountFingerprint == "" || s.maxEntries <= 0 {
 		return false
 	}
 
@@ -97,26 +191,16 @@ func (s *chatCompletionBindingStore) put(completionID string, binding chatComple
 }
 
 func (s *chatCompletionBindingStore) get(completionID string) (chatCompletionBinding, bool) {
-	completionID = strings.TrimSpace(completionID)
-	if s == nil || completionID == "" {
-		return chatCompletionBinding{}, false
-	}
-
-	now := s.currentTime()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.cleanupExpiredLocked(now)
-	entry := s.entries[completionID]
-	if entry == nil {
-		return chatCompletionBinding{}, false
-	}
-	s.order.MoveToBack(entry.element)
-	return entry.binding, true
+	binding, result := s.lookup(completionID)
+	return binding, result == ownerLookupBound
 }
 
-func (s *chatCompletionBindingStore) delete(completionID string) bool {
-	completionID = strings.TrimSpace(completionID)
-	if s == nil || completionID == "" {
+// deleteIfOwned removes a binding only when it still belongs to the account
+// observed before an upstream operation. In particular, it must not erase a
+// conflict tombstone installed while that operation was in flight.
+func (s *chatCompletionBindingStore) deleteIfOwned(completionID string, binding chatCompletionBinding) bool {
+	binding = normalizeChatCompletionBinding(binding)
+	if s == nil || !validOpaqueResourceID(completionID) || binding.Provider == "" || binding.AccountFingerprint == "" {
 		return false
 	}
 
@@ -125,7 +209,7 @@ func (s *chatCompletionBindingStore) delete(completionID string) bool {
 	defer s.mu.Unlock()
 	s.cleanupExpiredLocked(now)
 	entry := s.entries[completionID]
-	if entry == nil {
+	if entry == nil || entry.ambiguous || !sameChatCompletionBindingOwner(entry.binding, binding) {
 		return false
 	}
 	s.removeLocked(completionID, entry)
@@ -184,6 +268,7 @@ func chatCompletionBindingSize(completionID string, binding chatCompletionBindin
 // to a provider account.
 type chatCompletionStreamBindingCandidate struct {
 	id           string
+	invalid      bool
 	inconsistent bool
 }
 
@@ -191,19 +276,30 @@ func (c *chatCompletionStreamBindingCandidate) observe(chunk *models.StreamChunk
 	if c == nil || chunk == nil {
 		return
 	}
-	id := strings.TrimSpace(chunk.ID)
+	id := chunk.ID
 	if len(chunk.RawJSON) > 0 {
-		var envelope struct {
-			ID string `json:"id"`
+		var envelope map[string]json.RawMessage
+		if err := json.Unmarshal(chunk.RawJSON, &envelope); err != nil || envelope == nil {
+			c.invalid = true
+			return
 		}
-		if err := json.Unmarshal(chunk.RawJSON, &envelope); err == nil {
+		rawID, present := envelope["id"]
+		if !present {
 			// Native stream normalization may synthesize or stabilize the typed
-			// ID. Lifecycle binding must use the ID actually supplied by the
-			// upstream account, never that client-facing normalization.
-			id = strings.TrimSpace(envelope.ID)
+			// ID. Lifecycle binding must use only the ID actually supplied by the
+			// upstream account.
+			return
+		}
+		if err := json.Unmarshal(rawID, &id); err != nil || !validOpaqueResourceID(id) {
+			c.invalid = true
+			return
 		}
 	}
 	if id == "" {
+		return
+	}
+	if !validOpaqueResourceID(id) {
+		c.invalid = true
 		return
 	}
 	if c.id == "" {
@@ -216,8 +312,124 @@ func (c *chatCompletionStreamBindingCandidate) observe(chunk *models.StreamChunk
 }
 
 func (c chatCompletionStreamBindingCandidate) completionID() string {
-	if c.inconsistent {
+	if c.invalid || c.inconsistent {
 		return ""
 	}
 	return c.id
+}
+
+// chatCompletionResponseIDCapture observes the original non-stream upstream
+// document while the provider parser consumes it. This keeps a synthetic ID
+// added by compatibility normalization out of the lifecycle binding store.
+// The bound mirrors the provider response-body limit and fails closed if that
+// limit is ever exceeded or the original document is not valid JSON.
+type chatCompletionResponseIDCapture struct {
+	body      io.ReadCloser
+	captured  []byte
+	truncated bool
+}
+
+func newChatCompletionResponseIDCapture(body io.ReadCloser) *chatCompletionResponseIDCapture {
+	if body == nil {
+		return nil
+	}
+	return &chatCompletionResponseIDCapture{body: body}
+}
+
+func (c *chatCompletionResponseIDCapture) Read(p []byte) (int, error) {
+	if c == nil || c.body == nil {
+		return 0, io.EOF
+	}
+	n, err := c.body.Read(p)
+	if n <= 0 {
+		return n, err
+	}
+	remaining := maxChatCompletionIDCaptureBytes - len(c.captured)
+	if remaining > 0 {
+		captureBytes := n
+		if captureBytes > remaining {
+			captureBytes = remaining
+		}
+		c.captured = append(c.captured, p[:captureBytes]...)
+	}
+	if n > remaining {
+		c.truncated = true
+	}
+	return n, err
+}
+
+func (c *chatCompletionResponseIDCapture) Close() error {
+	if c == nil || c.body == nil {
+		return nil
+	}
+	return c.body.Close()
+}
+
+func (c *chatCompletionResponseIDCapture) completionID() string {
+	if c == nil || c.truncated || len(c.captured) == 0 {
+		return ""
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(c.captured, &envelope); err != nil || envelope == nil {
+		return ""
+	}
+	rawID, idPresent := envelope["id"]
+	rawObject, objectPresent := envelope["object"]
+	if !idPresent || !objectPresent {
+		return ""
+	}
+	var id string
+	if err := json.Unmarshal(rawID, &id); err != nil || !validOpaqueResourceID(id) {
+		return ""
+	}
+	var object string
+	if err := json.Unmarshal(rawObject, &object); err != nil || object != "chat.completion" {
+		return ""
+	}
+	return id
+}
+
+// storedChatCompletionStreamTranslator validates the upstream resource ID
+// before the streaming layer commits its first downstream byte. It is used
+// only for store:true Chat-to-Chat requests whose provider enables lifecycle
+// operations; compatibility normalization remains available elsewhere.
+type storedChatCompletionStreamTranslator struct {
+	models.ProviderTranslator
+	completionID string
+}
+
+func (t *storedChatCompletionStreamTranslator) ParseStreamChunk(data []byte) (*models.StreamChunk, error) {
+	if t == nil || t.ProviderTranslator == nil {
+		return nil, errors.New("stored Chat Completion stream translator is unavailable")
+	}
+	chunk, err := t.ProviderTranslator.ParseStreamChunk(data)
+	if err != nil || chunk == nil {
+		return chunk, err
+	}
+
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(chunk.RawJSON, &envelope); err != nil || envelope == nil {
+		return nil, errors.New("stored Chat Completion stream requires a JSON object")
+	}
+	rawID, present := envelope["id"]
+	if !present {
+		return nil, errors.New("stored Chat Completion stream requires a non-empty string id")
+	}
+	var completionID string
+	if err := json.Unmarshal(rawID, &completionID); err != nil || !validOpaqueResourceID(completionID) {
+		return nil, errors.New("stored Chat Completion stream requires a non-empty string id without surrounding whitespace")
+	}
+	rawObject, present := envelope["object"]
+	if !present {
+		return nil, errors.New("stored Chat Completion stream requires object=chat.completion.chunk")
+	}
+	var object string
+	if err := json.Unmarshal(rawObject, &object); err != nil || object != "chat.completion.chunk" {
+		return nil, errors.New("stored Chat Completion stream requires object=chat.completion.chunk")
+	}
+	if t.completionID != "" && completionID != t.completionID {
+		return nil, fmt.Errorf("stored Chat Completion stream changed id from %q to %q", t.completionID, completionID)
+	}
+	t.completionID = completionID
+	return chunk, nil
 }

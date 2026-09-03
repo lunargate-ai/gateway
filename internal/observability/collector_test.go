@@ -282,6 +282,107 @@ func TestCollectorClient_StopDrainsQueuedByteAccounting(t *testing.T) {
 	}
 }
 
+func TestCollectorClient_StopFlushesPendingPayloads(t *testing.T) {
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) == 1 {
+			close(firstStarted)
+			<-releaseFirst
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+	defer closeCollectorSignal(releaseFirst)
+
+	client := NewCollectorClient(config.GeneralConfig{
+		APIKey:     "collector-secret",
+		BackendURL: server.URL,
+	}, config.DataSharingConfig{Enabled: true}, "test")
+	client.Enqueue(context.Background(), "active", []Event{{Type: "metric"}})
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for active collector request")
+	}
+	client.Enqueue(context.Background(), "queued", []Event{{Type: "metric"}})
+
+	stopped := make(chan struct{})
+	go func() {
+		client.Stop()
+		close(stopped)
+	}()
+	waitForCollectorStopToStart(t, client)
+	close(releaseFirst)
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("collector Stop did not finish after flushing")
+	}
+
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("collector requests = %d, want 2 flushed payloads", got)
+	}
+	if got := client.stopDropItems.Load(); got != 0 {
+		t.Fatalf("dropped payloads = %d, want 0", got)
+	}
+	if got := client.queuedPayloadBytes(); got != 0 {
+		t.Fatalf("queued bytes after stop = %d, want 0", got)
+	}
+}
+
+func TestCollectorClient_StopBoundsFlushAtDeadlineAndCountsDrops(t *testing.T) {
+	requestStarted := make(chan struct{})
+	releaseRequest := make(chan struct{})
+	defer closeCollectorSignal(releaseRequest)
+
+	client := NewCollectorClient(config.GeneralConfig{
+		APIKey:     "collector-secret",
+		BackendURL: "https://collector.example/v1",
+	}, config.DataSharingConfig{Enabled: true}, "test")
+	client.httpClient = &http.Client{Transport: collectorURLRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		close(requestStarted)
+		<-releaseRequest
+		return &http.Response{
+			StatusCode: http.StatusAccepted,
+			Header:     make(http.Header),
+			Body:       http.NoBody,
+		}, nil
+	})}
+	client.stopTimeout = 20 * time.Millisecond
+	client.Enqueue(context.Background(), "active", []Event{{Type: "metric"}})
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for active collector request")
+	}
+	client.Enqueue(context.Background(), "queued", []Event{{Type: "metric"}})
+
+	started := time.Now()
+	client.Stop()
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("collector Stop took %s, want bounded shutdown", elapsed)
+	}
+
+	if got := client.stopDropItems.Load(); got != 2 {
+		t.Fatalf("dropped payloads = %d, want active and queued payload", got)
+	}
+	if got := client.stopDropBytes.Load(); got <= 0 {
+		t.Fatalf("dropped payload bytes = %d, want positive accounting", got)
+	}
+	if got := client.queuedPayloadBytes(); got != 0 {
+		t.Fatalf("queued bytes after timeout = %d, want 0", got)
+	}
+
+	close(releaseRequest)
+	select {
+	case <-client.done:
+	case <-time.After(time.Second):
+		t.Fatal("collector worker did not exit after blocked transport returned")
+	}
+}
+
 func TestCollectorClient_ConcurrentStopLeavesNoQueuedBytes(t *testing.T) {
 	const producers = 256
 	ctx, cancel := context.WithCancel(context.Background())
@@ -317,6 +418,31 @@ func newBoundedTestCollector(capacity int, maxPayloadBytes, maxQueueBytes int64)
 		ctx:             context.Background(),
 		maxPayloadBytes: maxPayloadBytes,
 		maxQueueBytes:   maxQueueBytes,
+	}
+}
+
+func waitForCollectorStopToStart(t *testing.T, client *CollectorClient) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		client.queueMu.Lock()
+		stopped := client.stopped
+		client.queueMu.Unlock()
+		if stopped {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for collector Stop to start")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func closeCollectorSignal(signal chan struct{}) {
+	select {
+	case <-signal:
+	default:
+		close(signal)
 	}
 }
 
@@ -376,7 +502,7 @@ func TestIsRetryableSendError(t *testing.T) {
 	}{
 		{
 			name: "unauthorized is permanent",
-			err:  &httpStatusError{statusCode: http.StatusUnauthorized, detail: "invalid gateway API key"},
+			err:  &httpStatusError{statusCode: http.StatusUnauthorized},
 			want: false,
 		},
 		{

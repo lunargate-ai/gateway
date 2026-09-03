@@ -3,15 +3,16 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/lunargate-ai/gateway/internal/config"
+	"github.com/lunargate-ai/gateway/internal/safeurl"
 )
 
 const defaultUpstreamTimeout = 120 * time.Second
@@ -39,7 +40,7 @@ func buildProviderClients(providerConfigs map[string]config.ProviderConfig) map[
 		}
 		mode := normalizeUpstreamTimeoutMode(providerCfg.TimeoutMode)
 		clients[providerID] = providerClientConfig{
-			client:  newProviderHTTPClient(timeout),
+			client:  newProviderHTTPClient(),
 			timeout: timeout,
 			mode:    mode,
 		}
@@ -58,40 +59,82 @@ func normalizeUpstreamTimeoutMode(mode string) string {
 	}
 }
 
-func wrapBodyWithTTFTTimeout(body io.ReadCloser, timeout time.Duration) io.ReadCloser {
-	if body == nil || timeout <= 0 {
-		return body
+func doProviderRequest(
+	request *http.Request,
+	clientCfg providerClientConfig,
+	provider string,
+	failureAction string,
+) (*http.Response, error) {
+	if request == nil {
+		return nil, fmt.Errorf("%s %s: request is nil", failureAction, provider)
+	}
+	if clientCfg.client == nil {
+		return nil, fmt.Errorf("%s %s: HTTP client is nil", failureAction, provider)
 	}
 
-	wrapped := &timeoutBody{
-		body:       body,
-		timeoutErr: errUpstreamTTFTTimeout,
-		stopOnData: true,
+	timeout := clientCfg.timeout
+	if timeout <= 0 {
+		timeout = defaultUpstreamTimeout
 	}
-	wrapped.timer = time.AfterFunc(timeout, func() {
-		if wrapped.state.CompareAndSwap(timeoutStateWaiting, timeoutStateTimedOut) {
-			_ = wrapped.body.Close()
+	mode := normalizeUpstreamTimeoutMode(clientCfg.mode)
+	parent := request.Context()
+	attempt := newUpstreamTimeoutAttempt(parent, timeout, mode)
+	attemptRequest := request.WithContext(attempt.ctx)
+
+	response, err := clientCfg.client.Do(attemptRequest)
+	if err != nil {
+		timeoutErr := attempt.finish()
+		if response != nil && response.Body != nil {
+			_ = response.Body.Close()
 		}
-	})
-	return wrapped
+		err = safeurl.RedactTransportError(err, attemptRequest.URL)
+		if timeoutErr != nil {
+			return nil, upstreamTimeoutError(mode, provider)
+		}
+		// A parent deadline belongs to the client request, not the provider.
+		// Preserve it so retry and fallback remain terminal for cancellation.
+		if parent.Err() == nil && isHTTPTimeoutError(err) {
+			return nil, upstreamTimeoutError(mode, provider)
+		}
+		return nil, fmt.Errorf("%s %s: %w", failureAction, provider, err)
+	}
+	if response.Request == nil {
+		response.Request = attemptRequest
+	}
+	if response.Body == nil {
+		_ = attempt.finish()
+		return response, nil
+	}
+	wrappedBody := &upstreamTimeoutBody{
+		body:    response.Body,
+		attempt: attempt,
+		mode:    mode,
+	}
+	if attachErr := attempt.attachBody(wrappedBody.closeUnderlying); attachErr != nil {
+		_ = wrappedBody.closeUnderlying()
+		if errors.Is(attachErr, errUpstreamTTFTTimeout) || errors.Is(attachErr, errUpstreamTotalTimeout) {
+			return nil, upstreamTimeoutError(mode, provider)
+		}
+		return nil, fmt.Errorf("%s %s: %w", failureAction, provider, attachErr)
+	}
+	if parentErr := parent.Err(); parentErr != nil {
+		_ = attempt.finish()
+		_ = wrappedBody.closeUnderlying()
+		return nil, fmt.Errorf("%s %s: %w", failureAction, provider, parentErr)
+	}
+	if timeoutErr := attempt.timeoutError(); timeoutErr != nil {
+		_ = wrappedBody.closeUnderlying()
+		return nil, upstreamTimeoutError(mode, provider)
+	}
+	response.Body = wrappedBody
+	return response, nil
 }
 
-func wrapBodyWithTotalTimeout(body io.ReadCloser, timeout time.Duration) io.ReadCloser {
-	if body == nil || timeout <= 0 {
-		return body
+func upstreamTimeoutError(mode string, provider string) error {
+	if mode == upstreamTimeoutModeTotal {
+		return fmt.Errorf("%w: provider %s", errUpstreamTotalTimeout, provider)
 	}
-
-	wrapped := &timeoutBody{
-		body:       body,
-		timeoutErr: errUpstreamTotalTimeout,
-		stopOnData: false,
-	}
-	wrapped.timer = time.AfterFunc(timeout, func() {
-		if wrapped.state.CompareAndSwap(timeoutStateWaiting, timeoutStateTimedOut) {
-			_ = wrapped.body.Close()
-		}
-	})
-	return wrapped
+	return fmt.Errorf("%w: provider %s", errUpstreamTTFTTimeout, provider)
 }
 
 func isUpstreamTTFTTimeout(err error) bool {
@@ -113,47 +156,161 @@ func isHTTPTimeoutError(err error) bool {
 	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
-type timeoutBody struct {
-	body       io.ReadCloser
-	timer      *time.Timer
+type upstreamTimeoutAttempt struct {
+	ctx        context.Context
+	cancel     context.CancelCauseFunc
 	timeoutErr error
-	stopOnData bool
-	state      atomic.Int32
+	timer      *time.Timer
+	closeBody  func() error
+	mu         sync.Mutex
+	state      upstreamTimeoutState
 }
 
+type upstreamTimeoutState uint8
+
 const (
-	timeoutStateWaiting int32 = iota
-	timeoutStateDone
-	timeoutStateTimedOut
+	upstreamTimeoutActive upstreamTimeoutState = iota
+	upstreamTimeoutStopped
+	upstreamTimeoutFinished
+	upstreamTimeoutFired
 )
 
-func (b *timeoutBody) Read(p []byte) (int, error) {
+func newUpstreamTimeoutAttempt(parent context.Context, timeout time.Duration, mode string) *upstreamTimeoutAttempt {
+	ctx, cancel := context.WithCancelCause(parent)
+	attempt := &upstreamTimeoutAttempt{
+		ctx:        ctx,
+		cancel:     cancel,
+		timeoutErr: errUpstreamTTFTTimeout,
+	}
+	if mode == upstreamTimeoutModeTotal {
+		attempt.timeoutErr = errUpstreamTotalTimeout
+	}
+	attempt.timer = time.AfterFunc(timeout, attempt.fire)
+	return attempt
+}
+
+func (a *upstreamTimeoutAttempt) fire() {
+	var closeBody func() error
+	a.mu.Lock()
+	if a.state != upstreamTimeoutActive {
+		a.mu.Unlock()
+		return
+	}
+	a.cancel(a.timeoutErr)
+	if errors.Is(context.Cause(a.ctx), a.timeoutErr) {
+		a.state = upstreamTimeoutFired
+		closeBody = a.closeBody
+	} else {
+		// The parent cancellation won the race. Do not relabel it as a provider
+		// timeout even though this timer callback was also ready to run.
+		a.state = upstreamTimeoutFinished
+	}
+	a.mu.Unlock()
+	if closeBody != nil {
+		_ = closeBody()
+	}
+}
+
+func (a *upstreamTimeoutAttempt) attachBody(closeBody func() error) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	switch a.state {
+	case upstreamTimeoutActive, upstreamTimeoutStopped:
+		a.closeBody = closeBody
+		return nil
+	case upstreamTimeoutFired:
+		return a.timeoutErr
+	default:
+		return context.Cause(a.ctx)
+	}
+}
+
+func (a *upstreamTimeoutAttempt) stopDeadline() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	switch a.state {
+	case upstreamTimeoutActive:
+		a.state = upstreamTimeoutStopped
+		if a.timer != nil {
+			a.timer.Stop()
+		}
+		return nil
+	case upstreamTimeoutFired:
+		return a.timeoutErr
+	default:
+		return nil
+	}
+}
+
+func (a *upstreamTimeoutAttempt) finish() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.state == upstreamTimeoutFired {
+		return a.timeoutErr
+	}
+	if a.state == upstreamTimeoutFinished {
+		return nil
+	}
+	a.state = upstreamTimeoutFinished
+	if a.timer != nil {
+		a.timer.Stop()
+	}
+	a.cancel(nil)
+	return nil
+}
+
+func (a *upstreamTimeoutAttempt) timeoutError() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.state == upstreamTimeoutFired {
+		return a.timeoutErr
+	}
+	return nil
+}
+
+type upstreamTimeoutBody struct {
+	body      io.ReadCloser
+	attempt   *upstreamTimeoutAttempt
+	mode      string
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (b *upstreamTimeoutBody) Read(p []byte) (int, error) {
 	n, err := b.body.Read(p)
 
-	if b.stopOnData && n > 0 {
-		if b.state.CompareAndSwap(timeoutStateWaiting, timeoutStateDone) && b.timer != nil {
-			b.timer.Stop()
-		}
+	var timeoutErr error
+	if b.mode == upstreamTimeoutModeTTFT && n > 0 {
+		timeoutErr = b.attempt.stopDeadline()
 	}
-
 	if err != nil {
-		if b.state.CompareAndSwap(timeoutStateWaiting, timeoutStateDone) && b.timer != nil {
-			b.timer.Stop()
+		if finishErr := b.attempt.finish(); timeoutErr == nil {
+			timeoutErr = finishErr
 		}
 	}
-
-	if b.state.Load() == timeoutStateTimedOut {
-		return 0, b.timeoutErr
+	if timeoutErr == nil {
+		timeoutErr = b.attempt.timeoutError()
 	}
-
+	if timeoutErr != nil {
+		return 0, timeoutErr
+	}
 	return n, err
 }
 
-func (b *timeoutBody) Close() error {
-	if b.state.CompareAndSwap(timeoutStateWaiting, timeoutStateDone) && b.timer != nil {
-		b.timer.Stop()
+func (b *upstreamTimeoutBody) Close() error {
+	timeoutErr := b.attempt.finish()
+	err := b.closeUnderlying()
+	if timeoutErr != nil {
+		return timeoutErr
 	}
-	return b.body.Close()
+	return err
+}
+
+func (b *upstreamTimeoutBody) closeUnderlying() error {
+	b.closeOnce.Do(func() {
+		b.closeErr = b.body.Close()
+	})
+	return b.closeErr
 }
 
 type providerClientRegistry struct {
@@ -208,7 +365,35 @@ func cloneProviderConfigs(providerConfigs map[string]config.ProviderConfig) map[
 	}
 	out := make(map[string]config.ProviderConfig, len(providerConfigs))
 	for providerID, providerCfg := range providerConfigs {
+		if providerCfg.Temperature != nil {
+			value := *providerCfg.Temperature
+			providerCfg.Temperature = &value
+		}
+		if providerCfg.TopP != nil {
+			value := *providerCfg.TopP
+			providerCfg.TopP = &value
+		}
+		if providerCfg.TopK != nil {
+			value := *providerCfg.TopK
+			providerCfg.TopK = &value
+		}
+		if len(providerCfg.Extra) > 0 {
+			providerCfg.Extra = cloneStringMap(providerCfg.Extra)
+		} else {
+			providerCfg.Extra = nil
+		}
+		providerCfg.Models.Static = append([]string(nil), providerCfg.Models.Static...)
+		providerCfg.Capabilities.HostedTools = append([]string(nil), providerCfg.Capabilities.HostedTools...)
+		providerCfg.Capabilities.ReasoningEffortLevels = append([]string(nil), providerCfg.Capabilities.ReasoningEffortLevels...)
 		out[providerID] = providerCfg
 	}
 	return out
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	cloned := make(map[string]string, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
 }

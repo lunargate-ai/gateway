@@ -68,28 +68,28 @@ func (s *responsesStateStore) get(responseID string) (map[string]json.RawMessage
 	return cloneResponsesRawMap(entry.payload), true
 }
 
-func (s *responsesStateStore) put(responseID string, payload map[string]json.RawMessage) {
-	s.putEntry(responseID, payload, nil, nil)
+func (s *responsesStateStore) put(responseID string, payload map[string]json.RawMessage) bool {
+	return s.putEntry(responseID, payload, nil, nil)
 }
 
 func (s *responsesStateStore) putCompleted(
 	responseID string,
 	requestPayload map[string]json.RawMessage,
 	completedResponse map[string]interface{},
-) {
+) bool {
 	if s == nil || responseID == "" || completedResponse == nil {
-		return
+		return false
 	}
 
 	response, err := json.Marshal(completedResponse)
 	if err != nil {
-		return
+		return false
 	}
 	inputItems, err := responsesStateInputItems(responseID, requestPayload["input"])
 	if err != nil {
-		return
+		return false
 	}
-	s.putEntry(
+	return s.putEntry(
 		responseID,
 		withCompletedResponseHistory(requestPayload, completedResponse),
 		response,
@@ -102,9 +102,9 @@ func (s *responsesStateStore) putEntry(
 	payload map[string]json.RawMessage,
 	response json.RawMessage,
 	inputItems []json.RawMessage,
-) {
-	if s == nil || responseID == "" || len(payload) == 0 {
-		return
+) bool {
+	if s == nil || responseID == "" || len(payload) == 0 || s.maxEntries <= 0 || s.maxBytes <= 0 {
+		return false
 	}
 
 	now := time.Now()
@@ -114,7 +114,7 @@ func (s *responsesStateStore) putEntry(
 	clonedInputItems := cloneResponsesRawMessages(inputItems)
 	size := responsesStateEntrySize(responseID, clonedPayload, clonedResponse, clonedInputItems)
 	if size > s.maxBytes {
-		return
+		return false
 	}
 
 	s.mu.Lock()
@@ -125,7 +125,7 @@ func (s *responsesStateStore) putEntry(
 	}
 	for len(s.entries) >= s.maxEntries || s.totalBytes+size > s.maxBytes {
 		if !s.removeOldestLocked() {
-			break
+			return false
 		}
 	}
 	element := s.order.PushBack(responseID)
@@ -138,6 +138,7 @@ func (s *responsesStateStore) putEntry(
 		element:    element,
 	}
 	s.totalBytes += size
+	return true
 }
 
 func (s *responsesStateStore) getCompleted(responseID string) (json.RawMessage, []json.RawMessage, bool) {
@@ -179,6 +180,27 @@ func (s *responsesStateStore) delete(responseID string) bool {
 		return false
 	}
 	if len(entry.response) == 0 {
+		return false
+	}
+	s.removeLocked(responseID, entry)
+	return true
+}
+
+// discard removes any cached continuation state, including incomplete entries.
+// Lifecycle deletion remains stricter and only deletes completed responses.
+func (s *responsesStateStore) discard(responseID string) bool {
+	if s == nil || responseID == "" {
+		return false
+	}
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, ok := s.entries[responseID]
+	if !ok {
+		return false
+	}
+	if now.After(entry.expiresAt) {
+		s.removeLocked(responseID, entry)
 		return false
 	}
 	s.removeLocked(responseID, entry)

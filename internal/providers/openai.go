@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/lunargate-ai/gateway/internal/config"
+	"github.com/lunargate-ai/gateway/internal/safeurl"
 	"github.com/lunargate-ai/gateway/pkg/models"
 	"github.com/rs/zerolog/log"
 )
@@ -36,14 +38,11 @@ func splitThinkTags(s string) (reasoning string, content string, changed bool) {
 		end = start + len(startTag) + end
 
 		inner := content[start+len(startTag) : end]
-		inner = strings.TrimSpace(inner)
 		if inner != "" {
 			if r.Len() > 0 {
 				r.WriteString("\n")
 			}
-			if inner != "" {
-				r.WriteString(inner)
-			}
+			r.WriteString(inner)
 		}
 
 		content = content[:start] + content[end+len(endTag):]
@@ -51,8 +50,7 @@ func splitThinkTags(s string) (reasoning string, content string, changed bool) {
 	}
 
 	if changed {
-		reasoning = strings.TrimSpace(r.String())
-		content = strings.TrimSpace(content)
+		reasoning = r.String()
 	}
 
 	return reasoning, content, changed
@@ -95,9 +93,9 @@ func (t *OpenAITranslator) TranslateRequest(ctx context.Context, req *models.Uni
 	reqCopy := normalizeOpenAICompatibleRequestForProvider(*req, t.cfg)
 	reqCopy.Reasoning = nil
 
-	endpoint := fmt.Sprintf("%s/chat/completions", t.cfg.BaseURL)
+	endpointPath := "chat/completions"
 	if strings.EqualFold(upstreamRequestType, "responses") {
-		endpoint = fmt.Sprintf("%s/responses", t.cfg.BaseURL)
+		endpointPath = "responses"
 	}
 
 	var body []byte
@@ -110,6 +108,10 @@ func (t *OpenAITranslator) TranslateRequest(ctx context.Context, req *models.Uni
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal openai request: %w", err)
 	}
+	endpoint, err := safeurl.JoinHTTPPath(t.cfg.BaseURL, endpointPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build openai endpoint: %w", err)
+	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
@@ -121,6 +123,7 @@ func (t *OpenAITranslator) TranslateRequest(ctx context.Context, req *models.Uni
 	if t.cfg.Organization != "" {
 		httpReq.Header.Set("OpenAI-Organization", t.cfg.Organization)
 	}
+	applyUpstreamRequestHeaders(ctx, httpReq, "Idempotency-Key", "OpenAI-Beta")
 
 	return httpReq, nil
 }
@@ -155,19 +158,19 @@ func openAIChatRequestBody(req *models.UnifiedRequest, cfg config.ProviderConfig
 
 	if req.Stream {
 		setRawJSONValue(payload, "stream", true)
-		streamOptions := make(map[string]interface{})
+		streamOptions := make(map[string]json.RawMessage)
 		if raw := bytes.TrimSpace(payload["stream_options"]); len(raw) > 0 && string(raw) != "null" {
 			if err := json.Unmarshal(raw, &streamOptions); err != nil {
 				return nil, fmt.Errorf("decode stream_options: %w", err)
 			}
 		}
-		streamOptions["include_usage"] = true
+		streamOptions["include_usage"] = json.RawMessage("true")
 		setRawJSONValue(payload, "stream_options", streamOptions)
 	}
 
 	if rawMessages := bytes.TrimSpace(payload["messages"]); len(rawMessages) > 0 {
 		var messages []map[string]interface{}
-		if err := json.Unmarshal(rawMessages, &messages); err != nil {
+		if err := decodeJSONPreserveNumbers(rawMessages, &messages); err != nil {
 			return nil, fmt.Errorf("decode messages: %w", err)
 		}
 		for _, message := range messages {
@@ -255,7 +258,10 @@ func (t *OpenAITranslator) TranslateEmbeddingsRequest(ctx context.Context, req *
 		return nil, fmt.Errorf("failed to marshal openai embeddings request: %w", err)
 	}
 
-	endpoint := fmt.Sprintf("%s/embeddings", t.cfg.BaseURL)
+	endpoint, err := safeurl.JoinHTTPPath(t.cfg.BaseURL, "embeddings")
+	if err != nil {
+		return nil, fmt.Errorf("failed to build openai embeddings endpoint: %w", err)
+	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create openai embeddings http request: %w", err)
@@ -266,6 +272,7 @@ func (t *OpenAITranslator) TranslateEmbeddingsRequest(ctx context.Context, req *
 	if t.cfg.Organization != "" {
 		httpReq.Header.Set("OpenAI-Organization", t.cfg.Organization)
 	}
+	applyUpstreamRequestHeaders(ctx, httpReq, "Idempotency-Key", "OpenAI-Beta")
 
 	return httpReq, nil
 }
@@ -321,7 +328,7 @@ func (t *OpenAITranslator) ParseResponse(resp *http.Response) (*models.UnifiedRe
 		Object string `json:"object"`
 	}
 	_ = json.Unmarshal(body, &envelope)
-	if strings.EqualFold(strings.TrimSpace(envelope.Object), "response") {
+	if envelope.Object == "response" {
 		responsesResp, terminalFailure, err := decodeOpenAIResponsesResponse(body)
 		if err != nil {
 			return nil, fmt.Errorf("failed to unmarshal openai responses object: %w", err)
@@ -338,46 +345,97 @@ func (t *OpenAITranslator) ParseResponse(resp *http.Response) (*models.UnifiedRe
 		result.Choices[0].FinishReason = finishReason
 		return result, nil
 	}
+	if nativeResponsesRequest {
+		return nil, errors.New("native Responses object requires exact object value response")
+	}
 
 	normalizedBody, normalizedEnvelope := normalizeOpenAIChatResponseEnvelope(body, t.DefaultModel())
 	if normalizedEnvelope {
 		body = normalizedBody
 	}
 
+	if t.cfg.ExtractReasoningTags {
+		if normalizedBody, changed := normalizeOpenAIChatReasoningTags(body); changed {
+			body = normalizedBody
+		}
+	}
+
 	var result models.UnifiedResponse
 	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal openai response: %w", err)
 	}
-
-	normalizedThinkTags := false
-	for i := range result.Choices {
-		c := &result.Choices[i]
-		if c.Message == nil {
-			continue
-		}
-		contentStr, ok := c.Message.Content.(string)
-		if !ok || strings.Index(contentStr, "<think>") < 0 {
-			continue
-		}
-		reasoning, cleaned, changed := splitThinkTags(contentStr)
-		if !changed {
-			continue
-		}
-		if reasoning != "" {
-			if strings.TrimSpace(c.Message.ReasoningContent) == "" {
-				c.Message.ReasoningContent = reasoning
-			} else {
-				c.Message.ReasoningContent = strings.TrimSpace(c.Message.ReasoningContent) + "\n" + reasoning
-			}
-		}
-		c.Message.Content = cleaned
-		normalizedThinkTags = true
-	}
-	if !normalizedThinkTags {
-		result.RawJSON = append(json.RawMessage(nil), body...)
-	}
+	result.RawJSON = append(json.RawMessage(nil), body...)
 
 	return &result, nil
+}
+
+// normalizeOpenAIChatReasoningTags extracts the non-standard <think> wrapper
+// only when a provider explicitly opts in. RawMessage containers keep unknown
+// fields and large JSON numbers intact while the two affected message fields
+// are updated.
+func normalizeOpenAIChatReasoningTags(body []byte) ([]byte, bool) {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil || payload == nil {
+		return body, false
+	}
+
+	var choices []json.RawMessage
+	if err := json.Unmarshal(payload["choices"], &choices); err != nil {
+		return body, false
+	}
+
+	changed := false
+	for index, rawChoice := range choices {
+		var choice map[string]json.RawMessage
+		if err := json.Unmarshal(rawChoice, &choice); err != nil || choice == nil {
+			continue
+		}
+		var message map[string]json.RawMessage
+		if err := json.Unmarshal(choice["message"], &message); err != nil || message == nil {
+			continue
+		}
+
+		var content string
+		if err := json.Unmarshal(message["content"], &content); err != nil ||
+			!strings.Contains(content, "<think>") || !strings.Contains(content, "</think>") {
+			continue
+		}
+		reasoning, cleaned, extracted := splitThinkTags(content)
+		if !extracted {
+			continue
+		}
+
+		setRawJSONValue(message, "content", cleaned)
+		if reasoning != "" {
+			var existing string
+			if rawExisting, ok := message["reasoning_content"]; ok &&
+				len(bytes.TrimSpace(rawExisting)) > 0 && string(bytes.TrimSpace(rawExisting)) != "null" {
+				if err := json.Unmarshal(rawExisting, &existing); err != nil {
+					continue
+				}
+			}
+			if existing != "" {
+				reasoning = existing + "\n" + reasoning
+			}
+			setRawJSONValue(message, "reasoning_content", reasoning)
+		}
+		setRawJSONValue(choice, "message", message)
+		normalizedChoice, err := json.Marshal(choice)
+		if err != nil {
+			continue
+		}
+		choices[index] = normalizedChoice
+		changed = true
+	}
+	if !changed {
+		return body, false
+	}
+	setRawJSONValue(payload, "choices", choices)
+	normalized, err := json.Marshal(payload)
+	if err != nil {
+		return body, false
+	}
+	return normalized, true
 }
 
 func normalizeOpenAIChatResponseEnvelope(body []byte, defaultModel string) ([]byte, bool) {
@@ -521,30 +579,32 @@ func (t *OpenAITranslator) ParseStreamChunk(data []byte) (*models.StreamChunk, e
 		return nil, fmt.Errorf("failed to unmarshal openai stream chunk: %w", err)
 	}
 
-	for i := range chunk.Choices {
-		c := &chunk.Choices[i]
-		if c.Delta == nil {
-			continue
-		}
-		contentStr, ok := c.Delta.Content.(string)
-		if !ok {
-			continue
-		}
-		if strings.Index(contentStr, "<think>") < 0 || strings.Index(contentStr, "</think>") < 0 {
-			continue
-		}
-		reasoning, cleaned, changed := splitThinkTags(contentStr)
-		if !changed {
-			continue
-		}
-		if reasoning != "" {
-			if strings.TrimSpace(c.Delta.ReasoningContent) == "" {
-				c.Delta.ReasoningContent = reasoning
-			} else {
-				c.Delta.ReasoningContent = strings.TrimSpace(c.Delta.ReasoningContent) + "\n" + reasoning
+	if t.cfg.ExtractReasoningTags {
+		for i := range chunk.Choices {
+			c := &chunk.Choices[i]
+			if c.Delta == nil {
+				continue
 			}
+			contentStr, ok := c.Delta.Content.(string)
+			if !ok {
+				continue
+			}
+			if strings.Index(contentStr, "<think>") < 0 || strings.Index(contentStr, "</think>") < 0 {
+				continue
+			}
+			reasoning, cleaned, changed := splitThinkTags(contentStr)
+			if !changed {
+				continue
+			}
+			if reasoning != "" {
+				if c.Delta.ReasoningContent == "" {
+					c.Delta.ReasoningContent = reasoning
+				} else {
+					c.Delta.ReasoningContent += "\n" + reasoning
+				}
+			}
+			c.Delta.Content = cleaned
 		}
-		c.Delta.Content = cleaned
 	}
 	chunk.RawJSON = append(json.RawMessage(nil), trimmed...)
 
@@ -640,11 +700,7 @@ func normalizeOpenAICompatibleRequestForProvider(req models.UnifiedRequest, cfg 
 }
 
 func shouldNormalizeDeveloperRole(cfg config.ProviderConfig) bool {
-	profile := strings.ToLower(strings.TrimSpace(cfg.CompatibilityProfile))
-	if profile == "" {
-		profile = strings.ToLower(strings.TrimSpace(providerExtraValue(cfg, "compatibility_profile")))
-	}
-	if profile == "deepseek" {
+	if isDeepSeekCompatibilityProfile(cfg) {
 		return true
 	}
 
@@ -657,6 +713,14 @@ func shouldNormalizeDeveloperRole(cfg config.ProviderConfig) bool {
 	}
 
 	return false
+}
+
+func isDeepSeekCompatibilityProfile(cfg config.ProviderConfig) bool {
+	profile := strings.ToLower(strings.TrimSpace(cfg.CompatibilityProfile))
+	if profile == "" {
+		profile = strings.ToLower(strings.TrimSpace(providerExtraValue(cfg, "compatibility_profile")))
+	}
+	return profile == "deepseek"
 }
 
 func providerExtraValue(cfg config.ProviderConfig, key string) string {
@@ -683,50 +747,28 @@ func providerExtraBool(cfg config.ProviderConfig, key string) (bool, bool) {
 
 func unifiedToResponsesPayload(req *models.UnifiedRequest) *models.ResponsesRequest {
 	input := make([]interface{}, 0, len(req.Messages))
-	instructions := make([]string, 0, 1)
 	store := false
 
 	for i := range req.Messages {
 		msg := req.Messages[i]
-		if strings.EqualFold(strings.TrimSpace(msg.Role), "system") {
-			if s := strings.TrimSpace(openaiMessageContentToString(msg.Content)); s != "" {
-				instructions = append(instructions, s)
-			}
-			continue
-		}
-
 		if strings.EqualFold(strings.TrimSpace(msg.Role), "assistant") && len(msg.ToolCalls) > 0 {
 			for _, tc := range msg.ToolCalls {
-				callID := strings.TrimSpace(tc.ID)
-				if callID == "" {
-					callID = "call_" + strings.TrimSpace(tc.Function.Name)
-				}
-				if callID == "call_" {
-					callID = "call_lunargate"
-				}
-				itemID := responsesFunctionItemID(callID)
+				callID := tc.ID
 				input = append(input, map[string]interface{}{
 					"type":      "function_call",
-					"id":        itemID,
 					"call_id":   callID,
-					"name":      strings.TrimSpace(tc.Function.Name),
+					"name":      tc.Function.Name,
 					"arguments": tc.Function.Arguments,
 				})
 			}
 		}
 
 		if strings.EqualFold(strings.TrimSpace(msg.Role), "tool") {
-			callID := strings.TrimSpace(msg.ToolCallID)
-			if callID == "" {
-				callID = strings.TrimSpace(msg.Name)
-			}
-			if callID == "" {
-				callID = "tool_call"
-			}
+			callID := msg.ToolCallID
 			input = append(input, map[string]interface{}{
 				"type":    "function_call_output",
 				"call_id": callID,
-				"output":  msg.Content,
+				"output":  normalizeResponsesToolOutput(msg.Content),
 			})
 			continue
 		}
@@ -747,7 +789,7 @@ func unifiedToResponsesPayload(req *models.UnifiedRequest) *models.ResponsesRequ
 	out := &models.ResponsesRequest{
 		Model:              req.Model,
 		Input:              input,
-		PreviousResponseID: strings.TrimSpace(req.PreviousResponseID),
+		PreviousResponseID: req.PreviousResponseID,
 		Temperature:        req.Temperature,
 		TopP:               req.TopP,
 		Tools:              make([]models.ResponsesTool, 0, len(req.Tools)),
@@ -755,9 +797,6 @@ func unifiedToResponsesPayload(req *models.UnifiedRequest) *models.ResponsesRequ
 		Stream:             req.Stream,
 		Store:              &store,
 		User:               req.User,
-	}
-	if len(instructions) > 0 {
-		out.Instructions = strings.Join(instructions, "\n")
 	}
 	if effort := strings.TrimSpace(req.ReasoningEffort); effort != "" {
 		out.Reasoning = &models.Reasoning{Effort: effort}
@@ -792,11 +831,14 @@ func responsesResponseToUnified(resp *models.ResponsesResponse) *models.UnifiedR
 	}
 
 	message := &models.Message{Role: "assistant"}
-	if text := strings.TrimSpace(firstNonEmptyResponsesText(resp)); text != "" {
+	if text := firstNonEmptyResponsesText(resp); strings.TrimSpace(text) != "" {
 		message.Content = text
 	}
-	if reasoning := strings.TrimSpace(firstNonEmptyResponsesReasoning(resp)); reasoning != "" {
+	if reasoning := firstNonEmptyResponsesReasoning(resp); strings.TrimSpace(reasoning) != "" {
 		message.ReasoningContent = reasoning
+	}
+	if refusal := firstNonEmptyResponsesRefusal(resp); refusal != "" {
+		message.Refusal = refusal
 	}
 
 	toolCalls := make([]models.ToolCall, 0)
@@ -806,9 +848,9 @@ func responsesResponseToUnified(resp *models.ResponsesResponse) *models.UnifiedR
 			continue
 		}
 		idx := i
-		callID := strings.TrimSpace(item.CallID)
+		callID := item.CallID
 		if callID == "" {
-			callID = strings.TrimSpace(item.ID)
+			callID = item.ID
 		}
 		toolCalls = append(toolCalls, models.ToolCall{
 			Index: &idx,
@@ -853,8 +895,8 @@ func firstNonEmptyResponsesText(resp *models.ResponsesResponse) string {
 	if resp == nil {
 		return ""
 	}
-	if text := strings.TrimSpace(resp.OutputText); text != "" {
-		return text
+	if strings.TrimSpace(resp.OutputText) != "" {
+		return resp.OutputText
 	}
 
 	parts := make([]string, 0, 2)
@@ -867,8 +909,8 @@ func firstNonEmptyResponsesText(resp *models.ResponsesResponse) string {
 			part := item.Content[j]
 			switch strings.TrimSpace(part.Type) {
 			case "output_text", "text":
-				if text := strings.TrimSpace(part.Text); text != "" {
-					parts = append(parts, text)
+				if strings.TrimSpace(part.Text) != "" {
+					parts = append(parts, part.Text)
 				}
 			}
 		}
@@ -888,8 +930,8 @@ func firstNonEmptyResponsesReasoning(resp *models.ResponsesResponse) string {
 			continue
 		}
 		for _, summary := range item.Summary {
-			if text := strings.TrimSpace(summary.Text); text != "" {
-				parts = append(parts, text)
+			if strings.TrimSpace(summary.Text) != "" {
+				parts = append(parts, summary.Text)
 			}
 		}
 		for _, content := range item.Content {
@@ -897,9 +939,31 @@ func firstNonEmptyResponsesReasoning(resp *models.ResponsesResponse) string {
 			if partType != "reasoning_text" && partType != "summary_text" && partType != "text" {
 				continue
 			}
-			if text := strings.TrimSpace(content.Text); text != "" {
-				parts = append(parts, text)
+			if strings.TrimSpace(content.Text) != "" {
+				parts = append(parts, content.Text)
 			}
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+func firstNonEmptyResponsesRefusal(resp *models.ResponsesResponse) string {
+	if resp == nil {
+		return ""
+	}
+
+	parts := make([]string, 0, 1)
+	for i := range resp.Output {
+		item := resp.Output[i]
+		if item.Type != "message" {
+			continue
+		}
+		for j := range item.Content {
+			part := item.Content[j]
+			if strings.TrimSpace(part.Type) != "refusal" || strings.TrimSpace(part.Refusal) == "" {
+				continue
+			}
+			parts = append(parts, part.Refusal)
 		}
 	}
 	return strings.Join(parts, "\n")
@@ -911,7 +975,10 @@ func responsesEventToStreamChunk(data []byte) (*models.StreamChunk, error) {
 		return nil, fmt.Errorf("failed to unmarshal responses stream event: %w", err)
 	}
 
-	responseID := responsesEventResponseID(raw)
+	responseID, err := responsesEventResponseID(raw)
+	if err != nil {
+		return nil, err
+	}
 	responseModel, responseCreated := responsesEventResponseMeta(raw)
 	typeName := strings.TrimSpace(interfaceToString(raw["type"]))
 	switch typeName {
@@ -1003,6 +1070,33 @@ func responsesEventToStreamChunk(data []byte) (*models.StreamChunk, error) {
 				Delta: &models.Message{Content: text},
 			}},
 		}, nil
+	case "response.refusal.delta":
+		delta := interfaceToString(raw["delta"])
+		if delta == "" {
+			return nil, nil
+		}
+		return &models.StreamChunk{
+			ID:     responseID,
+			Object: "chat.completion.chunk",
+			Choices: []models.Choice{{
+				Index: 0,
+				Delta: &models.Message{Refusal: delta},
+			}},
+		}, nil
+	case "response.refusal.done":
+		// Some Responses streams emit only the finalized refusal snapshot.
+		refusal := interfaceToString(raw["refusal"])
+		if refusal == "" {
+			return nil, nil
+		}
+		return &models.StreamChunk{
+			ID:     responseID,
+			Object: "chat.completion.chunk",
+			Choices: []models.Choice{{
+				Index: 0,
+				Delta: &models.Message{Refusal: refusal},
+			}},
+		}, nil
 	case "response.content_part.done":
 		part, _ := raw["part"].(map[string]interface{})
 		if part == nil {
@@ -1010,11 +1104,11 @@ func responsesEventToStreamChunk(data []byte) (*models.StreamChunk, error) {
 		}
 		partType := strings.TrimSpace(interfaceToString(part["type"]))
 		partText := interfaceToString(part["text"])
-		if partText == "" {
-			return nil, nil
-		}
 		switch partType {
 		case "output_text", "text":
+			if partText == "" {
+				return nil, nil
+			}
 			return &models.StreamChunk{
 				ID:     responseID,
 				Object: "chat.completion.chunk",
@@ -1024,12 +1118,28 @@ func responsesEventToStreamChunk(data []byte) (*models.StreamChunk, error) {
 				}},
 			}, nil
 		case "reasoning", "reasoning_text", "reasoning_summary_text":
+			if partText == "" {
+				return nil, nil
+			}
 			return &models.StreamChunk{
 				ID:     responseID,
 				Object: "chat.completion.chunk",
 				Choices: []models.Choice{{
 					Index: 0,
 					Delta: &models.Message{ReasoningContent: partText},
+				}},
+			}, nil
+		case "refusal":
+			refusal := interfaceToString(part["refusal"])
+			if refusal == "" {
+				return nil, nil
+			}
+			return &models.StreamChunk{
+				ID:     responseID,
+				Object: "chat.completion.chunk",
+				Choices: []models.Choice{{
+					Index: 0,
+					Delta: &models.Message{Refusal: refusal},
 				}},
 			}, nil
 		default:
@@ -1074,7 +1184,10 @@ func responsesEventToStreamChunk(data []byte) (*models.StreamChunk, error) {
 		if delta == "" {
 			return nil, nil
 		}
-		id := strings.TrimSpace(interfaceToString(raw["item_id"]))
+		id, err := openAIStreamIdentifier(raw, "item_id")
+		if err != nil {
+			return nil, err
+		}
 		idx := intFromAny(raw["output_index"])
 		log.Debug().
 			Str("provider", "openai").
@@ -1109,15 +1222,20 @@ func responsesEventToStreamChunk(data []byte) (*models.StreamChunk, error) {
 		if item != nil && itemType == "message" && typeName == "response.output_item.done" {
 			// Fallback for streams that only deliver final assistant content via item.content.
 			text := openaiMessageContentToString(item["content"])
-			if text == "" {
+			refusal := openaiMessageRefusalToString(item["content"])
+			if text == "" && refusal == "" {
 				return nil, nil
+			}
+			message := &models.Message{Refusal: refusal}
+			if text != "" {
+				message.Content = text
 			}
 			return &models.StreamChunk{
 				ID:     responseID,
 				Object: "chat.completion.chunk",
 				Choices: []models.Choice{{
 					Index: 0,
-					Delta: &models.Message{Content: text},
+					Delta: message,
 				}},
 			}, nil
 		}
@@ -1125,9 +1243,15 @@ func responsesEventToStreamChunk(data []byte) (*models.StreamChunk, error) {
 			logIgnoredResponsesEvent(typeName, raw)
 			return nil, nil
 		}
-		id := strings.TrimSpace(interfaceToString(item["call_id"]))
+		id, err := openAIStreamIdentifier(item, "call_id")
+		if err != nil {
+			return nil, err
+		}
 		if id == "" {
-			id = strings.TrimSpace(interfaceToString(item["id"]))
+			id, err = openAIStreamIdentifier(item, "id")
+			if err != nil {
+				return nil, err
+			}
 		}
 		name := strings.TrimSpace(interfaceToString(item["name"]))
 		args := interfaceToString(item["arguments"])
@@ -1217,15 +1341,15 @@ func mapKeys(m map[string]interface{}) []string {
 	return keys
 }
 
-func responsesEventResponseID(raw map[string]interface{}) string {
-	if id := strings.TrimSpace(interfaceToString(raw["response_id"])); id != "" {
-		return id
+func responsesEventResponseID(raw map[string]interface{}) (string, error) {
+	if _, present := raw["response_id"]; present {
+		return openAIStreamIdentifier(raw, "response_id")
 	}
 	resp, _ := raw["response"].(map[string]interface{})
 	if resp != nil {
-		return strings.TrimSpace(interfaceToString(resp["id"]))
+		return openAIStreamIdentifier(resp, "id")
 	}
-	return ""
+	return "", nil
 }
 
 func responsesEventResponseMeta(raw map[string]interface{}) (string, int64) {
@@ -1265,19 +1389,38 @@ func openaiMessageContentToString(content interface{}) string {
 	}
 }
 
+func openaiMessageRefusalToString(content interface{}) string {
+	parts, ok := content.([]interface{})
+	if !ok {
+		return ""
+	}
+
+	refusals := make([]string, 0, 1)
+	for _, rawPart := range parts {
+		part, ok := rawPart.(map[string]interface{})
+		if !ok || strings.TrimSpace(interfaceToString(part["type"])) != "refusal" {
+			continue
+		}
+		refusal := interfaceToString(part["refusal"])
+		if strings.TrimSpace(refusal) != "" {
+			refusals = append(refusals, refusal)
+		}
+	}
+	return strings.Join(refusals, "\n")
+}
+
 func normalizeResponsesMessageContent(role string, content interface{}) (interface{}, bool) {
 	partType := responsesTextPartTypeForRole(role)
 	if s, ok := content.(string); ok {
-		s = strings.TrimSpace(s)
-		if s == "" {
-			return nil, false
-		}
 		return []map[string]interface{}{{"type": partType, "text": s}}, true
 	}
 
 	parts, ok := content.([]interface{})
 	if !ok {
-		return content, true
+		encoded, err := json.Marshal(content)
+		if err != nil || decodeJSONPreserveNumbers(encoded, &parts) != nil {
+			return nil, false
+		}
 	}
 	normalized := make([]map[string]interface{}, 0, len(parts))
 	for _, part := range parts {
@@ -1290,6 +1433,20 @@ func normalizeResponsesMessageContent(role string, content interface{}) (interfa
 			copyObj[k] = v
 		}
 		t := strings.TrimSpace(interfaceToString(copyObj["type"]))
+		if t == "image_url" {
+			url, detail, _, ok := openAIChatImageReference(copyObj["image_url"])
+			if ok {
+				inputImage := map[string]interface{}{
+					"type":      "input_image",
+					"image_url": url,
+				}
+				if detail != "" {
+					inputImage["detail"] = detail
+				}
+				normalized = append(normalized, inputImage)
+				continue
+			}
+		}
 		if t == "" || t == "text" || t == "input_text" || t == "output_text" {
 			copyObj["type"] = partType
 		}
@@ -1299,6 +1456,17 @@ func normalizeResponsesMessageContent(role string, content interface{}) (interfa
 		return nil, false
 	}
 	return normalized, true
+}
+
+func normalizeResponsesToolOutput(content interface{}) interface{} {
+	if _, ok := content.(string); ok {
+		return content
+	}
+	normalized, ok := normalizeResponsesMessageContent("tool", content)
+	if !ok {
+		return content
+	}
+	return normalized
 }
 
 func responsesTextPartTypeForRole(role string) string {
@@ -1360,20 +1528,6 @@ func intFromAny(v interface{}) int {
 func interfaceToString(v interface{}) string {
 	s, _ := v.(string)
 	return s
-}
-
-func responsesFunctionItemID(callID string) string {
-	trimmed := strings.TrimSpace(callID)
-	if trimmed == "" {
-		return "fc_lunargate"
-	}
-	if strings.HasPrefix(trimmed, "fc") {
-		return trimmed
-	}
-	if strings.HasPrefix(trimmed, "call_") {
-		return "fc_" + strings.TrimPrefix(trimmed, "call_")
-	}
-	return "fc_" + trimmed
 }
 
 func (t *OpenAITranslator) SupportsStreaming() bool {

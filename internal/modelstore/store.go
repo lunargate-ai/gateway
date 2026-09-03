@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -13,6 +14,7 @@ import (
 	"github.com/lunargate-ai/gateway/internal/config"
 	"github.com/lunargate-ai/gateway/internal/modelid"
 	"github.com/lunargate-ai/gateway/internal/providers"
+	"github.com/lunargate-ai/gateway/internal/safeurl"
 	"github.com/lunargate-ai/gateway/pkg/models"
 	"github.com/rs/zerolog/log"
 )
@@ -55,17 +57,55 @@ func NewStore(reg *providers.Registry, providersCfg map[string]config.ProviderCo
 }
 
 func (s *Store) UpdateProvidersConfig(cfg map[string]config.ProviderConfig) {
-	copyMap := make(map[string]config.ProviderConfig, len(cfg))
-	for k, v := range cfg {
-		copyMap[k] = v
+	copyMap := cloneProviderConfigs(cfg)
+	current, _ := s.cfg.Load().(providerConfigSnapshot)
+	if reflect.DeepEqual(current.providers, copyMap) {
+		return
 	}
 	s.mu.Lock()
+	current, _ = s.cfg.Load().(providerConfigSnapshot)
+	if reflect.DeepEqual(current.providers, copyMap) {
+		s.mu.Unlock()
+		return
+	}
 	s.cfg.Store(providerConfigSnapshot{
 		generation: s.nextGeneration.Add(1),
 		providers:  copyMap,
 	})
 	s.cache = make(map[string]cacheEntry)
 	s.mu.Unlock()
+}
+
+func cloneProviderConfigs(cfg map[string]config.ProviderConfig) map[string]config.ProviderConfig {
+	cloned := make(map[string]config.ProviderConfig, len(cfg))
+	for provider, providerCfg := range cfg {
+		if providerCfg.Temperature != nil {
+			value := *providerCfg.Temperature
+			providerCfg.Temperature = &value
+		}
+		if providerCfg.TopP != nil {
+			value := *providerCfg.TopP
+			providerCfg.TopP = &value
+		}
+		if providerCfg.TopK != nil {
+			value := *providerCfg.TopK
+			providerCfg.TopK = &value
+		}
+		if len(providerCfg.Extra) > 0 {
+			extra := providerCfg.Extra
+			providerCfg.Extra = make(map[string]string, len(extra))
+			for key, value := range extra {
+				providerCfg.Extra[key] = value
+			}
+		} else {
+			providerCfg.Extra = nil
+		}
+		providerCfg.Models.Static = append([]string(nil), providerCfg.Models.Static...)
+		providerCfg.Capabilities.HostedTools = append([]string(nil), providerCfg.Capabilities.HostedTools...)
+		providerCfg.Capabilities.ReasoningEffortLevels = append([]string(nil), providerCfg.Capabilities.ReasoningEffortLevels...)
+		cloned[provider] = providerCfg
+	}
+	return cloned
 }
 
 func (s *Store) AllModels(ctx context.Context) []models.ModelInfo {
@@ -150,7 +190,7 @@ func (s *Store) modelsForProvider(ctx context.Context, generation uint64, provid
 
 	ttl := pcfg.Models.Fetch.TTL
 	if ttl <= 0 {
-		ttl = 10 * time.Minute
+		ttl = config.DefaultModelsFetchTTL
 	}
 
 	s.mu.RLock()
@@ -252,22 +292,32 @@ type ollamaTagsResponse struct {
 }
 
 func (s *Store) fetchModels(ctx context.Context, providerID string, pcfg config.ProviderConfig) ([]string, error) {
-	providerType, _ := s.registry.Type(providerID)
-	providerType = strings.ToLower(strings.TrimSpace(providerType))
+	providerSnapshot, ok := s.registry.Snapshot(providerID)
+	if !ok || providerSnapshot.Translator == nil {
+		return nil, fmt.Errorf("provider is not registered")
+	}
+	providerType := strings.ToLower(strings.TrimSpace(providerSnapshot.ProviderType))
 
-	baseURL := strings.TrimRight(strings.TrimSpace(pcfg.BaseURL), "/")
+	baseURL := strings.TrimSpace(pcfg.BaseURL)
 	if baseURL == "" {
-		return nil, fmt.Errorf("provider base_url is empty")
+		baseURL = strings.TrimSpace(providerSnapshot.Translator.BaseURL())
+	}
+	if baseURL == "" {
+		return nil, fmt.Errorf("provider has no effective base_url")
 	}
 
 	if providerType == "ollama" {
-		url := baseURL + "/api/tags"
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		endpoint, err := safeurl.JoinHTTPPath(baseURL, "api/tags")
+		if err != nil {
+			return nil, fmt.Errorf("failed to build ollama tags endpoint: %w", err)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create ollama tags request: %w", err)
 		}
 		resp, err := s.client.Do(req)
 		if err != nil {
+			err = safeurl.RedactTransportError(err, req.URL)
 			return nil, fmt.Errorf("failed to call ollama tags: %w", err)
 		}
 		defer resp.Body.Close()
@@ -288,8 +338,11 @@ func (s *Store) fetchModels(ctx context.Context, providerID string, pcfg config.
 	}
 
 	if providerType == "openai" {
-		url := baseURL + "/models"
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		endpoint, err := safeurl.JoinHTTPPath(baseURL, "models")
+		if err != nil {
+			return nil, fmt.Errorf("failed to build openai models endpoint: %w", err)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create openai models request: %w", err)
 		}
@@ -301,6 +354,7 @@ func (s *Store) fetchModels(ctx context.Context, providerID string, pcfg config.
 		}
 		resp, err := s.client.Do(req)
 		if err != nil {
+			err = safeurl.RedactTransportError(err, req.URL)
 			return nil, fmt.Errorf("failed to call openai models: %w", err)
 		}
 		defer resp.Body.Close()

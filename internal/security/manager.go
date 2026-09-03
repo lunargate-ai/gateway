@@ -90,8 +90,12 @@ func (m *Manager) Middleware(next http.Handler) http.Handler {
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		state := m.currentState()
-		if state == nil || !state.enabled || state.authenticator == nil {
+		if state == nil || !state.enabled {
 			next.ServeHTTP(w, r)
+			return
+		}
+		if state.authenticator == nil {
+			writeAuthError(w, state.provider, errors.New("enabled inbound auth has no authenticator"))
 			return
 		}
 
@@ -139,8 +143,11 @@ func buildRuntimeState(cfg config.SecurityConfig) (*runtimeState, error) {
 		provider: provider,
 	}
 
-	if !cfg.Enabled || provider == "none" {
+	if !cfg.Enabled {
 		return state, nil
+	}
+	if provider == "none" {
+		return nil, errors.New("security.provider must not be none when security.enabled is true")
 	}
 
 	switch provider {

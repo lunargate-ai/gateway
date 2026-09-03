@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -52,6 +53,101 @@ func TestCompatibleEmbeddingsFallbacksDropsBase64IncompatibleTargets(t *testing.
 	got := handler.compatibleEmbeddingsFallbacks(fallbacks, &models.EmbeddingsRequest{EncodingFormat: "base64"})
 	if len(got) != 1 || got[0].Provider != "enabled" {
 		t.Fatalf("compatible fallbacks = %#v, want only enabled", got)
+	}
+}
+
+func TestValidateEmbeddingsCompatibilityRejectsProviderWithoutEmbeddingsAPI(t *testing.T) {
+	handler := &Handler{registry: providers.NewRegistry(map[string]config.ProviderConfig{
+		"anthropic-chat": {Type: "anthropic"},
+	})}
+	err := handler.validateEmbeddingsCompatibility(
+		routing.Target{Provider: "anthropic-chat", Model: "claude-test"},
+		&models.EmbeddingsRequest{Input: "hello"},
+	)
+	var compatibilityErr *models.CompatibilityError
+	if !errors.As(err, &compatibilityErr) {
+		t.Fatalf("error = %v, want CompatibilityError", err)
+	}
+	if compatibilityErr.Field != "provider" || compatibilityErr.Provider != "anthropic-chat" {
+		t.Fatalf("compatibility error = %#v", compatibilityErr)
+	}
+}
+
+func TestCompatibleEmbeddingsFallbacksDropsProviderWithoutEmbeddingsAPI(t *testing.T) {
+	handler := &Handler{registry: providers.NewRegistry(map[string]config.ProviderConfig{
+		"anthropic-chat": {Type: "anthropic"},
+		"openai-embed":   {Type: "openai"},
+	})}
+	fallbacks := []routing.Target{
+		{Provider: "anthropic-chat", Model: "claude-test"},
+		{Provider: "openai-embed", Model: "text-embedding-test"},
+	}
+	got := handler.compatibleEmbeddingsFallbacks(fallbacks, &models.EmbeddingsRequest{Input: "hello"})
+	if len(got) != 1 || got[0].Provider != "openai-embed" {
+		t.Fatalf("compatible fallbacks = %#v, want only openai-embed", got)
+	}
+}
+
+func TestEmbeddingsUnsupportedPrimaryFailsBeforeFallbackAndCircuitBreaker(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer upstream.Close()
+
+	registry := providers.NewRegistry(map[string]config.ProviderConfig{
+		"anthropic-chat": {Type: "anthropic", APIKey: "test", BaseURL: upstream.URL},
+		"openai-embed":   {Type: "openai", APIKey: "test", BaseURL: upstream.URL},
+	})
+	router := routing.NewEngine(config.RoutingConfig{
+		DefaultStrategy: "weighted",
+		Routes: []config.RouteConfig{{
+			Name:     "embeddings-unsupported-primary",
+			Match:    config.MatchConfig{Path: "/v1/embeddings"},
+			Targets:  []config.TargetConfig{{Provider: "anthropic-chat", Model: "embed-model", Weight: 1}},
+			Fallback: []config.TargetConfig{{Provider: "openai-embed", Model: "embed-model", Weight: 1}},
+		}},
+	})
+	cache := middleware.NewCache(config.CacheConfig{Enabled: false})
+	defer cache.Stop()
+	breakers := resilience.NewCircuitBreakerManager()
+	handler := NewHandler(
+		registry,
+		router,
+		resilience.NewFallbackExecutor(resilience.NewRetrier(config.RetryConfig{Enabled: true, MaxAttempts: 3}), breakers),
+		cache,
+		streaming.NewHandler(),
+		observability.NewMetricsWithRegisterer(prometheus.NewRegistry()),
+		nil,
+		nil,
+		nil,
+	)
+
+	recorder := httptest.NewRecorder()
+	handler.Embeddings(recorder, httptest.NewRequest(
+		http.MethodPost,
+		"/v1/embeddings",
+		bytes.NewBufferString(`{"model":"embed-model","input":"hello"}`),
+	))
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response models.ErrorResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if response.Error.Param == nil || *response.Error.Param != "provider" {
+		t.Fatalf("error param = %#v, want provider", response.Error.Param)
+	}
+	if response.Error.Code == nil || *response.Error.Code != "unsupported_feature" {
+		t.Fatalf("error code = %#v, want unsupported_feature", response.Error.Code)
+	}
+	if got := upstreamCalls.Load(); got != 0 {
+		t.Fatalf("upstream calls = %d, want 0", got)
+	}
+	if failures := breakers.Get("anthropic-chat").Counts().TotalFailures; failures != 0 {
+		t.Fatalf("circuit-breaker failures = %d, want 0", failures)
 	}
 }
 

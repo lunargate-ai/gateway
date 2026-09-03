@@ -44,8 +44,8 @@ func TestResponsesPreservesTranslatedChatRefusal(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if response["output_text"] != "" {
-		t.Fatalf("output_text = %#v, want empty for refusal", response["output_text"])
+	if _, exists := response["output_text"]; exists {
+		t.Fatalf("refusal response exposed SDK-only output_text: %#v", response)
 	}
 	output, _ := response["output"].([]interface{})
 	if len(output) != 1 {
@@ -143,8 +143,11 @@ func TestResponsesStreamPreservesTranslatedChatRefusal(t *testing.T) {
 		t.Fatalf("content_part.done = %#v", contentDone)
 	}
 	assertCompletedRefusalMessage(t, itemDone, wantRefusal)
-	if completed == nil || completed["output_text"] != "" {
+	if completed == nil {
 		t.Fatalf("completed response = %#v", completed)
+	}
+	if _, exists := completed["output_text"]; exists {
+		t.Fatalf("completed refusal exposed SDK-only output_text: %#v", completed)
 	}
 	output, _ := completed["output"].([]interface{})
 	if len(output) != 1 {

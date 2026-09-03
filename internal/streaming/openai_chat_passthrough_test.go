@@ -22,8 +22,9 @@ func TestStreamResponsePreservesAdditiveOpenAIChatFields(t *testing.T) {
 		name := map[bool]string{false: "usage excluded", true: "usage included"}[includeUsage]
 		t.Run(name, func(t *testing.T) {
 			translator := providers.NewOpenAITranslator(config.ProviderConfig{
-				APIKey:       "dummy",
-				DefaultModel: "fallback-model",
+				APIKey:               "dummy",
+				DefaultModel:         "fallback-model",
+				ExtractReasoningTags: true,
 			})
 			providerResponse := &http.Response{
 				StatusCode: http.StatusOK,
@@ -115,6 +116,48 @@ func TestStreamResponsePreservesAdditiveOpenAIChatFields(t *testing.T) {
 				t.Fatalf("usage extension = %q, want kept", got)
 			}
 		})
+	}
+}
+
+func TestStreamResponsePreservesLiteralThinkTagsByDefault(t *testing.T) {
+	contentChunk := `{"id":"chatcmpl_literal","object":"chat.completion.chunk","created":1,"model":"custom","choices":[{"index":0,"delta":{"role":"assistant","content":"Use <think>literal</think> markup","x_delta":{"kept":true}},"finish_reason":null}],"x_vendor":{"kept":true}}`
+	providerResponse := &http.Response{
+		StatusCode: http.StatusOK,
+		Body: io.NopCloser(strings.NewReader(
+			"data: " + contentChunk + "\n\n" +
+				"data: [DONE]\n\n",
+		)),
+	}
+	recorder := httptest.NewRecorder()
+	translator := providers.NewOpenAITranslator(config.ProviderConfig{APIKey: "dummy"})
+
+	err := NewHandler().StreamResponse(
+		context.Background(),
+		recorder,
+		providerResponse,
+		translator,
+	)
+	if err != nil {
+		t.Fatalf("stream response: %v", err)
+	}
+	frames := strings.Split(strings.TrimSpace(recorder.Body.String()), "\n\n")
+	if len(frames) != 2 || frames[1] != "data: [DONE]" {
+		t.Fatalf("unexpected frames: %q", recorder.Body.String())
+	}
+	content := decodeStreamFrameObject(t, frames[0])
+	if _, ok := content["x_vendor"]; !ok {
+		t.Fatalf("top-level extension missing: %s", frames[0])
+	}
+	choices := decodeJSONArray(t, content["choices"])
+	delta := decodeJSONObject(t, decodeJSONObject(t, choices[0])["delta"])
+	if got := jsonStringField(t, delta, "content"); got != "Use <think>literal</think> markup" {
+		t.Fatalf("content = %q, want literal tags", got)
+	}
+	if _, ok := delta["reasoning_content"]; ok {
+		t.Fatalf("reasoning_content was synthesized without opt-in: %s", choices[0])
+	}
+	if _, ok := delta["x_delta"]; !ok {
+		t.Fatalf("delta extension missing: %s", choices[0])
 	}
 }
 

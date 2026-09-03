@@ -722,8 +722,8 @@ func TestResponses_MapsToChatCompletions(t *testing.T) {
 	if out.Object != "response" {
 		t.Fatalf("expected response object, got %q", out.Object)
 	}
-	if out.OutputText != "ok" {
-		t.Fatalf("expected output_text %q, got %q", "ok", out.OutputText)
+	if got := responsesTextFromTypedResponseForTest(&out); got != "ok" {
+		t.Fatalf("expected output text %q, got %q", "ok", got)
 	}
 	if rec.Header().Get("X-LunarGate-Provider") == "" {
 		t.Fatalf("expected X-LunarGate-Provider header to be set")
@@ -779,8 +779,8 @@ func TestResponses_RoutesViaChatPathWhenOnlyChatRouteConfigured(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 		t.Fatalf("failed to unmarshal responses payload: %v", err)
 	}
-	if out.OutputText != "ok" {
-		t.Fatalf("expected output_text %q, got %q", "ok", out.OutputText)
+	if got := responsesTextFromTypedResponseForTest(&out); got != "ok" {
+		t.Fatalf("expected output text %q, got %q", "ok", got)
 	}
 }
 
@@ -833,8 +833,8 @@ func TestResponses_RoutesViaResponsesPathWhenResponsesRouteConfigured(t *testing
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 		t.Fatalf("failed to unmarshal responses payload: %v", err)
 	}
-	if out.OutputText != "ok-responses-route" {
-		t.Fatalf("expected output_text %q, got %q", "ok-responses-route", out.OutputText)
+	if got := responsesTextFromTypedResponseForTest(&out); got != "ok-responses-route" {
+		t.Fatalf("expected output text %q, got %q", "ok-responses-route", got)
 	}
 }
 
@@ -1171,6 +1171,7 @@ func TestResponses_PreviousResponseIDResolvedLocallyForNonStreamFollowUp(t *test
 	streamer := streaming.NewHandler()
 	metrics := observability.NewMetricsWithRegisterer(prometheus.NewRegistry())
 	h := NewHandler(reg, router, fb, cache, streamer, metrics, nil, nil, nil)
+	h.UpdateProviderConfigs(cfgProviders)
 
 	firstPayload := []byte(`{"model":"lunargate/auto","input":"Call get_current_time once and then answer with a short sentence that includes the returned timestamp.","tools":[{"type":"function","name":"get_current_time","description":"Return the current UTC time in ISO 8601 format.","parameters":{"type":"object","properties":{"format":{"type":"string"}}}}],"tool_choice":"auto"}`)
 	firstReq := httptest.NewRequest(http.MethodPost, "http://example.com/v1/responses", bytes.NewReader(firstPayload))
@@ -1200,8 +1201,8 @@ func TestResponses_PreviousResponseIDResolvedLocallyForNonStreamFollowUp(t *test
 	if err := json.Unmarshal(secondRec.Body.Bytes(), &secondResp); err != nil {
 		t.Fatalf("failed to unmarshal second responses payload: %v", err)
 	}
-	if secondResp.OutputText != "The current time is 2026-04-09T16:51:50Z." {
-		t.Fatalf("expected final assistant text, got %q", secondResp.OutputText)
+	if got := responsesTextFromTypedResponseForTest(&secondResp); got != "The current time is 2026-04-09T16:51:50Z." {
+		t.Fatalf("expected final assistant text, got %q", got)
 	}
 
 	if len(capturedBodies) != 2 {
@@ -1276,6 +1277,7 @@ func TestResponses_PreviousResponseIDResolvedLocallyForStreamFollowUp(t *testing
 	streamer := streaming.NewHandler()
 	metrics := observability.NewMetricsWithRegisterer(prometheus.NewRegistry())
 	h := NewHandler(reg, router, fb, cache, streamer, metrics, nil, nil, nil)
+	h.UpdateProviderConfigs(cfgProviders)
 
 	firstPayload := []byte(`{"model":"lunargate/auto","stream":true,"input":"Call get_current_time once and then answer with a short sentence that includes the returned timestamp.","tools":[{"type":"function","name":"get_current_time","description":"Return the current UTC time in ISO 8601 format.","parameters":{"type":"object","properties":{"format":{"type":"string"}}}}],"tool_choice":"auto"}`)
 	firstReq := httptest.NewRequest(http.MethodPost, "http://example.com/v1/responses", bytes.NewReader(firstPayload))
@@ -1431,13 +1433,13 @@ func TestResponses_NativeResponsesStreamPreservesRepeatedDeltasWithoutSnapshots(
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		events := []string{
-			`{"type":"response.created","response":{"id":"resp_native","object":"response","created_at":123,"status":"in_progress","model":"gpt-native","output":[]}}`,
-			`{"type":"response.output_text.delta","response_id":"resp_native","item_id":"msg_native","output_index":0,"content_index":0,"delta":"ha"}`,
-			`{"type":"response.output_text.delta","response_id":"resp_native","item_id":"msg_native","output_index":0,"content_index":0,"delta":"ha"}`,
-			`{"type":"response.output_text.done","response_id":"resp_native","item_id":"msg_native","output_index":0,"content_index":0,"text":"haha"}`,
-			`{"type":"response.content_part.done","response_id":"resp_native","item_id":"msg_native","output_index":0,"content_index":0,"part":{"type":"output_text","text":"haha"}}`,
-			`{"type":"response.output_item.done","response_id":"resp_native","output_index":0,"item":{"id":"msg_native","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"haha"}]}}`,
-			`{"type":"response.completed","response":{"id":"resp_native","object":"response","created_at":123,"status":"completed","model":"gpt-native","output":[{"id":"msg_native","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"haha"}]}],"output_text":"haha","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`,
+			`{"type":"response.created","sequence_number":0,"response":{"id":"resp_native","object":"response","created_at":123,"status":"in_progress","model":"gpt-native","output":[]}}`,
+			`{"type":"response.output_text.delta","sequence_number":1,"response_id":"resp_native","item_id":"msg_native","output_index":0,"content_index":0,"delta":"ha"}`,
+			`{"type":"response.output_text.delta","sequence_number":2,"response_id":"resp_native","item_id":"msg_native","output_index":0,"content_index":0,"delta":"ha"}`,
+			`{"type":"response.output_text.done","sequence_number":3,"response_id":"resp_native","item_id":"msg_native","output_index":0,"content_index":0,"text":"haha"}`,
+			`{"type":"response.content_part.done","sequence_number":4,"response_id":"resp_native","item_id":"msg_native","output_index":0,"content_index":0,"part":{"type":"output_text","text":"haha"}}`,
+			`{"type":"response.output_item.done","sequence_number":5,"response_id":"resp_native","output_index":0,"item":{"id":"msg_native","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"haha"}]}}`,
+			`{"type":"response.completed","sequence_number":6,"response":{"id":"resp_native","object":"response","created_at":123,"status":"completed","model":"gpt-native","output":[{"id":"msg_native","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"haha"}]}],"output_text":"haha","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`,
 		}
 		for _, event := range events {
 			_, _ = w.Write([]byte("data: " + event + "\n\n"))

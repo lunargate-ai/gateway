@@ -193,6 +193,49 @@ func TestResponsesStreamProxy_MergeTextDelta_PreservesRepeatedDeltas(t *testing.
 	}
 }
 
+func TestResponsesStreamProxy_ToolCallIDIsExactAndOpaque(t *testing.T) {
+	t.Run("internal whitespace is preserved", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		proxy := newResponsesStreamProxy(recorder)
+		index := 0
+		if err := proxy.processToolCallDelta(models.ToolCall{
+			Index: &index,
+			ID:    "opaque call id",
+			Type:  "function",
+			Function: models.ToolCallFunction{
+				Name:      "lookup",
+				Arguments: "{}",
+			},
+		}); err != nil {
+			t.Fatalf("process exact tool id: %v", err)
+		}
+		if err := proxy.emitCompleted(); err != nil {
+			t.Fatalf("emit completed: %v", err)
+		}
+		for _, event := range decodeSSEEvents(t, recorder.Body.String()) {
+			if event["type"] != "response.output_item.added" {
+				continue
+			}
+			item, _ := event["item"].(map[string]interface{})
+			if item != nil && item["type"] == "function_call" && item["call_id"] != "opaque call id" {
+				t.Fatalf("call_id = %#v, want exact opaque value", item["call_id"])
+			}
+		}
+	})
+
+	t.Run("surrounding whitespace fails closed", func(t *testing.T) {
+		proxy := newResponsesStreamProxy(httptest.NewRecorder())
+		index := 0
+		err := proxy.processToolCallDelta(models.ToolCall{Index: &index, ID: " call_1 "})
+		if !errors.Is(err, errResponsesStreamInvalidToolID) {
+			t.Fatalf("error = %v, want %v", err, errResponsesStreamInvalidToolID)
+		}
+		if len(proxy.toolCalls) != 0 {
+			t.Fatalf("invalid id mutated tool state: %#v", proxy.toolCalls)
+		}
+	})
+}
+
 func TestResponsesStreamProxy_ToolOnlyTurnDoesNotEmitEmptyAssistantMessage(t *testing.T) {
 	rec := httptest.NewRecorder()
 	proxy := newResponsesStreamProxy(rec)
@@ -559,9 +602,8 @@ func TestResponsesStreamProxy_ReasoningLifecycleAndCompletedSummary(t *testing.T
 	if reasoningObj == nil {
 		t.Fatalf("expected response.completed to include reasoning object")
 	}
-	completedSummary, _ := reasoningObj["summary"].([]interface{})
-	if len(completedSummary) == 0 {
-		t.Fatalf("expected response.completed reasoning summary")
+	if reasoningObj["summary"] != nil {
+		t.Fatalf("response reasoning config must not duplicate generated summary: %#v", reasoningObj)
 	}
 }
 
@@ -675,7 +717,7 @@ func containsEventType(events []map[string]interface{}, targetType string) bool 
 
 func assertSequenceNumbersMonotonic(t *testing.T, events []map[string]interface{}) {
 	t.Helper()
-	prev := 0
+	prev := -1
 	for i, evt := range events {
 		raw, ok := evt["sequence_number"]
 		if !ok {

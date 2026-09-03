@@ -1,6 +1,8 @@
 package api
 
 import (
+	"net/http"
+
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
 	"github.com/lunargate-ai/gateway/internal/health"
@@ -34,32 +36,34 @@ func NewRouter(handler *Handler, authManager *security.Manager, rateLimiter *mid
 		}
 
 		messagePolicy := newResponsesWebSocketMessagePolicy(authManager, rateLimiter)
-		r.Get("/chat/completions", handler.ListStoredChatCompletions)
-		r.Post("/chat/completions", handler.ChatCompletions)
-		r.Get("/chat/completions/{completion_id}", handler.RetrieveStoredChatCompletion)
-		r.Post("/chat/completions/{completion_id}", handler.UpdateStoredChatCompletion)
-		r.Delete("/chat/completions/{completion_id}", handler.DeleteStoredChatCompletion)
-		r.Get("/chat/completions/{completion_id}/messages", handler.ListStoredChatCompletionMessages)
-		r.Post("/responses", handler.Responses)
-		r.Get("/responses", handler.responsesWebSocketHandler(messagePolicy))
-		r.Post("/responses/compact", handler.CompactResponses)
-		r.Post("/responses/input_tokens", handler.CountResponseInputTokens)
-		r.Get("/responses/{response_id}", handler.RetrieveResponse)
-		r.Delete("/responses/{response_id}", handler.DeleteResponse)
-		r.Post("/responses/{response_id}/cancel", handler.CancelResponse)
-		r.Get("/responses/{response_id}/input_items", handler.ListResponseInputItems)
-		r.Post("/conversations", handler.CreateConversation)
-		r.Get("/conversations/{conversation_id}", handler.GetConversation)
-		r.Post("/conversations/{conversation_id}", handler.UpdateConversation)
-		r.Delete("/conversations/{conversation_id}", handler.DeleteConversation)
-		r.Post("/conversations/{conversation_id}/items", handler.CreateConversationItems)
-		r.Get("/conversations/{conversation_id}/items", handler.ListConversationItems)
-		r.Get("/conversations/{conversation_id}/items/{item_id}", handler.GetConversationItem)
-		r.Delete("/conversations/{conversation_id}/items/{item_id}", handler.DeleteConversationItem)
-		r.Post("/embeddings", handler.Embeddings)
-		r.Get("/models", handler.ListModels)
+		r.Get("/chat/completions", handler.withRuntime((*Handler).ListStoredChatCompletions))
+		r.Post("/chat/completions", handler.withRuntime((*Handler).ChatCompletions))
+		r.Get("/chat/completions/{completion_id}", handler.withRuntime((*Handler).RetrieveStoredChatCompletion))
+		r.Post("/chat/completions/{completion_id}", handler.withRuntime((*Handler).UpdateStoredChatCompletion))
+		r.Delete("/chat/completions/{completion_id}", handler.withRuntime((*Handler).DeleteStoredChatCompletion))
+		r.Get("/chat/completions/{completion_id}/messages", handler.withRuntime((*Handler).ListStoredChatCompletionMessages))
+		r.Post("/responses", handler.withRuntime((*Handler).Responses))
+		r.Get("/responses", handler.withRuntime(func(bound *Handler, w http.ResponseWriter, request *http.Request) {
+			bound.responsesWebSocket(w, request, messagePolicy)
+		}))
+		r.Post("/responses/compact", handler.withRuntime((*Handler).CompactResponses))
+		r.Post("/responses/input_tokens", handler.withRuntime((*Handler).CountResponseInputTokens))
+		r.Get("/responses/{response_id}", handler.withRuntime((*Handler).RetrieveResponse))
+		r.Delete("/responses/{response_id}", handler.withRuntime((*Handler).DeleteResponse))
+		r.Post("/responses/{response_id}/cancel", handler.withRuntime((*Handler).CancelResponse))
+		r.Get("/responses/{response_id}/input_items", handler.withRuntime((*Handler).ListResponseInputItems))
+		r.Post("/conversations", handler.withRuntime((*Handler).CreateConversation))
+		r.Get("/conversations/{conversation_id}", handler.withRuntime((*Handler).GetConversation))
+		r.Post("/conversations/{conversation_id}", handler.withRuntime((*Handler).UpdateConversation))
+		r.Delete("/conversations/{conversation_id}", handler.withRuntime((*Handler).DeleteConversation))
+		r.Post("/conversations/{conversation_id}/items", handler.withRuntime((*Handler).CreateConversationItems))
+		r.Get("/conversations/{conversation_id}/items", handler.withRuntime((*Handler).ListConversationItems))
+		r.Get("/conversations/{conversation_id}/items/{item_id}", handler.withRuntime((*Handler).GetConversationItem))
+		r.Delete("/conversations/{conversation_id}/items/{item_id}", handler.withRuntime((*Handler).DeleteConversationItem))
+		r.Post("/embeddings", handler.withRuntime((*Handler).Embeddings))
+		r.Get("/models", handler.withRuntime((*Handler).ListModels))
 		// Canonical model IDs may contain provider and vendor path segments.
-		r.Get("/models/*", handler.GetModel)
+		r.Get("/models/*", handler.withRuntime((*Handler).GetModel))
 	})
 
 	return r

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 	"testing"
@@ -82,6 +83,45 @@ func TestRetryAfterIsCappedByConfiguredMaximum(t *testing.T) {
 	err := &RetryableStatusError{Headers: http.Header{"Retry-After": []string{"30"}}}
 	if got := calculateRetryDelay(cfg, 0, err, time.Now()); got != cfg.MaxDelay {
 		t.Fatalf("delay = %s, want configured cap %s", got, cfg.MaxDelay)
+	}
+}
+
+func TestCalculateRetryDelaySaturatesBeforeDurationConversion(t *testing.T) {
+	cfg := config.RetryConfig{
+		InitialDelay: time.Duration(math.MaxInt64 / 2),
+		MaxDelay:     time.Duration(math.MaxInt64),
+		Multiplier:   math.MaxFloat64,
+	}
+
+	got := calculateRetryDelay(cfg, 1, nil, time.Now())
+	if got != cfg.MaxDelay {
+		t.Fatalf("delay = %s, want saturated maximum %s", got, cfg.MaxDelay)
+	}
+	if got < 0 {
+		t.Fatalf("delay wrapped negative: %s", got)
+	}
+}
+
+func TestRetrierEnforcesAttemptCeilingForDirectConfig(t *testing.T) {
+	retrier := NewRetrier(config.RetryConfig{
+		Enabled:     true,
+		MaxAttempts: config.MaxRetryAttempts + 100,
+		Multiplier:  1,
+	})
+	calls := 0
+
+	_, retryCount, err := retrier.Do(context.Background(), func(context.Context) (*http.Response, error) {
+		calls++
+		return nil, errors.New("temporary failure")
+	})
+	if err == nil {
+		t.Fatal("expected retry exhaustion")
+	}
+	if calls != config.MaxRetryAttempts {
+		t.Fatalf("calls = %d, want hard ceiling %d", calls, config.MaxRetryAttempts)
+	}
+	if retryCount != config.MaxRetryAttempts-1 {
+		t.Fatalf("retryCount = %d, want %d", retryCount, config.MaxRetryAttempts-1)
 	}
 }
 
