@@ -29,6 +29,18 @@ func (h *Handler) validateChatCompatibility(target routing.Target, req *models.U
 	if err := validateTranslatedResponsesCompatibility(target, providerID, providerType, req); err != nil {
 		return err
 	}
+	if strings.EqualFold(strings.TrimSpace(req.SourceRequestType), requestTypeResponses) &&
+		strings.EqualFold(strings.TrimSpace(target.UpstreamRequestType), requestTypeResponses) &&
+		rawJSONBoolFieldEnabled(req.RawJSON, "background") {
+		capabilities, exists := h.registry.Capabilities(providerID)
+		if !exists || !capabilities.BackgroundResponses {
+			return &models.CompatibilityError{
+				Field:    "background",
+				Provider: providerID,
+				Reason:   "background Responses are not enabled for this provider",
+			}
+		}
+	}
 	if translator, exists := h.registry.Get(providerID); exists {
 		if validator, validates := translator.(chatRequestCompatibilityValidator); validates {
 			if err := validator.ValidateRequestCompatibility(providerID, req); err != nil {
@@ -142,4 +154,16 @@ func rawJSONObjectHasField(raw json.RawMessage, field string) bool {
 	}
 	_, ok := payload[field]
 	return ok
+}
+
+func rawJSONBoolFieldEnabled(raw json.RawMessage, field string) bool {
+	if len(bytes.TrimSpace(raw)) == 0 || strings.TrimSpace(field) == "" {
+		return false
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return false
+	}
+	var enabled bool
+	return json.Unmarshal(payload[field], &enabled) == nil && enabled
 }

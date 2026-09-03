@@ -43,6 +43,29 @@ func TestChatCompletionsStoreFalseBypassesCache(t *testing.T) {
 	}
 }
 
+func TestChatCompletionsStoreTrueBypassesCache(t *testing.T) {
+	h, calls, closeTest := newStoreSemanticsTestHandler(t)
+	defer closeTest()
+
+	payload := []byte(`{"model":"mock-gpt","store":true,"messages":[{"role":"user","content":"hello"}]}`)
+	first := performJSONRequest(t, h.ChatCompletions, "/v1/chat/completions", payload)
+	second := performJSONRequest(t, h.ChatCompletions, "/v1/chat/completions", payload)
+
+	if *calls != 2 {
+		t.Fatalf("upstream calls = %d, want 2", *calls)
+	}
+	var firstResp, secondResp models.UnifiedResponse
+	if err := json.Unmarshal(first.Body.Bytes(), &firstResp); err != nil {
+		t.Fatalf("decode first response: %v", err)
+	}
+	if err := json.Unmarshal(second.Body.Bytes(), &secondResp); err != nil {
+		t.Fatalf("decode second response: %v", err)
+	}
+	if firstResp.ID == secondResp.ID {
+		t.Fatalf("store:true reused cached response ID %q", firstResp.ID)
+	}
+}
+
 func TestResponsesCreateBypassesCacheAndStoreFalseSkipsLocalState(t *testing.T) {
 	h, calls, closeTest := newStoreSemanticsTestHandler(t)
 	defer closeTest()

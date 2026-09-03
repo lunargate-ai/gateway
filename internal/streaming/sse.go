@@ -186,7 +186,7 @@ func parseSSEEvent(frame []byte) SSEEvent {
 // StreamResponse reads an SSE stream from a provider and forwards it to the client.
 // It translates provider-specific chunks to OpenAI-compatible format using the translator.
 func (h *Handler) StreamResponse(ctx context.Context, w http.ResponseWriter, providerResp *http.Response, translator models.ProviderTranslator) error {
-	return h.streamResponse(ctx, w, providerResp, translator, nil)
+	return h.streamResponse(ctx, w, providerResp, translator, nil, true)
 }
 
 func (h *Handler) StreamResponseWithObserver(
@@ -196,7 +196,21 @@ func (h *Handler) StreamResponseWithObserver(
 	translator models.ProviderTranslator,
 	observer ChunkObserver,
 ) error {
-	return h.streamResponse(ctx, w, providerResp, translator, observer)
+	return h.streamResponse(ctx, w, providerResp, translator, observer, true)
+}
+
+// StreamResponseWithObserverAndUsage controls whether upstream usage is
+// exposed to a Chat Completions client while always reporting it to the
+// gateway observer.
+func (h *Handler) StreamResponseWithObserverAndUsage(
+	ctx context.Context,
+	w http.ResponseWriter,
+	providerResp *http.Response,
+	translator models.ProviderTranslator,
+	observer ChunkObserver,
+	includeUsage bool,
+) error {
+	return h.streamResponse(ctx, w, providerResp, translator, observer, includeUsage)
 }
 
 func (h *Handler) streamResponse(
@@ -205,6 +219,7 @@ func (h *Handler) streamResponse(
 	providerResp *http.Response,
 	translator models.ProviderTranslator,
 	observer ChunkObserver,
+	includeUsage bool,
 ) error {
 	if providerResp != nil && providerResp.StatusCode != http.StatusOK {
 		defer providerResp.Body.Close()
@@ -217,8 +232,6 @@ func (h *Handler) streamResponse(
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Transfer-Encoding", "chunked")
 	w.WriteHeader(http.StatusOK)
 	if err := controller.Flush(); err != nil {
 		return fmt.Errorf("failed to flush stream headers: %w", err)
@@ -278,9 +291,15 @@ func (h *Handler) streamResponse(
 			if observer != nil {
 				observer(chunk)
 			}
+			clientChunk := chunk
+			if !includeUsage && chunk.Usage != nil {
+				copyChunk := *chunk
+				copyChunk.Usage = nil
+				clientChunk = &copyChunk
+			}
 
 			// Marshal to OpenAI-compatible format
-			chunkJSON, err := json.Marshal(chunk)
+			chunkJSON, err := json.Marshal(clientChunk)
 			if err != nil {
 				log.Error().Err(err).Msg("failed to marshal stream chunk")
 			} else {
@@ -356,8 +375,6 @@ func (h *Handler) streamAnthropicResponse(
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Transfer-Encoding", "chunked")
 	w.WriteHeader(http.StatusOK)
 	if err := controller.Flush(); err != nil {
 		return fmt.Errorf("failed to flush stream headers: %w", err)

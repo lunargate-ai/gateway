@@ -35,6 +35,9 @@ func TestLocalResponsesLifecycleNonStream(t *testing.T) {
 	}
 	created := decodeLifecycleObject(t, create.Body.Bytes())
 	responseID := lifecycleStringField(t, created, "id")
+	if !strings.HasPrefix(responseID, "resp_") {
+		t.Fatalf("translated response ID = %q, want resp_ prefix", responseID)
+	}
 
 	retrieve := performLifecycleRequest(t, router, http.MethodGet, "/v1/responses/"+responseID, nil)
 	if retrieve.Code != http.StatusOK {
@@ -217,6 +220,9 @@ func TestLocalResponsesLifecycleStoresCompletedStreamOnlyWhenEnabled(t *testing.
 		t.Fatalf("stream create status = %d, want 200; body=%s", stored.Code, stored.Body.String())
 	}
 	storedID := lifecycleCompletedStreamResponseID(t, stored.Body.String())
+	if !strings.HasPrefix(storedID, "resp_") {
+		t.Fatalf("translated streaming response ID = %q, want resp_ prefix", storedID)
+	}
 	retrieve := performLifecycleRequest(t, router, http.MethodGet, "/v1/responses/"+storedID, nil)
 	if retrieve.Code != http.StatusOK {
 		t.Fatalf("stream retrieve status = %d, want 200; body=%s", retrieve.Code, retrieve.Body.String())

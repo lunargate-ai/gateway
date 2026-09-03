@@ -202,6 +202,50 @@ func (t *AnthropicTranslator) ValidateRequestCompatibility(providerID string, re
 		}
 	}
 
+	return validateAnthropicMessageInput(providerID, req.Messages)
+}
+
+func validateAnthropicMessageInput(providerID string, messages []models.Message) error {
+	unsupported := func(field, reason string) error {
+		return &models.CompatibilityError{Field: field, Provider: providerID, Reason: reason}
+	}
+
+	for messageIndex := range messages {
+		messagePath := fmt.Sprintf("messages[%d]", messageIndex)
+		message := messages[messageIndex]
+		switch message.Role {
+		case "system", "developer", "user", "assistant", "tool":
+		default:
+			return unsupported(messagePath+".role", "Anthropic Messages supports system, developer, user, assistant, and tool messages")
+		}
+
+		parts, ok := message.Content.([]interface{})
+		if !ok {
+			continue
+		}
+		for partIndex, part := range parts {
+			partPath := fmt.Sprintf("%s.content[%d]", messagePath, partIndex)
+			encoded, err := json.Marshal(part)
+			if err != nil {
+				return unsupported(partPath, "Anthropic content parts must be JSON objects")
+			}
+			var object map[string]interface{}
+			if err := json.Unmarshal(encoded, &object); err != nil || object == nil {
+				return unsupported(partPath, "Anthropic content parts must be JSON objects")
+			}
+
+			partType, ok := object["type"].(string)
+			if !ok || strings.TrimSpace(partType) == "" {
+				return unsupported(partPath+".type", "content part type is required")
+			}
+			switch partType {
+			case "text", "input_text", "image_url", "image", "input_image":
+			default:
+				return unsupported(partPath+".type", "Anthropic Messages cannot represent this content part type")
+			}
+		}
+	}
+
 	return nil
 }
 

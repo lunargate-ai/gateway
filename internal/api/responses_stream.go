@@ -14,9 +14,8 @@ import (
 )
 
 const (
-	responsesFallbackResponseID = "resp_lunargate"
-	responsesFallbackModel      = "unknown"
-	responsesEventIDPrefix      = "evt_lg_"
+	responsesFallbackModel = "unknown"
+	responsesEventIDPrefix = "evt_lg_"
 )
 
 type responsesStreamProxy struct {
@@ -458,7 +457,7 @@ func (p *responsesStreamProxy) processFrame(frame string) error {
 			continue
 		}
 		if p.responseID == "" {
-			p.responseID = strings.TrimSpace(chunk.ID)
+			p.responseID = translatedResponseID(chunk.ID)
 		}
 		if p.model == "" {
 			p.model = strings.TrimSpace(chunk.Model)
@@ -588,7 +587,7 @@ func (p *responsesStreamProxy) ensureStarted() error {
 
 	if p.responseID == "" {
 		// Compatibility fallback for chunks that don't expose an ID.
-		p.responseID = responsesFallbackResponseID
+		p.responseID = translatedResponseID("")
 	}
 	if p.itemID == "" {
 		p.itemID = "msg_" + p.responseID + "_0"
@@ -934,9 +933,6 @@ func (p *responsesStreamProxy) emitFinal(status, eventType, incompleteReason str
 		}
 	}
 
-	if p.responseID == "" {
-		resp["id"] = responsesFallbackResponseID
-	}
 	if p.model == "" {
 		resp["model"] = responsesFallbackModel
 	}

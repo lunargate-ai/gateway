@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -41,7 +42,36 @@ type conversationDeletedObject struct {
 	Deleted bool   `json:"deleted"`
 }
 
+type conversationItemInputError struct {
+	message string
+	param   string
+	code    string
+}
+
+func (e *conversationItemInputError) Error() string {
+	if e == nil {
+		return "invalid conversation item"
+	}
+	return e.message
+}
+
 func (h *Handler) CreateConversation(w http.ResponseWriter, r *http.Request) {
+	binding, native, err := h.conversationCreateBinding(r)
+	if err != nil {
+		writeConversationBindingResolutionError(w, err)
+		return
+	}
+	if native {
+		body, ok := readResponseOperationBody(w, r)
+		if !ok {
+			return
+		}
+		h.proxyNativeConversationCreate(w, r, binding, body)
+		return
+	}
+	if rejectUnsupportedLocalConversationQuery(w, r) {
+		return
+	}
 	var req conversationCreateRequest
 	if !decodeConversationRequest(w, r, &req) {
 		return
@@ -57,7 +87,7 @@ func (h *Handler) CreateConversation(w http.ResponseWriter, r *http.Request) {
 	}
 	items, err := prepareConversationItems(req.Items)
 	if err != nil {
-		writeConversationInvalid(w, err.Error(), "items", "invalid_conversation_item")
+		writeConversationItemInputError(w, err)
 		return
 	}
 	if h == nil || h.conversationsState == nil {
@@ -74,8 +104,20 @@ func (h *Handler) CreateConversation(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) GetConversation(w http.ResponseWriter, r *http.Request) {
 	conversationID := strings.TrimSpace(chi.URLParam(r, "conversation_id"))
-	if h == nil || h.conversationsState == nil {
+	binding, native, local, err := h.resolveConversationOwner(r, conversationID)
+	if err != nil {
+		writeConversationBindingResolutionError(w, err)
+		return
+	}
+	if native {
+		h.proxyNativeConversationRequest(w, r, binding, http.MethodGet, nativeConversationPath(conversationID), nil)
+		return
+	}
+	if !local {
 		writeConversationNotFound(w, conversationID)
+		return
+	}
+	if rejectUnsupportedLocalConversationQuery(w, r) {
 		return
 	}
 	conversation, ok := h.conversationsState.get(conversationID)
@@ -88,6 +130,26 @@ func (h *Handler) GetConversation(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) UpdateConversation(w http.ResponseWriter, r *http.Request) {
 	conversationID := strings.TrimSpace(chi.URLParam(r, "conversation_id"))
+	binding, native, local, err := h.resolveConversationOwner(r, conversationID)
+	if err != nil {
+		writeConversationBindingResolutionError(w, err)
+		return
+	}
+	if native {
+		body, ok := readResponseOperationBody(w, r)
+		if !ok {
+			return
+		}
+		h.proxyNativeConversationRequest(w, r, binding, http.MethodPost, nativeConversationPath(conversationID), body)
+		return
+	}
+	if !local {
+		writeConversationNotFound(w, conversationID)
+		return
+	}
+	if rejectUnsupportedLocalConversationQuery(w, r) {
+		return
+	}
 	var req conversationUpdateRequest
 	if !decodeConversationRequest(w, r, &req) {
 		return
@@ -101,10 +163,6 @@ func (h *Handler) UpdateConversation(w http.ResponseWriter, r *http.Request) {
 		writeConversationInvalid(w, err.Error(), "metadata", "invalid_metadata")
 		return
 	}
-	if h == nil || h.conversationsState == nil {
-		writeConversationNotFound(w, conversationID)
-		return
-	}
 	conversation, err := h.conversationsState.updateMetadata(conversationID, metadata)
 	if err != nil {
 		writeConversationStateErrorForID(w, err, conversationID, "")
@@ -115,8 +173,20 @@ func (h *Handler) UpdateConversation(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) DeleteConversation(w http.ResponseWriter, r *http.Request) {
 	conversationID := strings.TrimSpace(chi.URLParam(r, "conversation_id"))
-	if h == nil || h.conversationsState == nil {
+	binding, native, local, err := h.resolveConversationOwner(r, conversationID)
+	if err != nil {
+		writeConversationBindingResolutionError(w, err)
+		return
+	}
+	if native {
+		h.deleteNativeConversation(w, r, binding, conversationID)
+		return
+	}
+	if !local {
 		writeConversationNotFound(w, conversationID)
+		return
+	}
+	if rejectUnsupportedLocalConversationQuery(w, r) {
 		return
 	}
 	conversation, ok := h.conversationsState.delete(conversationID)
@@ -133,6 +203,26 @@ func (h *Handler) DeleteConversation(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) CreateConversationItems(w http.ResponseWriter, r *http.Request) {
 	conversationID := strings.TrimSpace(chi.URLParam(r, "conversation_id"))
+	binding, native, local, err := h.resolveConversationOwner(r, conversationID)
+	if err != nil {
+		writeConversationBindingResolutionError(w, err)
+		return
+	}
+	if native {
+		body, ok := readResponseOperationBody(w, r)
+		if !ok {
+			return
+		}
+		h.proxyNativeConversationRequest(w, r, binding, http.MethodPost, nativeConversationItemsPath(conversationID), body)
+		return
+	}
+	if !local {
+		writeConversationNotFound(w, conversationID)
+		return
+	}
+	if rejectUnsupportedLocalConversationQuery(w, r) {
+		return
+	}
 	var req conversationItemsCreateRequest
 	if !decodeConversationRequest(w, r, &req) {
 		return
@@ -147,11 +237,7 @@ func (h *Handler) CreateConversationItems(w http.ResponseWriter, r *http.Request
 	}
 	items, err := prepareConversationItems(req.Items)
 	if err != nil {
-		writeConversationInvalid(w, err.Error(), "items", "invalid_conversation_item")
-		return
-	}
-	if h == nil || h.conversationsState == nil {
-		writeConversationNotFound(w, conversationID)
+		writeConversationItemInputError(w, err)
 		return
 	}
 	created, err := h.conversationsState.addItems(conversationID, items)
@@ -164,6 +250,22 @@ func (h *Handler) CreateConversationItems(w http.ResponseWriter, r *http.Request
 
 func (h *Handler) ListConversationItems(w http.ResponseWriter, r *http.Request) {
 	conversationID := strings.TrimSpace(chi.URLParam(r, "conversation_id"))
+	binding, native, local, err := h.resolveConversationOwner(r, conversationID)
+	if err != nil {
+		writeConversationBindingResolutionError(w, err)
+		return
+	}
+	if native {
+		h.proxyNativeConversationRequest(w, r, binding, http.MethodGet, nativeConversationItemsPath(conversationID), nil)
+		return
+	}
+	if !local {
+		writeConversationNotFound(w, conversationID)
+		return
+	}
+	if rejectUnsupportedLocalConversationQuery(w, r, "after", "limit", "order") {
+		return
+	}
 	order := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("order")))
 	if order == "" {
 		order = "desc"
@@ -180,10 +282,6 @@ func (h *Handler) ListConversationItems(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		limit = parsed
-	}
-	if h == nil || h.conversationsState == nil {
-		writeConversationNotFound(w, conversationID)
-		return
 	}
 	items, err := h.conversationsState.listItems(
 		conversationID,
@@ -205,8 +303,20 @@ func (h *Handler) ListConversationItems(w http.ResponseWriter, r *http.Request) 
 func (h *Handler) GetConversationItem(w http.ResponseWriter, r *http.Request) {
 	conversationID := strings.TrimSpace(chi.URLParam(r, "conversation_id"))
 	itemID := strings.TrimSpace(chi.URLParam(r, "item_id"))
-	if h == nil || h.conversationsState == nil {
+	binding, native, local, err := h.resolveConversationOwner(r, conversationID)
+	if err != nil {
+		writeConversationBindingResolutionError(w, err)
+		return
+	}
+	if native {
+		h.proxyNativeConversationRequest(w, r, binding, http.MethodGet, nativeConversationItemPath(conversationID, itemID), nil)
+		return
+	}
+	if !local {
 		writeConversationNotFound(w, conversationID)
+		return
+	}
+	if rejectUnsupportedLocalConversationQuery(w, r) {
 		return
 	}
 	item, err := h.conversationsState.getItem(conversationID, itemID)
@@ -220,8 +330,20 @@ func (h *Handler) GetConversationItem(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) DeleteConversationItem(w http.ResponseWriter, r *http.Request) {
 	conversationID := strings.TrimSpace(chi.URLParam(r, "conversation_id"))
 	itemID := strings.TrimSpace(chi.URLParam(r, "item_id"))
-	if h == nil || h.conversationsState == nil {
+	binding, native, local, err := h.resolveConversationOwner(r, conversationID)
+	if err != nil {
+		writeConversationBindingResolutionError(w, err)
+		return
+	}
+	if native {
+		h.proxyNativeConversationRequest(w, r, binding, http.MethodDelete, nativeConversationItemPath(conversationID, itemID), nil)
+		return
+	}
+	if !local {
 		writeConversationNotFound(w, conversationID)
+		return
+	}
+	if rejectUnsupportedLocalConversationQuery(w, r) {
 		return
 	}
 	conversation, err := h.conversationsState.deleteItem(conversationID, itemID)
@@ -240,11 +362,52 @@ func decodeConversationRequest(w http.ResponseWriter, r *http.Request, dst inter
 		writeRequestReadError(w, err)
 		return false
 	}
-	if err := decodeJSONStrict(bytes.NewReader(body), dst); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(dst); err != nil {
+		writeRequestDecodeError(w, err)
+		return false
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err != io.EOF {
 		writeRequestDecodeError(w, err)
 		return false
 	}
 	return true
+}
+
+func rejectUnsupportedLocalConversationQuery(w http.ResponseWriter, r *http.Request, allowed ...string) bool {
+	if r == nil || r.URL == nil || r.URL.RawQuery == "" {
+		return false
+	}
+	allowedSet := make(map[string]struct{}, len(allowed))
+	for _, key := range allowed {
+		allowedSet[key] = struct{}{}
+	}
+	keys := make([]string, 0, len(r.URL.Query()))
+	for key := range r.URL.Query() {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, rawKey := range keys {
+		key := strings.TrimSpace(rawKey)
+		if _, ok := allowedSet[key]; ok {
+			continue
+		}
+		displayKey := key
+		if key == "include[]" {
+			displayKey = "include"
+		}
+		code := "unknown_parameter"
+		message := fmt.Sprintf("query parameter %q is not supported", displayKey)
+		if displayKey == "include" {
+			code = "unsupported_feature"
+			message = "include is not supported for locally stored conversations"
+		}
+		writeConversationInvalid(w, message, displayKey, code)
+		return true
+	}
+	return false
 }
 
 func parseConversationMetadata(raw json.RawMessage) (map[string]string, error) {
@@ -271,10 +434,11 @@ func parseConversationMetadata(raw json.RawMessage) (map[string]string, error) {
 
 func prepareConversationItems(rawItems []json.RawMessage) ([]map[string]json.RawMessage, error) {
 	items := make([]map[string]json.RawMessage, 0, len(rawItems))
+	seenIDs := make(map[string]struct{}, len(rawItems))
 	for index, raw := range rawItems {
 		var item map[string]json.RawMessage
 		if err := json.Unmarshal(raw, &item); err != nil || item == nil {
-			return nil, fmt.Errorf("items[%d] must be an object", index)
+			return nil, newConversationItemInputError(index, "", "must be an object", "invalid_conversation_item")
 		}
 		itemType := parseJSONStringRaw(item["type"])
 		if itemType == "" && parseJSONStringRaw(item["role"]) != "" {
@@ -282,17 +446,62 @@ func prepareConversationItems(rawItems []json.RawMessage) ([]map[string]json.Raw
 			item["type"] = json.RawMessage(`"message"`)
 		}
 		if itemType == "" {
-			return nil, fmt.Errorf("items[%d].type is required", index)
+			return nil, newConversationItemInputError(index, "type", "is required", "invalid_conversation_item")
 		}
-		if conversationItemID(item) == "" {
+		if itemType == "item_reference" {
+			return nil, newConversationItemInputError(index, "type", "item_reference cannot be resolved by local conversation storage", "unsupported_feature")
+		}
+		itemID, hasID, validID := suppliedConversationItemID(item)
+		if hasID && !validID {
+			return nil, newConversationItemInputError(index, "id", "must be a non-empty string", "invalid_value")
+		}
+		if !hasID {
 			item["id"] = mustJSONRawString(conversationItemPrefix(itemType) + uuid.NewString())
+			itemID = conversationItemID(item)
 		}
+		if _, exists := seenIDs[itemID]; exists {
+			return nil, newConversationItemInputError(index, "id", "duplicates another item ID in this request", "duplicate_item_id")
+		}
+		seenIDs[itemID] = struct{}{}
 		if len(item["status"]) == 0 && conversationItemHasStatus(itemType) {
 			item["status"] = json.RawMessage(`"completed"`)
 		}
 		items = append(items, item)
 	}
 	return items, nil
+}
+
+func suppliedConversationItemID(item map[string]json.RawMessage) (string, bool, bool) {
+	raw, exists := item["id"]
+	if !exists {
+		return "", false, true
+	}
+	var id string
+	if err := json.Unmarshal(raw, &id); err != nil || strings.TrimSpace(id) == "" {
+		return "", true, false
+	}
+	return id, true, true
+}
+
+func newConversationItemInputError(index int, field, message, code string) *conversationItemInputError {
+	param := fmt.Sprintf("items[%d]", index)
+	if field != "" {
+		param += "." + field
+	}
+	return &conversationItemInputError{
+		message: param + " " + message,
+		param:   param,
+		code:    code,
+	}
+}
+
+func writeConversationItemInputError(w http.ResponseWriter, err error) {
+	var inputErr *conversationItemInputError
+	if errors.As(err, &inputErr) {
+		writeConversationInvalid(w, inputErr.message, inputErr.param, inputErr.code)
+		return
+	}
+	writeConversationInvalid(w, err.Error(), "items", "invalid_conversation_item")
 }
 
 func conversationItemPrefix(itemType string) string {
@@ -364,6 +573,10 @@ func writeConversationItemNotFound(w http.ResponseWriter, itemID string) {
 func writeConversationStateError(w http.ResponseWriter, err error) {
 	if errors.Is(err, errConversationItemLimit) {
 		writeConversationInvalid(w, "conversation contains too many items", "items", "conversation_item_limit_exceeded")
+		return
+	}
+	if errors.Is(err, errConversationItemIDConflict) {
+		writeConversationInvalid(w, "conversation item ID already exists", "items", "duplicate_item_id")
 		return
 	}
 	writeError(w, http.StatusInsufficientStorage, "conversation state storage limit exceeded", "server_error")

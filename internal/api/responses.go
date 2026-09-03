@@ -312,7 +312,9 @@ func (h *Handler) handleResponsesNonStream(
 		return
 	}
 
-	resp := models.UnifiedResponseToResponses(unifiedResp)
+	translatedUnified := *unifiedResp
+	translatedUnified.ID = translatedResponseID(unifiedResp.ID)
+	resp := models.UnifiedResponseToResponses(&translatedUnified)
 	completedResponse, err = responsesResponseToMap(resp)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to prepare response", "internal_error")

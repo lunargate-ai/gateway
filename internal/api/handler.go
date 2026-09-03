@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/lunargate-ai/gateway/internal/config"
 	"github.com/lunargate-ai/gateway/internal/middleware"
@@ -29,19 +31,20 @@ import (
 
 // Handler is the main API handler that orchestrates the request lifecycle.
 type Handler struct {
-	registry           *providers.Registry
-	router             *routing.Engine
-	fallback           *resilience.FallbackExecutor
-	cache              *middleware.Cache
-	streamer           *streaming.Handler
-	metrics            *observability.Metrics
-	collector          *observability.CollectorClient
-	selector           *modelselect.Engine
-	store              *modelstore.Store
-	providerClients    *providerClientRegistry
-	responsesState     *responsesStateStore
-	responseBindings   *responseBindingStore
-	conversationsState *conversationStateStore
+	registry             *providers.Registry
+	router               *routing.Engine
+	fallback             *resilience.FallbackExecutor
+	cache                *middleware.Cache
+	streamer             *streaming.Handler
+	metrics              *observability.Metrics
+	collector            *observability.CollectorClient
+	selector             *modelselect.Engine
+	store                *modelstore.Store
+	providerClients      *providerClientRegistry
+	responsesState       *responsesStateStore
+	responseBindings     *responseBindingStore
+	conversationBindings *conversationBindingStore
+	conversationsState   *conversationStateStore
 }
 
 type trackedResponseWriter struct {
@@ -240,19 +243,6 @@ func requestContextWithRetryPolicy(r *http.Request) context.Context {
 	return ctx
 }
 
-func upstreamFailureFromError(err error) (int, string, string, bool) {
-	var statusErr *resilience.RetryableStatusError
-	if !errors.As(err, &statusErr) || statusErr == nil || statusErr.StatusCode <= 0 {
-		return 0, "", "", false
-	}
-
-	errCode := "upstream_error"
-	if statusErr.StatusCode == http.StatusTooManyRequests {
-		errCode = "rate_limit_error"
-	}
-	return statusErr.StatusCode, errCode, statusErr.Error(), true
-}
-
 func (h *Handler) observeCircuitBreakerState(provider string, state string) {
 	if h == nil || h.metrics == nil {
 		return
@@ -284,19 +274,20 @@ func NewHandler(
 	store *modelstore.Store,
 ) *Handler {
 	return &Handler{
-		registry:           registry,
-		router:             router,
-		fallback:           fallback,
-		cache:              cache,
-		streamer:           streamer,
-		metrics:            metrics,
-		collector:          collector,
-		selector:           selector,
-		store:              store,
-		providerClients:    newProviderClientRegistry(nil),
-		responsesState:     newResponsesStateStore(30 * time.Minute),
-		responseBindings:   newResponseBindingStore(30 * time.Minute),
-		conversationsState: newConversationStateStore(30 * time.Minute),
+		registry:             registry,
+		router:               router,
+		fallback:             fallback,
+		cache:                cache,
+		streamer:             streamer,
+		metrics:              metrics,
+		collector:            collector,
+		selector:             selector,
+		store:                store,
+		providerClients:      newProviderClientRegistry(nil),
+		responsesState:       newResponsesStateStore(30 * time.Minute),
+		responseBindings:     newResponseBindingStore(30 * time.Minute),
+		conversationBindings: newConversationBindingStore(30 * time.Minute),
+		conversationsState:   newConversationStateStore(30 * time.Minute),
 	}
 }
 
@@ -491,7 +482,10 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	resolvedRequestTypes := chatAPIRequestTypes(requestType, resolved.Target)
 	resolvedCollectorHeaders := resolvedRequestTypes.tags(headers)
 
-	noCache := r.Header.Get("X-LunarGate-No-Cache") == "true" || (req.Store != nil && !*req.Store)
+	// An explicit storage policy is part of the upstream side effect. Replaying
+	// a cached body for store:true would skip creation of the stored upstream
+	// object, while caching store:false would violate the caller's policy.
+	noCache := r.Header.Get("X-LunarGate-No-Cache") == "true" || req.Store != nil
 	if !req.Stream && !noCache && h.cache.Enabled() {
 		cacheKey := middleware.GenerateKeyForTarget(&req, resolved.Target.Provider, resolved.Target.UpstreamRequestType)
 		if cached := h.cache.Get(cacheKey); cached != nil {
@@ -615,6 +609,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		errCode := "provider_error"
 		errMsg := "all LLM providers unavailable"
 		requestFailure := false
+		var upstreamFailure *upstreamHTTPError
 		if errors.Is(err, context.Canceled) {
 			status = 499
 			errCode = "client_cancelled"
@@ -634,32 +629,42 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				Int("status_code", status).
 				Dur("duration", duration).
 				Msg("provider request rejected before upstream call")
-		} else if upstreamStatus, upstreamErrCode, upstreamErrMsg, ok := upstreamFailureFromError(err); ok {
-			status = upstreamStatus
-			errCode = upstreamErrCode
-			errMsg = upstreamErrMsg
-			log.Warn().
-				Err(err).
-				Str("request_id", requestID).
-				Int("status_code", status).
-				Dur("duration", duration).
-				Msg("upstream provider failure after retries")
 		} else {
-			log.Error().Err(err).
-				Str("request_id", requestID).
-				Dur("duration", duration).
-				Msg("all providers failed")
+			providerType, _ := h.registry.Type(usedTarget.Provider)
+			if failure, ok := upstreamHTTPErrorFromRetry(err, providerType); ok {
+				upstreamFailure = failure
+				status = failure.status
+				errCode = failure.errType
+				errMsg = failure.message
+				log.Warn().
+					Err(err).
+					Str("request_id", requestID).
+					Int("status_code", status).
+					Dur("duration", duration).
+					Msg("upstream provider failure after retries")
+			} else {
+				log.Error().Err(err).
+					Str("request_id", requestID).
+					Dur("duration", duration).
+					Msg("all providers failed")
+			}
 		}
 		if !errors.Is(err, context.Canceled) && !requestFailure {
 			h.metrics.ProviderErrors.WithLabelValues(resolved.Target.Provider, "all_failed").Inc()
 		}
 		setTimingHeaders(w, duration.Milliseconds(), upstreamStartMS)
-		writeError(w, status, errMsg, errCode)
+		if upstreamFailure != nil {
+			upstreamFailure.write(w)
+		} else {
+			writeError(w, status, errMsg, errCode)
+		}
 		if h.collector != nil {
 			errCodeForCollector := errCode
 			errMsgForCollector := err.Error()
 			if errors.Is(err, context.Canceled) {
 				errMsgForCollector = "client disconnected"
+			} else if upstreamFailure != nil {
+				errMsgForCollector = upstreamFailure.message
 			}
 			routeUsed := resolved.RouteName
 			targetIndex := resolved.Index
@@ -883,7 +888,9 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			strings.EqualFold(strings.TrimSpace(usedRequestTypes.upstream), requestTypeResponses) &&
 			resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices
 		nativeResponseStatus := http.StatusOK
-		if nativeResponsesStream {
+		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+			streamErr = readUpstreamHTTPError(resp, usedProviderType)
+		} else if nativeResponsesStream {
 			nativeResponseStatus = resp.StatusCode
 			copyHeaders(w.Header(), resp.Header)
 			nativeSink, _ := w.(nativeResponsesStreamSink)
@@ -921,12 +928,26 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				resp,
 				translator,
 				streamObserver,
-				includeAnthropicStreamUsage(requestType, &req),
+				includeClientStreamUsage(requestType, &req),
 			)
 		} else if usedProviderType == "ollama" {
-			streamErr = h.streamer.StreamNDJSONResponseWithObserver(r.Context(), tw, resp, translator, streamObserver)
+			streamErr = h.streamer.StreamNDJSONResponseWithObserverAndUsage(
+				r.Context(),
+				tw,
+				resp,
+				translator,
+				streamObserver,
+				includeClientStreamUsage(requestType, &req),
+			)
 		} else {
-			streamErr = h.streamer.StreamResponseWithObserver(r.Context(), tw, resp, translator, streamObserver)
+			streamErr = h.streamer.StreamResponseWithObserverAndUsage(
+				r.Context(),
+				tw,
+				resp,
+				translator,
+				streamObserver,
+				includeClientStreamUsage(requestType, &req),
+			)
 		}
 
 		duration := time.Since(startTime)
@@ -941,6 +962,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			status = http.StatusBadGateway
 			errCode := "streaming_error"
 			errMsg := streamErr.Error()
+			var upstreamFailure *upstreamHTTPError
 
 			if errors.Is(streamErr, context.Canceled) {
 				status = 499
@@ -950,7 +972,15 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 					Str("request_id", requestID).
 					Dur("duration", duration).
 					Msg("streaming cancelled")
-			} else if pe, ok := streamErr.(*providers.ProviderError); ok {
+			} else if errors.As(streamErr, &upstreamFailure) && upstreamFailure != nil {
+				status = upstreamFailure.status
+				errCode = upstreamFailure.errType
+				errMsg = upstreamFailure.message
+				log.Warn().Err(streamErr).
+					Str("request_id", requestID).
+					Dur("duration", duration).
+					Msg("upstream rejected streaming request")
+			} else if pe := (*providers.ProviderError)(nil); errors.As(streamErr, &pe) && pe != nil {
 				if pe.StatusCode != 0 {
 					status = pe.StatusCode
 				}
@@ -986,7 +1016,11 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 
 			if !trw.wroteHeader && !errors.Is(streamErr, context.Canceled) {
-				writeError(tw, status, errMsg, errCode)
+				if upstreamFailure != nil {
+					upstreamFailure.write(tw)
+				} else {
+					writeError(tw, status, errMsg, errCode)
+				}
 			}
 
 			errCodePtr = &errCode
@@ -1174,8 +1208,16 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		responseHeaders = resp.Header.Clone()
 	}
 
-	// Handle non-streaming response
-	unified, err := providerSnapshot.Translator.ParseResponse(resp)
+	// Handle non-streaming response. HTTP failures are consumed here so a
+	// native OpenAI error document is not reduced by a typed translator.
+	var unified *models.UnifiedResponse
+	var upstreamFailure *upstreamHTTPError
+	if resp.StatusCode >= http.StatusBadRequest {
+		upstreamFailure = readUpstreamHTTPError(resp, usedProviderType)
+		err = upstreamFailure
+	} else {
+		unified, err = providerSnapshot.Translator.ParseResponse(resp)
+	}
 	if err != nil {
 		duration := time.Since(startTime)
 		status := http.StatusBadGateway
@@ -1184,7 +1226,13 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		errMsg := "failed to parse provider response: " + err.Error()
 		metricErrType := "parse_error"
 		var pe *providers.ProviderError
-		if errors.As(err, &pe) {
+		if upstreamFailure != nil {
+			status = upstreamFailure.status
+			respErrType = upstreamFailure.errType
+			collectorErrCode = upstreamFailure.errType
+			errMsg = upstreamFailure.message
+			metricErrType = upstreamFailure.errType
+		} else if errors.As(err, &pe) {
 			if pe.StatusCode != 0 {
 				status = pe.StatusCode
 			}
@@ -1219,7 +1267,11 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			Msg("failed to parse provider response")
 		h.metrics.ProviderErrors.WithLabelValues(usedTarget.Provider, metricErrType).Inc()
 		setTimingHeaders(w, duration.Milliseconds(), upstreamStartMS)
-		writeError(w, status, errMsg, respErrType)
+		if upstreamFailure != nil {
+			upstreamFailure.write(w)
+		} else {
+			writeError(w, status, errMsg, respErrType)
+		}
 		if h.collector != nil {
 			errCode := collectorErrCode
 			routeUsed := resolved.RouteName
@@ -1271,7 +1323,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 						SessionID:           sessionIDPtr,
 						Provider:            usedTarget.Provider,
 						Model:               usedModelCanonical,
-						StatusCode:          http.StatusBadGateway,
+						StatusCode:          status,
 						DurationMS:          duration.Milliseconds(),
 						RouteUsed:           &routeUsed,
 						CacheHit:            cacheHit,
@@ -1408,7 +1460,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	return
 }
 
-func includeAnthropicStreamUsage(requestType string, req *models.UnifiedRequest) bool {
+func includeClientStreamUsage(requestType string, req *models.UnifiedRequest) bool {
 	// The Responses stream contract requires terminal usage for its lifecycle
 	// events. Chat Completions only exposes it when the client opts in.
 	if strings.EqualFold(strings.TrimSpace(requestType), requestTypeResponses) {
@@ -1419,14 +1471,7 @@ func includeAnthropicStreamUsage(requestType string, req *models.UnifiedRequest)
 
 // ListModels handles GET /v1/models.
 func (h *Handler) ListModels(w http.ResponseWriter, r *http.Request) {
-	var allModels []models.ModelInfo
-	if h.store != nil {
-		allModels = h.store.AllModels(r.Context())
-	} else {
-		allModels = h.registry.AllModels()
-	}
-	auto := models.ModelInfo{ID: "lunargate/auto", Object: "model", Created: time.Now().Unix(), OwnedBy: "lunargate"}
-	allModels = append(allModels, auto)
+	allModels := h.availableModels(r.Context())
 	resp := models.ModelList{
 		Object: "list",
 		Data:   allModels,
@@ -1436,8 +1481,29 @@ func (h *Handler) ListModels(w http.ResponseWriter, r *http.Request) {
 
 // GetModel handles GET /v1/models/{model}.
 func (h *Handler) GetModel(w http.ResponseWriter, r *http.Request) {
-	// For now, return a simple model info
+	modelID, err := url.PathUnescape(strings.TrimSpace(chi.URLParam(r, "*")))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid model ID", "invalid_request_error")
+		return
+	}
+	for _, model := range h.availableModels(r.Context()) {
+		if model.ID == modelID {
+			writeJSON(w, http.StatusOK, model)
+			return
+		}
+	}
 	writeError(w, http.StatusNotFound, "model not found", "invalid_request_error")
+}
+
+func (h *Handler) availableModels(ctx context.Context) []models.ModelInfo {
+	var allModels []models.ModelInfo
+	if h != nil && h.store != nil {
+		allModels = h.store.AllModels(ctx)
+	} else if h != nil && h.registry != nil {
+		allModels = h.registry.AllModels()
+	}
+	auto := models.ModelInfo{ID: "lunargate/auto", Object: "model", Created: time.Now().Unix(), OwnedBy: "lunargate"}
+	return append(allModels, auto)
 }
 
 // callProvider makes the actual HTTP request to the LLM provider.

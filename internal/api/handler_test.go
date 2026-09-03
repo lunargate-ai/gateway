@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -159,8 +160,8 @@ func TestChatCompletions_RetryExhausted429PreservesUpstreamStatus(t *testing.T) 
 	if resp.Error.Type != "rate_limit_error" {
 		t.Fatalf("expected error type %q, got %q", "rate_limit_error", resp.Error.Type)
 	}
-	if resp.Error.Message != "provider returned status 429" {
-		t.Fatalf("expected error message %q, got %q", "provider returned status 429", resp.Error.Message)
+	if resp.Error.Message != "too many requests" {
+		t.Fatalf("expected error message %q, got %q", "too many requests", resp.Error.Message)
 	}
 }
 
@@ -1183,8 +1184,11 @@ func TestResponses_PreviousResponseIDResolvedLocallyForNonStreamFollowUp(t *test
 	if err := json.Unmarshal(firstRec.Body.Bytes(), &firstResp); err != nil {
 		t.Fatalf("failed to unmarshal first responses payload: %v", err)
 	}
+	if !strings.HasPrefix(firstResp.ID, "resp_") {
+		t.Fatalf("translated response ID = %q, want resp_ prefix", firstResp.ID)
+	}
 
-	secondPayload := []byte(`{"model":"lunargate/auto","previous_response_id":"chatcmpl-tool-1","input":[{"type":"function_call_output","call_id":"call_time_1","output":"{\"iso\":\"2026-04-09T16:51:50Z\"}"}],"tools":[{"type":"function","name":"get_current_time","description":"Return the current UTC time in ISO 8601 format.","parameters":{"type":"object","properties":{"format":{"type":"string"}}}}],"tool_choice":"auto"}`)
+	secondPayload := []byte(fmt.Sprintf(`{"model":"lunargate/auto","previous_response_id":%q,"input":[{"type":"function_call_output","call_id":"call_time_1","output":"{\"iso\":\"2026-04-09T16:51:50Z\"}"}],"tools":[{"type":"function","name":"get_current_time","description":"Return the current UTC time in ISO 8601 format.","parameters":{"type":"object","properties":{"format":{"type":"string"}}}}],"tool_choice":"auto"}`, firstResp.ID))
 	secondReq := httptest.NewRequest(http.MethodPost, "http://example.com/v1/responses", bytes.NewReader(secondPayload))
 	secondRec := httptest.NewRecorder()
 	h.Responses(secondRec, secondReq)
@@ -1290,11 +1294,11 @@ func TestResponses_PreviousResponseIDResolvedLocallyForStreamFollowUp(t *testing
 		responseObj, _ := evt["response"].(map[string]interface{})
 		firstResponseID, _ = responseObj["id"].(string)
 	}
-	if firstResponseID != "chatcmpl-stream-tool-1" {
-		t.Fatalf("expected cached first response id, got %q", firstResponseID)
+	if !strings.HasPrefix(firstResponseID, "resp_") {
+		t.Fatalf("translated streaming response ID = %q, want resp_ prefix", firstResponseID)
 	}
 
-	secondPayload := []byte(`{"model":"lunargate/auto","stream":true,"previous_response_id":"chatcmpl-stream-tool-1","input":[{"type":"function_call_output","call_id":"call_time_stream_1","output":"{\"iso\":\"2026-04-09T16:51:50Z\"}"}],"tools":[{"type":"function","name":"get_current_time","description":"Return the current UTC time in ISO 8601 format.","parameters":{"type":"object","properties":{"format":{"type":"string"}}}}],"tool_choice":"auto"}`)
+	secondPayload := []byte(fmt.Sprintf(`{"model":"lunargate/auto","stream":true,"previous_response_id":%q,"input":[{"type":"function_call_output","call_id":"call_time_stream_1","output":"{\"iso\":\"2026-04-09T16:51:50Z\"}"}],"tools":[{"type":"function","name":"get_current_time","description":"Return the current UTC time in ISO 8601 format.","parameters":{"type":"object","properties":{"format":{"type":"string"}}}}],"tool_choice":"auto"}`, firstResponseID))
 	secondReq := httptest.NewRequest(http.MethodPost, "http://example.com/v1/responses", bytes.NewReader(secondPayload))
 	secondRec := httptest.NewRecorder()
 	h.Responses(secondRec, secondReq)

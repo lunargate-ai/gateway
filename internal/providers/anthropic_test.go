@@ -193,6 +193,47 @@ func TestAnthropicTranslator_RejectsUnsupportedClientControls(t *testing.T) {
 	}
 }
 
+func TestAnthropicTranslator_RejectsLossyMessageInput(t *testing.T) {
+	tests := []struct {
+		name      string
+		message   models.Message
+		wantField string
+	}{
+		{
+			name:      "unknown role",
+			message:   models.Message{Role: "critic", Content: "Review this."},
+			wantField: "messages[0].role",
+		},
+		{
+			name: "unsupported content part",
+			message: models.Message{Role: "user", Content: []interface{}{
+				map[string]interface{}{
+					"type":        "input_audio",
+					"input_audio": map[string]interface{}{"data": "...", "format": "wav"},
+				},
+			}},
+			wantField: "messages[0].content[0].type",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			translator := NewAnthropicTranslator(config.ProviderConfig{APIKey: "dummy"})
+			_, err := translator.TranslateRequest(context.Background(), &models.UnifiedRequest{
+				Model:    "claude-sonnet-4-5",
+				Messages: []models.Message{tt.message},
+			})
+			var compatibilityErr *models.CompatibilityError
+			if !errors.As(err, &compatibilityErr) {
+				t.Fatalf("error = %v, want CompatibilityError", err)
+			}
+			if compatibilityErr.Field != tt.wantField || compatibilityErr.Provider != "anthropic" {
+				t.Fatalf("compatibility error = %#v, want field=%q provider=anthropic", compatibilityErr, tt.wantField)
+			}
+		})
+	}
+}
+
 func TestAnthropicTranslator_AllowsNonStoringRequests(t *testing.T) {
 	store := false
 	one := 1

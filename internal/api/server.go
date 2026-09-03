@@ -52,7 +52,8 @@ func NewRouter(handler *Handler, authManager *security.Manager, rateLimiter *mid
 		r.Delete("/conversations/{conversation_id}/items/{item_id}", handler.DeleteConversationItem)
 		r.Post("/embeddings", handler.Embeddings)
 		r.Get("/models", handler.ListModels)
-		r.Get("/models/{model}", handler.GetModel)
+		// Canonical model IDs may contain provider and vendor path segments.
+		r.Get("/models/*", handler.GetModel)
 	})
 
 	return r

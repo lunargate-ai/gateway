@@ -16,7 +16,7 @@ import (
 )
 
 func (h *Handler) StreamNDJSONResponse(ctx context.Context, w http.ResponseWriter, providerResp *http.Response, translator models.ProviderTranslator) error {
-	return h.streamNDJSONResponse(ctx, w, providerResp, translator, nil)
+	return h.streamNDJSONResponse(ctx, w, providerResp, translator, nil, true)
 }
 
 func (h *Handler) StreamNDJSONResponseWithObserver(
@@ -26,7 +26,21 @@ func (h *Handler) StreamNDJSONResponseWithObserver(
 	translator models.ProviderTranslator,
 	observer ChunkObserver,
 ) error {
-	return h.streamNDJSONResponse(ctx, w, providerResp, translator, observer)
+	return h.streamNDJSONResponse(ctx, w, providerResp, translator, observer, true)
+}
+
+// StreamNDJSONResponseWithObserverAndUsage controls whether translated usage
+// is exposed to a Chat Completions client while always reporting it to the
+// gateway observer.
+func (h *Handler) StreamNDJSONResponseWithObserverAndUsage(
+	ctx context.Context,
+	w http.ResponseWriter,
+	providerResp *http.Response,
+	translator models.ProviderTranslator,
+	observer ChunkObserver,
+	includeUsage bool,
+) error {
+	return h.streamNDJSONResponse(ctx, w, providerResp, translator, observer, includeUsage)
 }
 
 func (h *Handler) streamNDJSONResponse(
@@ -35,6 +49,7 @@ func (h *Handler) streamNDJSONResponse(
 	providerResp *http.Response,
 	translator models.ProviderTranslator,
 	observer ChunkObserver,
+	includeUsage bool,
 ) error {
 	if providerResp != nil && providerResp.StatusCode != http.StatusOK {
 		defer providerResp.Body.Close()
@@ -47,8 +62,6 @@ func (h *Handler) streamNDJSONResponse(
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Transfer-Encoding", "chunked")
 	w.WriteHeader(http.StatusOK)
 	if err := controller.Flush(); err != nil {
 		return fmt.Errorf("failed to flush stream headers: %w", err)
@@ -84,8 +97,14 @@ func (h *Handler) streamNDJSONResponse(
 			if observer != nil {
 				observer(chunk)
 			}
+			clientChunk := chunk
+			if !includeUsage && chunk.Usage != nil {
+				copyChunk := *chunk
+				copyChunk.Usage = nil
+				clientChunk = &copyChunk
+			}
 
-			chunkJSON, err := json.Marshal(chunk)
+			chunkJSON, err := json.Marshal(clientChunk)
 			if err != nil {
 				log.Error().Err(err).Msg("failed to marshal stream chunk")
 			} else {

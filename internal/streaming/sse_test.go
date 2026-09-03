@@ -75,6 +75,11 @@ func TestStreamHandlersRecognizeWrappedTerminalError(t *testing.T) {
 			if got := recorder.Body.String(); got != "data: [DONE]\n\n" {
 				t.Fatalf("stream body = %q, want terminal frame", got)
 			}
+			for _, header := range []string{"Connection", "Transfer-Encoding"} {
+				if got := recorder.Header().Get(header); got != "" {
+					t.Fatalf("hop-by-hop header %s = %q, want empty", header, got)
+				}
+			}
 		})
 	}
 }
@@ -183,6 +188,77 @@ func TestStreamResponseEmitsTerminalUsageBeforeDone(t *testing.T) {
 	}
 	if chunk.Usage == nil || chunk.Usage.PromptTokens != 17 || chunk.Usage.CompletionTokens != 9 || chunk.Usage.TotalTokens != 26 {
 		t.Fatalf("unexpected terminal usage: %#v", chunk.Usage)
+	}
+}
+
+func TestGenericStreamHandlersRespectIncludeUsageWithoutHidingMetrics(t *testing.T) {
+	base := providers.NewOpenAITranslator(config.ProviderConfig{APIKey: "dummy"})
+	terminal := &models.StreamChunk{
+		Choices: []models.Choice{{Index: 0}},
+		Usage:   &models.Usage{PromptTokens: 3, CompletionTokens: 2, TotalTokens: 5},
+	}
+	tests := []struct {
+		name string
+		body string
+		run  func(*Handler, http.ResponseWriter, *http.Response, models.ProviderTranslator, ChunkObserver, bool) error
+	}{
+		{
+			name: "openai sse",
+			body: "data: {}\n\n",
+			run: func(handler *Handler, writer http.ResponseWriter, response *http.Response, translator models.ProviderTranslator, observer ChunkObserver, includeUsage bool) error {
+				return handler.StreamResponseWithObserverAndUsage(
+					context.Background(), writer, response, translator, observer, includeUsage,
+				)
+			},
+		},
+		{
+			name: "ollama ndjson",
+			body: "{}\n",
+			run: func(handler *Handler, writer http.ResponseWriter, response *http.Response, translator models.ProviderTranslator, observer ChunkObserver, includeUsage bool) error {
+				return handler.StreamNDJSONResponseWithObserverAndUsage(
+					context.Background(), writer, response, translator, observer, includeUsage,
+				)
+			},
+		},
+	}
+
+	for _, testCase := range tests {
+		for _, includeUsage := range []bool{false, true} {
+			name := map[bool]string{false: "excluded", true: "included"}[includeUsage]
+			t.Run(testCase.name+"/"+name, func(t *testing.T) {
+				providerResp := &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(testCase.body)),
+				}
+				recorder := httptest.NewRecorder()
+				observedUsage := 0
+				err := testCase.run(
+					NewHandler(),
+					recorder,
+					providerResp,
+					wrappedTerminalTranslator{ProviderTranslator: base, chunk: terminal},
+					func(chunk *models.StreamChunk) {
+						if chunk != nil && chunk.Usage != nil {
+							observedUsage++
+						}
+					},
+					includeUsage,
+				)
+				if err != nil {
+					t.Fatalf("stream returned error: %v", err)
+				}
+				if observedUsage != 1 {
+					t.Fatalf("observer saw %d usage chunks, want 1", observedUsage)
+				}
+				gotUsage := strings.Count(recorder.Body.String(), `"usage":`)
+				if includeUsage && gotUsage != 1 {
+					t.Fatalf("client saw %d usage chunks, want 1: %s", gotUsage, recorder.Body.String())
+				}
+				if !includeUsage && gotUsage != 0 {
+					t.Fatalf("client saw usage without opting in: %s", recorder.Body.String())
+				}
+			})
+		}
 	}
 }
 

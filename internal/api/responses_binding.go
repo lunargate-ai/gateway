@@ -12,14 +12,15 @@ const (
 	defaultResponseBindingMaxBytes   = 1 << 20
 )
 
-// responseBinding identifies the logical upstream that owns a native
-// Responses resource. It deliberately contains no provider credentials or
-// endpoint URL so retained state cannot disclose secrets.
+// responseBinding identifies the configured provider account that owns a
+// native Responses resource. Account-sensitive configuration is retained only
+// as a one-way digest; no credential or endpoint is stored directly.
 type responseBinding struct {
 	Provider            string
 	Route               string
 	Model               string
 	UpstreamRequestType string
+	AccountFingerprint  string
 }
 
 type responseBindingStore struct {
@@ -52,18 +53,19 @@ func newResponseBindingStore(ttl time.Duration) *responseBindingStore {
 	}
 }
 
-func (s *responseBindingStore) put(responseID string, binding responseBinding) {
+func (s *responseBindingStore) put(responseID string, binding responseBinding) bool {
 	responseID = strings.TrimSpace(responseID)
 	binding.Provider = strings.TrimSpace(binding.Provider)
 	binding.Route = strings.TrimSpace(binding.Route)
 	binding.Model = strings.TrimSpace(binding.Model)
 	binding.UpstreamRequestType = strings.TrimSpace(binding.UpstreamRequestType)
-	if s == nil || responseID == "" || binding.Provider == "" {
-		return
+	binding.AccountFingerprint = strings.TrimSpace(binding.AccountFingerprint)
+	if s == nil || responseID == "" || binding.Provider == "" || binding.AccountFingerprint == "" {
+		return false
 	}
 	size := responseBindingSize(responseID, binding)
 	if size > s.maxBytes {
-		return
+		return false
 	}
 
 	now := time.Now()
@@ -75,7 +77,7 @@ func (s *responseBindingStore) put(responseID string, binding responseBinding) {
 	}
 	for len(s.entries) >= s.maxEntries || s.totalBytes+size > s.maxBytes {
 		if !s.removeOldestLocked() {
-			return
+			return false
 		}
 	}
 	element := s.order.PushBack(responseID)
@@ -86,6 +88,7 @@ func (s *responseBindingStore) put(responseID string, binding responseBinding) {
 		element:   element,
 	}
 	s.totalBytes += size
+	return true
 }
 
 func (s *responseBindingStore) get(responseID string) (responseBinding, bool) {
@@ -172,5 +175,5 @@ func (s *responseBindingStore) removeLocked(responseID string, entry *responseBi
 }
 
 func responseBindingSize(responseID string, binding responseBinding) int {
-	return len(responseID) + len(binding.Provider) + len(binding.Route) + len(binding.Model) + len(binding.UpstreamRequestType)
+	return len(responseID) + len(binding.Provider) + len(binding.Route) + len(binding.Model) + len(binding.UpstreamRequestType) + len(binding.AccountFingerprint)
 }

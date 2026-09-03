@@ -20,6 +20,7 @@ var (
 	errConversationNotFound       = errors.New("conversation not found")
 	errConversationItemNotFound   = errors.New("conversation item not found")
 	errConversationItemLimit      = errors.New("conversation item limit exceeded")
+	errConversationItemIDConflict = errors.New("conversation item ID already exists")
 	errConversationStateTooLarge  = errors.New("conversation state exceeds storage limit")
 	errConversationCursorNotFound = errors.New("conversation item cursor not found")
 )
@@ -80,6 +81,9 @@ func (s *conversationStateStore) create(metadata map[string]string, items []map[
 	}
 	if len(items) > s.maxItems {
 		return conversationObject{}, errConversationItemLimit
+	}
+	if hasDuplicateConversationItemIDs(nil, items) {
+		return conversationObject{}, errConversationItemIDConflict
 	}
 
 	now := s.currentTime()
@@ -206,6 +210,9 @@ func (s *conversationStateStore) addItems(conversationID string, items []map[str
 	}
 	if len(entry.items)+len(items) > s.maxItems {
 		return nil, errConversationItemLimit
+	}
+	if hasDuplicateConversationItemIDs(entry.items, items) {
+		return nil, errConversationItemIDConflict
 	}
 
 	previousSize := entry.size
@@ -441,4 +448,24 @@ func cloneConversationItems(src []map[string]json.RawMessage) []map[string]json.
 
 func conversationItemID(item map[string]json.RawMessage) string {
 	return parseJSONStringRaw(item["id"])
+}
+
+func hasDuplicateConversationItemIDs(existing, added []map[string]json.RawMessage) bool {
+	seen := make(map[string]struct{}, len(existing)+len(added))
+	for _, item := range existing {
+		if id := conversationItemID(item); id != "" {
+			seen[id] = struct{}{}
+		}
+	}
+	for _, item := range added {
+		id := conversationItemID(item)
+		if id == "" {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			return true
+		}
+		seen[id] = struct{}{}
+	}
+	return false
 }

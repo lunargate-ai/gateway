@@ -304,3 +304,44 @@ func TestCompatibleChatFallbacksFiltersHostedToolsPerTarget(t *testing.T) {
 		t.Fatalf("compatible fallbacks = %#v, want only responses-enabled", got)
 	}
 }
+
+func TestValidateChatCompatibilityRequiresBackgroundResponsesCapability(t *testing.T) {
+	handler := &Handler{registry: providers.NewRegistry(map[string]config.ProviderConfig{
+		"disabled": {Type: "openai"},
+		"enabled": {
+			Type: "openai",
+			Capabilities: config.ProviderCapabilities{
+				BackgroundResponses: true,
+			},
+		},
+	})}
+	target := func(provider string) routing.Target {
+		return routing.Target{Provider: provider, UpstreamRequestType: requestTypeResponses}
+	}
+	request := func(background string) *models.UnifiedRequest {
+		return &models.UnifiedRequest{
+			RawJSON:           json.RawMessage(`{"model":"gpt-5.4","input":"hello","background":` + background + `}`),
+			SourceRequestType: requestTypeResponses,
+		}
+	}
+
+	err := handler.validateChatCompatibility(target("disabled"), request("true"))
+	var compatibilityErr *models.CompatibilityError
+	if !errors.As(err, &compatibilityErr) || compatibilityErr.Field != "background" || compatibilityErr.Provider != "disabled" {
+		t.Fatalf("compatibility error = %#v, want disabled background", err)
+	}
+	if err := handler.validateChatCompatibility(target("enabled"), request("true")); err != nil {
+		t.Fatalf("enabled background Responses rejected: %v", err)
+	}
+	if err := handler.validateChatCompatibility(target("disabled"), request("false")); err != nil {
+		t.Fatalf("background:false should not require capability: %v", err)
+	}
+
+	fallbacks := handler.compatibleChatFallbacks(
+		[]routing.Target{target("disabled"), target("enabled")},
+		request("true"),
+	)
+	if len(fallbacks) != 1 || fallbacks[0].Provider != "enabled" {
+		t.Fatalf("compatible fallbacks = %#v, want only enabled", fallbacks)
+	}
+}

@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"fmt"
 	"io"
 	"net/http"
@@ -75,8 +76,41 @@ func (h *Handler) retainNativeResponseBinding(responseID string, headers http.He
 	if binding.Provider == "" || !h.providerSupportsResponseCapability(binding.Provider, responseNativeLifecycle) {
 		return false
 	}
-	h.responseBindings.put(responseID, binding)
-	return true
+	fingerprint, ok := h.responseAccountFingerprint(binding.Provider)
+	if !ok {
+		return false
+	}
+	binding.AccountFingerprint = fingerprint
+	return h.responseBindings.put(responseID, binding)
+}
+
+func (h *Handler) responseAccountFingerprint(provider string) (string, bool) {
+	provider = strings.TrimSpace(provider)
+	if provider == "" || h == nil || h.registry == nil || h.providerClients == nil {
+		return "", false
+	}
+	providerSnapshot, ok := h.registry.Snapshot(provider)
+	if !ok || providerSnapshot.Translator == nil {
+		return "", false
+	}
+	_, providerConfig, ok := h.providerClients.Snapshot(provider)
+	if !ok {
+		return "", false
+	}
+	providerType := strings.TrimSpace(providerConfig.Type)
+	if providerType == "" {
+		providerType = strings.TrimSpace(providerSnapshot.ProviderType)
+	}
+	baseURL := strings.TrimSpace(providerConfig.BaseURL)
+	if baseURL == "" {
+		baseURL = strings.TrimSpace(providerSnapshot.Translator.BaseURL())
+	}
+	return conversationAccountFingerprint(
+		providerType,
+		baseURL,
+		providerConfig.Organization,
+		providerConfig.APIKey,
+	), true
 }
 
 func responseBindingHeaders(w http.ResponseWriter, binding responseBinding) {
@@ -122,6 +156,24 @@ func (h *Handler) boundResponseBinding(r *http.Request, responseID string, capab
 					code:    "unsupported_feature",
 				}
 			}
+			currentFingerprint, fingerprintOK := h.responseAccountFingerprint(binding.Provider)
+			if !fingerprintOK {
+				return responseBinding{}, false, &responseBindingResolutionError{
+					message: fmt.Sprintf("provider %q no longer has an HTTP account configuration", binding.Provider),
+					param:   "provider",
+					code:    "provider_not_found",
+				}
+			}
+			if subtle.ConstantTimeCompare(
+				[]byte(binding.AccountFingerprint),
+				[]byte(currentFingerprint),
+			) != 1 {
+				return responseBinding{}, false, &responseBindingResolutionError{
+					message: fmt.Sprintf("provider account configuration changed for response %q", responseID),
+					param:   "provider",
+					code:    "provider_binding_stale",
+				}
+			}
 			return binding, true, nil
 		}
 	}
@@ -155,10 +207,19 @@ func (h *Handler) explicitResponseBinding(r *http.Request, capability responseNa
 		}
 	}
 	model := strings.TrimSpace(r.Header.Get("X-LunarGate-Model"))
+	fingerprint, ok := h.responseAccountFingerprint(provider)
+	if !ok {
+		return responseBinding{}, false, &responseBindingResolutionError{
+			message: fmt.Sprintf("provider %q has no HTTP account configuration", provider),
+			param:   "provider",
+			code:    "provider_not_found",
+		}
+	}
 	return responseBinding{
 		Provider:            provider,
 		Model:               model,
 		UpstreamRequestType: requestTypeResponses,
+		AccountFingerprint:  fingerprint,
 	}, true, nil
 }
 
@@ -232,7 +293,14 @@ func (h *Handler) nativeResponseRequest(
 	}
 
 	startedAt := time.Now()
-	response, err := clientCfg.client.Do(request)
+	// Native lifecycle and utility operations are stateful. Follow-up requests
+	// must stay pinned to the selected provider and must never be replayed by
+	// net/http against a redirect target.
+	singleHopClient := *clientCfg.client
+	singleHopClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	response, err := singleHopClient.Do(request)
 	if err != nil {
 		if isHTTPTimeoutError(err) {
 			if clientCfg.mode == upstreamTimeoutModeTotal {

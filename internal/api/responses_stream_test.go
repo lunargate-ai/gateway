@@ -42,6 +42,34 @@ func TestResponsesStreamProxy_EmitsFailedInsteadOfCompletedAfterStreamError(t *t
 	}
 }
 
+func TestResponsesStreamProxy_ReplacesChatCompletionID(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	proxy := newResponsesStreamProxy(recorder)
+	chunk := "data: {\"id\":\"chatcmpl-upstream\",\"object\":\"chat.completion.chunk\",\"created\":123,\"model\":\"gpt\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n"
+	if _, err := proxy.Write([]byte(chunk)); err != nil {
+		t.Fatalf("write stream chunk: %v", err)
+	}
+	if err := proxy.finalize(); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	if !strings.HasPrefix(proxy.responseID, "resp_") {
+		t.Fatalf("translated response ID = %q, want resp_ prefix", proxy.responseID)
+	}
+	if strings.Contains(recorder.Body.String(), "chatcmpl-upstream") {
+		t.Fatalf("upstream Chat Completions ID leaked into Responses stream: %s", recorder.Body.String())
+	}
+	for _, event := range decodeSSEEvents(t, recorder.Body.String()) {
+		if responseID, ok := event["response_id"].(string); ok && responseID != proxy.responseID {
+			t.Fatalf("event response_id = %q, want stable %q", responseID, proxy.responseID)
+		}
+		if response, ok := event["response"].(map[string]interface{}); ok {
+			if id, ok := response["id"].(string); ok && id != proxy.responseID {
+				t.Fatalf("response id = %q, want stable %q", id, proxy.responseID)
+			}
+		}
+	}
+}
+
 func TestResponsesStreamProxy_ReturnsDownstreamFlushError(t *testing.T) {
 	writer := &responsesFlushErrorWriter{header: make(http.Header)}
 	proxy := newResponsesStreamProxy(writer)

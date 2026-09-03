@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/rs/zerolog/log"
 )
 
 const (
@@ -98,7 +99,7 @@ func (h *Handler) DeleteResponse(w http.ResponseWriter, r *http.Request) {
 	} else if ok {
 		response, requestErr := h.makeResponseLifecycleRequest(r, binding, http.MethodDelete, "responses/"+url.PathEscape(responseID), nil)
 		if requestErr != nil {
-			writeError(w, http.StatusBadGateway, requestErr.Error(), "provider_error")
+			writeNativeResponseTransportError(w, binding, requestErr)
 			return
 		}
 		if response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
@@ -123,7 +124,7 @@ func (h *Handler) DeleteResponse(w http.ResponseWriter, r *http.Request) {
 	} else if ok {
 		response, requestErr := h.makeResponseLifecycleRequest(r, binding, http.MethodDelete, "responses/"+url.PathEscape(responseID), nil)
 		if requestErr != nil {
-			writeError(w, http.StatusBadGateway, requestErr.Error(), "provider_error")
+			writeNativeResponseTransportError(w, binding, requestErr)
 			return
 		}
 		h.proxyNativeResponse(w, r, binding, response)
@@ -232,10 +233,15 @@ func (h *Handler) proxyResponseLifecycleRequest(
 ) {
 	response, err := h.makeResponseLifecycleRequest(r, binding, method, path, body)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error(), "provider_error")
+		writeNativeResponseTransportError(w, binding, err)
 		return
 	}
 	h.proxyNativeResponse(w, r, binding, response)
+}
+
+func writeNativeResponseTransportError(w http.ResponseWriter, binding responseBinding, err error) {
+	log.Error().Err(err).Str("provider", strings.TrimSpace(binding.Provider)).Msg("native response provider request failed")
+	writeError(w, http.StatusBadGateway, "upstream response provider request failed", "provider_error")
 }
 
 func (h *Handler) makeResponseLifecycleRequest(

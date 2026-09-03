@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -219,12 +220,10 @@ func TestNativeResponsesRetrieveStreamsRawSSEAndEscapesResponseID(t *testing.T) 
 		"native": {ResponsesLifecycle: true},
 	})
 	defer cache.Stop()
-	handler.responseBindings.put("resp space", responseBinding{
-		Provider:            "native",
-		Route:               "responses",
-		Model:               "native/gpt-native",
-		UpstreamRequestType: requestTypeResponses,
-	})
+	binding := mustResponseBinding(t, handler, "native")
+	binding.Route = "responses"
+	binding.Model = "native/gpt-native"
+	handler.responseBindings.put("resp space", binding)
 
 	retrieve := performLifecycleRequest(t, router, http.MethodGet, "/v1/responses/resp%20space", nil)
 	if retrieve.Code != http.StatusAccepted {
@@ -271,7 +270,7 @@ func TestNativeResponsesDeleteReleasesBindingOnlyAfterUpstreamSuccess(t *testing
 				"native": {ResponsesLifecycle: true},
 			})
 			defer cache.Stop()
-			handler.responseBindings.put("resp_delete", responseBinding{Provider: "native", UpstreamRequestType: requestTypeResponses})
+			handler.responseBindings.put("resp_delete", mustResponseBinding(t, handler, "native"))
 
 			deleted := performLifecycleRequest(t, router, http.MethodDelete, "/v1/responses/resp_delete", nil)
 			if deleted.Code != testCase.status {
@@ -313,7 +312,7 @@ func TestNativeResponsesCancelIsSingleAttemptAndKeepsBinding(t *testing.T) {
 		"native": {ResponsesLifecycle: true, ResponseCancellation: true},
 	})
 	defer cache.Stop()
-	handler.responseBindings.put("resp_cancel", responseBinding{Provider: "native", UpstreamRequestType: requestTypeResponses})
+	handler.responseBindings.put("resp_cancel", mustResponseBinding(t, handler, "native"))
 
 	request := httptest.NewRequest(http.MethodPost, "/v1/responses/resp_cancel/cancel?future=true", strings.NewReader(`{"reason":"client_request"}`))
 	request.Header.Set("Content-Type", "application/json")
@@ -355,8 +354,8 @@ func TestLocalResponsesCancelFailsExplicitlyWithoutUpstreamCall(t *testing.T) {
 func TestResponseBindingStoreExpiresAndEvicts(t *testing.T) {
 	store := newResponseBindingStore(5 * time.Millisecond)
 	store.maxEntries = 1
-	store.put("resp_first", responseBinding{Provider: "first"})
-	store.put("resp_second", responseBinding{Provider: "second"})
+	store.put("resp_first", responseBinding{Provider: "first", AccountFingerprint: "first-account"})
+	store.put("resp_second", responseBinding{Provider: "second", AccountFingerprint: "second-account"})
 	if _, ok := store.get("resp_first"); ok {
 		t.Fatal("oldest binding was not evicted")
 	}
@@ -372,9 +371,57 @@ func TestResponseBindingStoreExpiresAndEvicts(t *testing.T) {
 func TestResponseBindingStoreRejectsOversizedEntry(t *testing.T) {
 	store := newResponseBindingStore(time.Hour)
 	store.maxBytes = 32
-	store.put("resp_large", responseBinding{Provider: "provider", Model: strings.Repeat("m", 64)})
+	store.put("resp_large", responseBinding{Provider: "provider", Model: strings.Repeat("m", 64), AccountFingerprint: "account"})
 	if _, ok := store.get("resp_large"); ok {
 		t.Fatal("oversized binding was retained")
+	}
+}
+
+func TestBoundResponseBindingRejectsChangedProviderAccountWithoutUpstreamCall(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_account","object":"response","status":"completed"}`)
+	}))
+	defer upstream.Close()
+
+	original := config.ProviderConfig{
+		Type:         "openai",
+		APIKey:       "original-secret",
+		BaseURL:      "https://original.example/v1",
+		Organization: "org-original",
+		DefaultModel: "gpt-native",
+		Capabilities: config.ProviderCapabilities{ResponsesLifecycle: true},
+	}
+	router, handler, cache := newNativeLifecycleRouterFromConfigs(t, map[string]config.ProviderConfig{"native": original})
+	defer cache.Stop()
+	binding := mustResponseBinding(t, handler, "native")
+	if strings.Contains(binding.AccountFingerprint, original.APIKey) || len(binding.AccountFingerprint) != sha256.Size*2 {
+		t.Fatalf("unsafe account fingerprint %q", binding.AccountFingerprint)
+	}
+	handler.responseBindings.put("resp_account", binding)
+
+	changed := original
+	changed.APIKey = "rotated-secret"
+	changed.BaseURL = upstream.URL + "/v1"
+	changed.Organization = "org-rotated"
+	changedConfigs := map[string]config.ProviderConfig{"native": changed}
+	handler.registry.UpdateProvidersConfig(changedConfigs)
+	handler.UpdateProviderConfigs(changedConfigs)
+
+	response := performLifecycleRequest(t, router, http.MethodGet, "/v1/responses/resp_account", nil)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", response.Code, response.Body.String())
+	}
+	assertLifecycleError(t, response.Body.Bytes(), "provider", "provider_binding_stale")
+	if got := upstreamCalls.Load(); got != 0 {
+		t.Fatalf("stale binding made %d upstream calls", got)
+	}
+	for _, secret := range []string{original.APIKey, changed.APIKey, binding.AccountFingerprint} {
+		if strings.Contains(response.Body.String(), secret) {
+			t.Fatalf("binding error leaked account identity: %s", response.Body.String())
+		}
 	}
 }
 
@@ -395,6 +442,19 @@ func newNativeLifecycleRouter(
 		}
 	}
 	return newNativeLifecycleRouterFromConfigs(t, providerConfigs)
+}
+
+func mustResponseBinding(t *testing.T, handler *Handler, provider string) responseBinding {
+	t.Helper()
+	fingerprint, ok := handler.responseAccountFingerprint(provider)
+	if !ok {
+		t.Fatalf("provider %q has no account fingerprint", provider)
+	}
+	return responseBinding{
+		Provider:            provider,
+		UpstreamRequestType: requestTypeResponses,
+		AccountFingerprint:  fingerprint,
+	}
 }
 
 func newNativeLifecycleRouterFromConfigs(

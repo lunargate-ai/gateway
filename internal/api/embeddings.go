@@ -492,6 +492,7 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 		errCode := "provider_error"
 		errMsg := "all embedding providers unavailable"
 		requestFailure := false
+		var upstreamFailure *upstreamHTTPError
 		if errors.Is(err, context.Canceled) {
 			status = 499
 			errCode = "client_cancelled"
@@ -511,16 +512,6 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 				Int("status_code", status).
 				Dur("duration", duration).
 				Msg("embeddings request rejected before upstream call")
-		} else if upstreamStatus, upstreamErrCode, upstreamErrMsg, ok := upstreamFailureFromError(err); ok {
-			status = upstreamStatus
-			errCode = upstreamErrCode
-			errMsg = upstreamErrMsg
-			log.Warn().
-				Err(err).
-				Str("request_id", requestID).
-				Int("status_code", status).
-				Dur("duration", duration).
-				Msg("upstream embeddings provider failure after retries")
 		} else if isUpstreamTTFTTimeout(err) {
 			errCode = "upstream_timeout"
 			errMsg = "provider timed out waiting for first byte"
@@ -536,21 +527,41 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 				Dur("duration", duration).
 				Msg("embeddings total timeout")
 		} else {
-			log.Error().Err(err).
-				Str("request_id", requestID).
-				Dur("duration", duration).
-				Msg("all embeddings providers failed")
+			providerType, _ := h.registry.Type(usedTarget.Provider)
+			if failure, ok := upstreamHTTPErrorFromRetry(err, providerType); ok {
+				upstreamFailure = failure
+				status = failure.status
+				errCode = failure.errType
+				errMsg = failure.message
+				log.Warn().
+					Err(err).
+					Str("request_id", requestID).
+					Int("status_code", status).
+					Dur("duration", duration).
+					Msg("upstream embeddings provider failure after retries")
+			} else {
+				log.Error().Err(err).
+					Str("request_id", requestID).
+					Dur("duration", duration).
+					Msg("all embeddings providers failed")
+			}
 		}
 		if !errors.Is(err, context.Canceled) && !requestFailure {
 			h.metrics.ProviderErrors.WithLabelValues(resolved.Target.Provider, "all_failed").Inc()
 		}
 		setTimingHeaders(w, duration.Milliseconds(), upstreamStartMS)
-		writeError(w, status, errMsg, errCode)
+		if upstreamFailure != nil {
+			upstreamFailure.write(w)
+		} else {
+			writeError(w, status, errMsg, errCode)
+		}
 		if h.collector != nil {
 			errCodeForCollector := errCode
 			errMsgForCollector := err.Error()
 			if errors.Is(err, context.Canceled) {
 				errMsgForCollector = "client disconnected"
+			} else if upstreamFailure != nil {
+				errMsgForCollector = upstreamFailure.message
 			} else if isUpstreamTTFTTimeout(err) {
 				errCodeForCollector = "upstream_timeout"
 				errMsgForCollector = "provider timed out waiting for first byte"
@@ -658,7 +669,14 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 	}
 	responseHeaders := resp.Header.Clone()
 
-	embeddingsResp, err := embeddingsTranslator.ParseEmbeddingsResponse(resp)
+	var embeddingsResp *models.EmbeddingsResponse
+	var upstreamFailure *upstreamHTTPError
+	if resp.StatusCode >= http.StatusBadRequest {
+		upstreamFailure = readUpstreamHTTPError(resp, usedProviderType)
+		err = upstreamFailure
+	} else {
+		embeddingsResp, err = embeddingsTranslator.ParseEmbeddingsResponse(resp)
+	}
 	copyHeaders(w.Header(), responseHeaders)
 	if err != nil {
 		duration := time.Since(startTime)
@@ -668,7 +686,13 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 		errMsg := "failed to parse provider response: " + err.Error()
 		metricErrType := "parse_error"
 		var pe *providers.ProviderError
-		if errors.As(err, &pe) {
+		if upstreamFailure != nil {
+			status = upstreamFailure.status
+			respErrType = upstreamFailure.errType
+			collectorErrCode = upstreamFailure.errType
+			errMsg = upstreamFailure.message
+			metricErrType = upstreamFailure.errType
+		} else if errors.As(err, &pe) {
 			if pe.StatusCode != 0 {
 				status = pe.StatusCode
 			}
@@ -703,7 +727,11 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 			Msg("failed to parse embeddings provider response")
 		h.metrics.ProviderErrors.WithLabelValues(usedTarget.Provider, metricErrType).Inc()
 		setTimingHeaders(w, duration.Milliseconds(), upstreamStartMS)
-		writeError(w, status, errMsg, respErrType)
+		if upstreamFailure != nil {
+			upstreamFailure.write(w)
+		} else {
+			writeError(w, status, errMsg, respErrType)
+		}
 		if h.collector != nil {
 			errCode := collectorErrCode
 			routeUsed := resolved.RouteName
