@@ -6,6 +6,7 @@ import (
 )
 
 func TestResponsesToUnifiedRequest_MapsTopLevelFunctionTool(t *testing.T) {
+	strict := true
 	req := &ResponsesRequest{
 		Model: "lunargate/auto",
 		Input: "hello",
@@ -20,6 +21,7 @@ func TestResponsesToUnifiedRequest_MapsTopLevelFunctionTool(t *testing.T) {
 						"city": map[string]interface{}{"type": "string"},
 					},
 				},
+				Strict: &strict,
 			},
 		},
 		ToolChoice: map[string]interface{}{
@@ -38,6 +40,9 @@ func TestResponsesToUnifiedRequest_MapsTopLevelFunctionTool(t *testing.T) {
 	}
 	if unified.Tools[0].Function.Name != "get_weather" {
 		t.Fatalf("expected tool function name %q, got %q", "get_weather", unified.Tools[0].Function.Name)
+	}
+	if unified.Tools[0].Function.Strict == nil || !*unified.Tools[0].Function.Strict {
+		t.Fatalf("expected strict function contract, got %#v", unified.Tools[0].Function.Strict)
 	}
 
 	choiceObj, ok := unified.ToolChoice.(map[string]interface{})
@@ -77,6 +82,23 @@ func TestResponsesToUnifiedRequest_PreservesSourceEnvelope(t *testing.T) {
 	}
 }
 
+func TestResponsesToUnifiedRequest_AllowsNativePromptOnlyEnvelope(t *testing.T) {
+	raw := []byte(`{"prompt":{"id":"pmpt_1"},"store":false}`)
+	unified, err := ResponsesToUnifiedRequest(&ResponsesRequest{RawJSON: raw})
+	if err != nil {
+		t.Fatalf("ResponsesToUnifiedRequest returned error: %v", err)
+	}
+	if unified.Model != "" {
+		t.Fatalf("model = %q, want route-selected model", unified.Model)
+	}
+	if len(unified.Messages) != 0 {
+		t.Fatalf("messages = %#v, want native-only prompt envelope", unified.Messages)
+	}
+	if string(unified.RawJSON) != string(raw) {
+		t.Fatalf("raw envelope = %s, want %s", unified.RawJSON, raw)
+	}
+}
+
 func TestResponsesToUnifiedRequest_RejectsFunctionToolWithoutName(t *testing.T) {
 	req := &ResponsesRequest{
 		Model: "lunargate/auto",
@@ -89,6 +111,29 @@ func TestResponsesToUnifiedRequest_RejectsFunctionToolWithoutName(t *testing.T) 
 	_, err := ResponsesToUnifiedRequest(req)
 	if err == nil {
 		t.Fatalf("expected error for missing function name")
+	}
+}
+
+func TestResponsesToUnifiedRequest_RejectsConflictingStrictFunctionTool(t *testing.T) {
+	topLevelStrict := true
+	nestedStrict := false
+	req := &ResponsesRequest{
+		Model: "lunargate/auto",
+		Input: "hello",
+		Tools: []ResponsesTool{{
+			Type:   "function",
+			Name:   "lookup",
+			Strict: &topLevelStrict,
+			Function: &ToolFunction{
+				Name:   "lookup",
+				Strict: &nestedStrict,
+			},
+		}},
+	}
+
+	_, err := ResponsesToUnifiedRequest(req)
+	if err == nil || !strings.Contains(err.Error(), "strict conflicts") {
+		t.Fatalf("expected strict conflict error, got %v", err)
 	}
 }
 
@@ -331,6 +376,33 @@ func TestUnifiedResponseToResponses_SerializesNonStringContent(t *testing.T) {
 	}
 	if !strings.Contains(out.OutputText, "\"url\":\"https://example.com/a.png\"") {
 		t.Fatalf("expected output_text to include serialized content, got %q", out.OutputText)
+	}
+}
+
+func TestUnifiedResponseToResponses_PreservesRefusalContent(t *testing.T) {
+	resp := &UnifiedResponse{
+		ID:      "chatcmpl_refusal",
+		Created: 123,
+		Model:   "openai/gpt-5.4",
+		Choices: []Choice{{
+			Index: 0,
+			Message: &Message{
+				Role:    "assistant",
+				Refusal: "I can't help with that.",
+			},
+		}},
+	}
+
+	out := UnifiedResponseToResponses(resp)
+	if out == nil || len(out.Output) != 1 || len(out.Output[0].Content) != 1 {
+		t.Fatalf("refusal response = %#v", out)
+	}
+	part := out.Output[0].Content[0]
+	if part.Type != "refusal" || part.Refusal != "I can't help with that." || part.Text != "" {
+		t.Fatalf("refusal part = %#v", part)
+	}
+	if out.OutputText != "" {
+		t.Fatalf("output_text = %q, want empty for refusal", out.OutputText)
 	}
 }
 

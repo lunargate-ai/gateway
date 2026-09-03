@@ -185,7 +185,7 @@ func TestOllamaTranslator_TranslateRequest_MapsSupportedGenerationControls(t *te
 		PresencePenalty:  &presencePenalty,
 		FrequencyPenalty: &frequencyPenalty,
 		Seed:             &seed,
-		ReasoningEffort:  "max",
+		ReasoningEffort:  "high",
 	})
 	if err != nil {
 		t.Fatalf("TranslateRequest returned error: %v", err)
@@ -205,8 +205,8 @@ func TestOllamaTranslator_TranslateRequest_MapsSupportedGenerationControls(t *te
 	if got := options["seed"]; got != float64(seed) {
 		t.Fatalf("options.seed = %#v, want %d", got, seed)
 	}
-	if got := payload["think"]; got != "max" {
-		t.Fatalf("think = %#v, want max", got)
+	if got := payload["think"]; got != "high" {
+		t.Fatalf("think = %#v, want high", got)
 	}
 	stop, ok := options["stop"].([]interface{})
 	if !ok || len(stop) != 2 || stop[0] != "END" || stop[1] != "STOP" {
@@ -279,7 +279,9 @@ func TestOllamaTranslator_TranslateRequest_RejectsUnsupportedExplicitFields(t *t
 		{name: "logit bias", configure: func(req *models.UnifiedRequest) { req.LogitBias = map[string]int{"42": 10} }, wantField: "logit_bias"},
 		{name: "user", configure: func(req *models.UnifiedRequest) { req.User = "end-user" }, wantField: "user"},
 		{name: "stored response", configure: func(req *models.UnifiedRequest) { req.Store = &store }, wantField: "store"},
-		{name: "reasoning effort", configure: func(req *models.UnifiedRequest) { req.ReasoningEffort = "extreme" }, wantField: "reasoning_effort"},
+		{name: "minimal reasoning effort", configure: func(req *models.UnifiedRequest) { req.ReasoningEffort = "minimal" }, wantField: "reasoning_effort"},
+		{name: "max reasoning effort", configure: func(req *models.UnifiedRequest) { req.ReasoningEffort = "max" }, wantField: "reasoning_effort"},
+		{name: "unknown reasoning effort", configure: func(req *models.UnifiedRequest) { req.ReasoningEffort = "extreme" }, wantField: "reasoning_effort"},
 		{name: "invalid stop", configure: func(req *models.UnifiedRequest) { req.Stop = float64(42) }, wantField: "stop"},
 		{
 			name: "unsupported response format",
@@ -324,6 +326,23 @@ func TestOllamaTranslator_TranslateRequest_RejectsUnsupportedExplicitFields(t *t
 				t.Fatalf("compatibility error = %#v, want field=%q provider=ollama", compatibilityErr, tt.wantField)
 			}
 		})
+	}
+}
+
+func TestOllamaTranslator_RejectsUnsupportedNestedReasoningEffortAtSourcePath(t *testing.T) {
+	translator := NewOllamaTranslator(config.ProviderConfig{BaseURL: "http://localhost:11434"})
+	request := &models.UnifiedRequest{
+		RawJSON:         json.RawMessage(`{"model":"gemma3","messages":[{"role":"user","content":"hi"}],"reasoning":{"effort":"minimal"}}`),
+		ReasoningEffort: "minimal",
+		Messages:        []models.Message{{Role: "user", Content: "hi"}},
+	}
+	_, err := translator.TranslateRequest(context.Background(), request)
+	var compatibilityErr *models.CompatibilityError
+	if !errors.As(err, &compatibilityErr) {
+		t.Fatalf("error = %v, want CompatibilityError", err)
+	}
+	if compatibilityErr.Field != "reasoning.effort" {
+		t.Fatalf("field = %q, want reasoning.effort", compatibilityErr.Field)
 	}
 }
 
@@ -785,88 +804,65 @@ func TestOllamaTranslator_TranslateRequest_ToolChoiceNoneOmitsTools(t *testing.T
 	}
 }
 
-func TestOllamaTranslator_TranslateRequest_ToolChoiceRequiredAddsInstruction(t *testing.T) {
-	translator := NewOllamaTranslator(config.ProviderConfig{
-		BaseURL:      "http://localhost:11434",
-		DefaultModel: "gemma3",
-	})
-
-	req, err := translator.TranslateRequest(context.Background(), &models.UnifiedRequest{
-		Model:      "gemma3",
-		ToolChoice: "required",
-		Messages:   []models.Message{{Role: "system", Content: "You are helpful."}, {Role: "user", Content: "hello"}},
-		Tools: []models.Tool{{
-			Type: "function",
-			Function: models.ToolFunction{
-				Name: "get_weather",
-			},
-		}},
-	})
-	if err != nil {
-		t.Fatalf("TranslateRequest returned error: %v", err)
-	}
-
-	payload := decodeOllamaRequestBody(t, req.Body)
-	messages, ok := payload["messages"].([]interface{})
-	if !ok || len(messages) == 0 {
-		t.Fatalf("expected messages array, got %#v", payload["messages"])
-	}
-	first, _ := messages[0].(map[string]interface{})
-	content, _ := first["content"].(string)
-	if !strings.Contains(content, "You must call one of the available tools") {
-		t.Fatalf("expected required tool instruction in system prompt, got %q", content)
-	}
-}
-
-func TestOllamaTranslator_TranslateRequest_ToolChoiceFunctionFiltersToolsAndAddsInstruction(t *testing.T) {
-	translator := NewOllamaTranslator(config.ProviderConfig{
-		BaseURL:      "http://localhost:11434",
-		DefaultModel: "gemma3",
-	})
-
-	req, err := translator.TranslateRequest(context.Background(), &models.UnifiedRequest{
-		Model: "gemma3",
-		ToolChoice: map[string]interface{}{
-			"type": "function",
-			"function": map[string]interface{}{
-				"name": "exec_command",
-			},
+func TestOllamaTranslator_TranslateRequest_RejectsUnsupportedToolChoice(t *testing.T) {
+	tests := []struct {
+		name       string
+		toolChoice interface{}
+		wantReason string
+	}{
+		{
+			name:       "required",
+			toolChoice: "required",
+			wantReason: "cannot enforce required tool use",
 		},
-		Messages: []models.Message{{Role: "user", Content: "hello"}},
-		Tools: []models.Tool{
-			{
-				Type: "function",
-				Function: models.ToolFunction{
-					Name: "exec_command",
+		{
+			name: "named function",
+			toolChoice: map[string]interface{}{
+				"type": "function",
+				"function": map[string]interface{}{
+					"name": "exec_command",
 				},
 			},
-			{
-				Type: "function",
-				Function: models.ToolFunction{
-					Name: "write_stdin",
-				},
-			},
+			wantReason: "cannot enforce a named function tool choice",
 		},
-	})
-	if err != nil {
-		t.Fatalf("TranslateRequest returned error: %v", err)
 	}
 
-	payload := decodeOllamaRequestBody(t, req.Body)
-	tools, ok := payload["tools"].([]interface{})
-	if !ok || len(tools) != 1 {
-		t.Fatalf("expected exactly one filtered tool, got %#v", payload["tools"])
-	}
-	tool, _ := tools[0].(map[string]interface{})
-	function, _ := tool["function"].(map[string]interface{})
-	if got, _ := function["name"].(string); got != "exec_command" {
-		t.Fatalf("expected filtered tool exec_command, got %q", got)
-	}
-	messages, _ := payload["messages"].([]interface{})
-	first, _ := messages[0].(map[string]interface{})
-	content, _ := first["content"].(string)
-	if !strings.Contains(content, `You must call the function "exec_command"`) {
-		t.Fatalf("expected forced tool instruction in system prompt, got %q", content)
+	for _, tt := range tests {
+		for _, stream := range []bool{false, true} {
+			name := tt.name + "/non-stream"
+			if stream {
+				name = tt.name + "/stream"
+			}
+			t.Run(name, func(t *testing.T) {
+				translator := NewOllamaTranslator(config.ProviderConfig{
+					BaseURL:      "http://localhost:11434",
+					DefaultModel: "gemma3",
+				})
+
+				_, err := translator.TranslateRequest(context.Background(), &models.UnifiedRequest{
+					Model:      "gemma3",
+					Stream:     stream,
+					ToolChoice: tt.toolChoice,
+					Messages:   []models.Message{{Role: "user", Content: "hello"}},
+					Tools: []models.Tool{{
+						Type: "function",
+						Function: models.ToolFunction{
+							Name: "exec_command",
+						},
+					}},
+				})
+				var compatibilityErr *models.CompatibilityError
+				if !errors.As(err, &compatibilityErr) {
+					t.Fatalf("error = %v, want CompatibilityError", err)
+				}
+				if compatibilityErr.Field != "tool_choice" || compatibilityErr.Provider != "ollama" {
+					t.Fatalf("compatibility error = %#v, want field=tool_choice provider=ollama", compatibilityErr)
+				}
+				if !strings.Contains(compatibilityErr.Reason, tt.wantReason) {
+					t.Fatalf("reason = %q, want substring %q", compatibilityErr.Reason, tt.wantReason)
+				}
+			})
+		}
 	}
 }
 
@@ -983,5 +979,30 @@ func TestOllamaTranslator_TranslateRequest_DebugLogRedactsRequestContent(t *test
 	toolNames, ok := event["tool_names"].([]interface{})
 	if !ok || len(toolNames) != 1 || toolNames[0] != "safe_tool_name" {
 		t.Fatalf("expected safe tool-name metadata, got %#v", event["tool_names"])
+	}
+}
+
+func TestOllamaTranslatorSaturatesUsageTotal(t *testing.T) {
+	maximum := int(^uint(0) >> 1)
+	body, err := json.Marshal(map[string]interface{}{
+		"model":             "qwen3.5",
+		"message":           map[string]interface{}{"role": "assistant", "content": "ok"},
+		"done":              true,
+		"prompt_eval_count": maximum,
+		"eval_count":        maximum,
+	})
+	if err != nil {
+		t.Fatalf("encode response: %v", err)
+	}
+
+	response, err := NewOllamaTranslator(config.ProviderConfig{}).ParseResponse(&http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(bytes.NewReader(body)),
+	})
+	if err != nil {
+		t.Fatalf("ParseResponse returned error: %v", err)
+	}
+	if response.Usage == nil || response.Usage.TotalTokens != maximum {
+		t.Fatalf("usage = %#v, want total saturated to %d", response.Usage, maximum)
 	}
 }

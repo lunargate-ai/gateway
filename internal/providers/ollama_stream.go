@@ -78,7 +78,7 @@ func (t *ollamaStreamTranslator) ParseStreamChunk(data []byte) (*models.StreamCh
 			usage = &models.Usage{
 				PromptTokens:     ev.PromptEvalCount,
 				CompletionTokens: ev.EvalCount,
-				TotalTokens:      ev.PromptEvalCount + ev.EvalCount,
+				TotalTokens:      models.SaturatingTokenSum(ev.PromptEvalCount, ev.EvalCount),
 			}
 		}
 	}

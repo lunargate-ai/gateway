@@ -3,9 +3,9 @@ package providers
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -24,7 +24,7 @@ func NewAnthropicTranslator(cfg config.ProviderConfig) *AnthropicTranslator {
 		cfg.BaseURL = "https://api.anthropic.com"
 	}
 	if cfg.DefaultModel == "" {
-		cfg.DefaultModel = "claude-3-sonnet-20240229"
+		cfg.DefaultModel = "claude-sonnet-4-6"
 	}
 	if cfg.APIVersion == "" {
 		cfg.APIVersion = "2023-06-01"
@@ -87,13 +87,20 @@ type anthropicMessage struct {
 }
 
 type anthropicResponse struct {
-	ID         string                  `json:"id"`
-	Type       string                  `json:"type"`
-	Role       string                  `json:"role"`
-	Content    []anthropicContentBlock `json:"content"`
-	Model      string                  `json:"model"`
-	StopReason *string                 `json:"stop_reason"`
-	Usage      anthropicUsage          `json:"usage"`
+	ID          string                  `json:"id"`
+	Type        string                  `json:"type"`
+	Role        string                  `json:"role"`
+	Content     []anthropicContentBlock `json:"content"`
+	Model       string                  `json:"model"`
+	StopReason  *string                 `json:"stop_reason"`
+	StopDetails *anthropicStopDetails   `json:"stop_details"`
+	Usage       anthropicUsage          `json:"usage"`
+}
+
+type anthropicStopDetails struct {
+	Type        string  `json:"type"`
+	Category    *string `json:"category"`
+	Explanation *string `json:"explanation"`
 }
 
 type anthropicContentBlock struct {
@@ -112,11 +119,20 @@ type anthropicTool struct {
 	Name        string      `json:"name"`
 	Description string      `json:"description,omitempty"`
 	InputSchema interface{} `json:"input_schema,omitempty"`
+	Strict      *bool       `json:"strict,omitempty"`
 }
 
 type anthropicUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	InputTokens              int                     `json:"input_tokens"`
+	OutputTokens             int                     `json:"output_tokens"`
+	CacheCreationInputTokens int                     `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int                     `json:"cache_read_input_tokens"`
+	CacheCreation            *anthropicCacheCreation `json:"cache_creation,omitempty"`
+}
+
+type anthropicCacheCreation struct {
+	Ephemeral5mInputTokens int `json:"ephemeral_5m_input_tokens"`
+	Ephemeral1hInputTokens int `json:"ephemeral_1h_input_tokens"`
 }
 
 type anthropicErrorResponse struct {
@@ -139,6 +155,9 @@ func (t *AnthropicTranslator) ValidateRequestCompatibility(providerID string, re
 	providerID = strings.TrimSpace(providerID)
 	if providerID == "" {
 		providerID = "anthropic"
+	}
+	if err := validateTranslatedChatRawControls(providerID, req); err != nil {
+		return err
 	}
 
 	unsupported := func(field, reason string) error {
@@ -171,6 +190,18 @@ func (t *AnthropicTranslator) ValidateRequestCompatibility(providerID string, re
 			return unsupported("stop", "expected a string or an array of strings")
 		}
 	}
+	if len(req.Functions) > 0 {
+		return unsupported("functions", "normalize legacy functions into tools before using Anthropic")
+	}
+	if req.FunctionCall != nil {
+		return unsupported("function_call", "normalize legacy function_call into tool_choice before using Anthropic")
+	}
+	if err := validateTranslatedChatTypedToolChoice(providerID, req.ToolChoice); err != nil {
+		return err
+	}
+	if err := validateAnthropicTools(providerID, req.Tools); err != nil {
+		return err
+	}
 	if req.ToolChoice != nil {
 		if _, ok := mapOpenAIToolChoiceToAnthropic(req.ToolChoice); !ok {
 			return unsupported("tool_choice", "the requested tool selection mode has no Anthropic equivalent")
@@ -184,6 +215,9 @@ func (t *AnthropicTranslator) ValidateRequestCompatibility(providerID string, re
 		if !isAnthropicEffort(effort) {
 			return unsupported("reasoning_effort", fmt.Sprintf("unsupported Anthropic effort level %q", req.ReasoningEffort))
 		}
+		if !anthropicEffortEnabled(t.cfg.Capabilities, effort) {
+			return unsupported("reasoning_effort", fmt.Sprintf("Anthropic effort level %q is not enabled for this provider", req.ReasoningEffort))
+		}
 	}
 
 	if req.ResponseFormat != nil {
@@ -194,8 +228,8 @@ func (t *AnthropicTranslator) ValidateRequestCompatibility(providerID string, re
 			if !t.cfg.Capabilities.StructuredOutputs {
 				return unsupported("response_format", "enable provider capability structured_outputs for a compatible Anthropic model")
 			}
-			if req.ResponseFormat.JSONSchema == nil || req.ResponseFormat.JSONSchema.Schema == nil {
-				return unsupported("response_format.json_schema.schema", "a JSON schema is required for Anthropic structured output")
+			if _, err := translatedChatAnnotatedJSONSchema(providerID, req.ResponseFormat.JSONSchema); err != nil {
+				return err
 			}
 		default:
 			return unsupported("response_format", fmt.Sprintf("Anthropic Messages has no equivalent for response format %q", req.ResponseFormat.Type))
@@ -203,6 +237,34 @@ func (t *AnthropicTranslator) ValidateRequestCompatibility(providerID string, re
 	}
 
 	return validateAnthropicMessageInput(providerID, req.Messages)
+}
+
+func validateAnthropicTools(providerID string, tools []models.Tool) error {
+	unsupported := func(field, reason string) error {
+		return &models.CompatibilityError{Field: field, Provider: providerID, Reason: reason}
+	}
+	for index := range tools {
+		path := fmt.Sprintf("tools[%d]", index)
+		tool := tools[index]
+		toolType := strings.ToLower(strings.TrimSpace(tool.Type))
+		if toolType != "" && toolType != "function" {
+			return unsupported(path+".type", "Anthropic only supports function tools")
+		}
+		if strings.TrimSpace(tool.Function.Name) == "" {
+			return unsupported(path+".function.name", "Anthropic requires a function name")
+		}
+		if tool.Function.Parameters != nil {
+			encoded, err := json.Marshal(tool.Function.Parameters)
+			if err != nil {
+				return unsupported(path+".function.parameters", "function parameters must be a JSON schema object")
+			}
+			var schema map[string]interface{}
+			if err := json.Unmarshal(encoded, &schema); err != nil || schema == nil {
+				return unsupported(path+".function.parameters", "function parameters must be a JSON schema object")
+			}
+		}
+	}
+	return nil
 }
 
 func validateAnthropicMessageInput(providerID string, messages []models.Message) error {
@@ -218,35 +280,234 @@ func validateAnthropicMessageInput(providerID string, messages []models.Message)
 		default:
 			return unsupported(messagePath+".role", "Anthropic Messages supports system, developer, user, assistant, and tool messages")
 		}
+		if message.Name != "" {
+			return unsupported(messagePath+".name", "Anthropic Messages cannot preserve Chat Completions participant names")
+		}
+		if message.Refusal != "" {
+			return unsupported(messagePath+".refusal", "Anthropic Messages has no assistant refusal-history field")
+		}
+		if message.ReasoningContent != "" {
+			return unsupported(messagePath+".reasoning_content", "Anthropic Messages requires signed thinking blocks for assistant reasoning history")
+		}
+		if message.FunctionCall != nil {
+			return unsupported(messagePath+".function_call", "normalize legacy function_call into assistant.tool_calls before using Anthropic")
+		}
+		if message.ToolCallID != "" && message.Role != "tool" {
+			return unsupported(messagePath+".tool_call_id", "Anthropic only represents tool_call_id on tool-result messages")
+		}
+		if len(message.ToolCalls) > 0 && message.Role != "assistant" {
+			return unsupported(messagePath+".tool_calls", "Anthropic tool calls belong to assistant messages")
+		}
+		if message.Role == "tool" && strings.TrimSpace(message.ToolCallID) == "" {
+			return unsupported(messagePath+".tool_call_id", "Anthropic tool results require the originating tool-call ID")
+		}
+
+		switch message.Content.(type) {
+		case nil, string, []interface{}:
+		default:
+			return unsupported(messagePath+".content", "Anthropic message content must be a string or an array of supported content parts")
+		}
 
 		parts, ok := message.Content.([]interface{})
-		if !ok {
-			continue
-		}
-		for partIndex, part := range parts {
-			partPath := fmt.Sprintf("%s.content[%d]", messagePath, partIndex)
-			encoded, err := json.Marshal(part)
-			if err != nil {
-				return unsupported(partPath, "Anthropic content parts must be JSON objects")
-			}
-			var object map[string]interface{}
-			if err := json.Unmarshal(encoded, &object); err != nil || object == nil {
-				return unsupported(partPath, "Anthropic content parts must be JSON objects")
-			}
+		if ok {
+			for partIndex, part := range parts {
+				partPath := fmt.Sprintf("%s.content[%d]", messagePath, partIndex)
+				encoded, err := json.Marshal(part)
+				if err != nil {
+					return unsupported(partPath, "Anthropic content parts must be JSON objects")
+				}
+				var object map[string]interface{}
+				if err := json.Unmarshal(encoded, &object); err != nil || object == nil {
+					return unsupported(partPath, "Anthropic content parts must be JSON objects")
+				}
 
-			partType, ok := object["type"].(string)
-			if !ok || strings.TrimSpace(partType) == "" {
-				return unsupported(partPath+".type", "content part type is required")
+				partType, ok := object["type"].(string)
+				if !ok || strings.TrimSpace(partType) == "" {
+					return unsupported(partPath+".type", "content part type is required")
+				}
+				partType = strings.ToLower(strings.TrimSpace(partType))
+				switch partType {
+				case "text", "input_text":
+					if field := firstUnsupportedTranslatedChatField(object, "text", "type"); field != "" {
+						return unsupported(partPath+"."+field, "Anthropic text parts cannot preserve this field")
+					}
+					if _, ok := object["text"].(string); !ok {
+						return unsupported(partPath+".text", "Anthropic text parts require string text")
+					}
+				case "image_url", "image", "input_image":
+					if message.Role != "user" {
+						return unsupported(partPath+".type", "Anthropic only accepts image history in user messages")
+					}
+					if err := validateAnthropicImageContentPart(providerID, object, partPath, partType); err != nil {
+						return err
+					}
+				default:
+					return unsupported(partPath+".type", "Anthropic Messages cannot represent this content part type")
+				}
 			}
-			switch partType {
-			case "text", "input_text", "image_url", "image", "input_image":
-			default:
-				return unsupported(partPath+".type", "Anthropic Messages cannot represent this content part type")
+		}
+		if (message.Role == "user" || message.Role == "assistant") && len(message.ToolCalls) == 0 && anthropicMessageContentIsEmpty(message.Content) {
+			return unsupported(messagePath+".content", "Anthropic requires non-empty user and assistant message content when no tool calls are present")
+		}
+
+		for toolIndex := range message.ToolCalls {
+			callPath := fmt.Sprintf("%s.tool_calls[%d]", messagePath, toolIndex)
+			call := message.ToolCalls[toolIndex]
+			callType := strings.ToLower(strings.TrimSpace(call.Type))
+			if callType != "" && callType != "function" {
+				return unsupported(callPath+".type", "Anthropic only supports function tool calls")
+			}
+			if strings.TrimSpace(call.Function.Name) == "" {
+				return unsupported(callPath+".function.name", "Anthropic requires a function name")
+			}
+			arguments := strings.TrimSpace(call.Function.Arguments)
+			if arguments == "" {
+				arguments = "{}"
+			}
+			var input map[string]interface{}
+			if err := json.Unmarshal([]byte(arguments), &input); err != nil || input == nil {
+				return unsupported(callPath+".function.arguments", "Anthropic requires tool arguments to be a JSON object")
 			}
 		}
 	}
 
 	return nil
+}
+
+func anthropicMessageContentIsEmpty(content interface{}) bool {
+	switch value := content.(type) {
+	case nil:
+		return true
+	case string:
+		return value == ""
+	case []interface{}:
+		for _, part := range value {
+			encoded, err := json.Marshal(part)
+			if err != nil {
+				return false
+			}
+			var object map[string]interface{}
+			if err := json.Unmarshal(encoded, &object); err != nil {
+				return false
+			}
+			partType, _ := object["type"].(string)
+			switch strings.ToLower(strings.TrimSpace(partType)) {
+			case "text", "input_text":
+				if text, _ := object["text"].(string); text != "" {
+					return false
+				}
+			case "image_url", "image", "input_image":
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func validateAnthropicImageContentPart(
+	providerID string,
+	object map[string]interface{},
+	partPath string,
+	partType string,
+) error {
+	unsupported := func(field, reason string) error {
+		return &models.CompatibilityError{Field: field, Provider: providerID, Reason: reason}
+	}
+	allowed := []string{"image_url", "type"}
+	if partType != "image_url" {
+		allowed = []string{"detail", "image_url", "type", "url"}
+	}
+	if field := firstUnsupportedTranslatedChatField(object, allowed...); field != "" {
+		return unsupported(partPath+"."+field, "Anthropic image parts cannot preserve this field")
+	}
+	if detail, exists := object["detail"]; exists {
+		if !isAutomaticImageDetail(detail) {
+			return unsupported(partPath+".detail", "Anthropic cannot enforce OpenAI image detail settings")
+		}
+	}
+
+	urlValue := ""
+	if rawURL, exists := object["url"]; exists {
+		value, ok := rawURL.(string)
+		if !ok || strings.TrimSpace(value) == "" {
+			return unsupported(partPath+".url", "Anthropic image URL must be a non-empty string")
+		}
+		urlValue = strings.TrimSpace(value)
+	}
+	imageURLValue := ""
+	imageURLField := partPath + ".image_url"
+	if reference, exists := object["image_url"]; exists {
+		value, err := anthropicImageReferenceURL(providerID, reference, partPath+".image_url")
+		if err != nil {
+			return err
+		}
+		imageURLValue = value
+		if _, ok := reference.(map[string]interface{}); ok {
+			imageURLField += ".url"
+		}
+	}
+	if urlValue == "" && imageURLValue == "" {
+		return unsupported(partPath+".image_url", "Anthropic image parts require a non-empty image URL")
+	}
+	if urlValue != "" && imageURLValue != "" && urlValue != imageURLValue {
+		return unsupported(partPath+".image_url", "image_url conflicts with url and would otherwise be ignored")
+	}
+	selectedURL := urlValue
+	selectedField := partPath + ".url"
+	if selectedURL == "" {
+		selectedURL = imageURLValue
+		selectedField = imageURLField
+	}
+	if !isAnthropicImageURL(selectedURL) {
+		return unsupported(selectedField, "Anthropic images require an HTTP(S) URL or a base64 data URL")
+	}
+	return nil
+}
+
+func anthropicImageReferenceURL(providerID string, reference interface{}, path string) (string, error) {
+	unsupported := func(field, reason string) error {
+		return &models.CompatibilityError{Field: field, Provider: providerID, Reason: reason}
+	}
+	switch value := reference.(type) {
+	case string:
+		if strings.TrimSpace(value) == "" {
+			return "", unsupported(path, "Anthropic image URL must be a non-empty string")
+		}
+		return strings.TrimSpace(value), nil
+	case map[string]interface{}:
+		if field := firstUnsupportedTranslatedChatField(value, "detail", "url"); field != "" {
+			return "", unsupported(path+"."+field, "Anthropic image URLs cannot preserve this field")
+		}
+		if detail, exists := value["detail"]; exists && !isAutomaticImageDetail(detail) {
+			return "", unsupported(path+".detail", "Anthropic cannot enforce OpenAI image detail settings")
+		}
+		rawURL, ok := value["url"].(string)
+		if !ok || strings.TrimSpace(rawURL) == "" {
+			return "", unsupported(path+".url", "Anthropic image URL must be a non-empty string")
+		}
+		return strings.TrimSpace(rawURL), nil
+	default:
+		return "", unsupported(path, "Anthropic image_url must be a string or an object containing url")
+	}
+}
+
+func isAnthropicImageURL(value string) bool {
+	lower := strings.ToLower(strings.TrimSpace(value))
+	if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
+		return true
+	}
+	if strings.HasPrefix(lower, "data:") {
+		_, _, ok := parseDataURL(value)
+		return ok
+	}
+	return false
+}
+
+func isAutomaticImageDetail(value interface{}) bool {
+	detail, ok := value.(string)
+	return ok && (strings.TrimSpace(detail) == "" || strings.EqualFold(strings.TrimSpace(detail), "auto"))
 }
 
 func (t *AnthropicTranslator) TranslateRequest(ctx context.Context, req *models.UnifiedRequest) (*http.Request, error) {
@@ -314,15 +575,21 @@ func (t *AnthropicTranslator) TranslateRequest(ctx context.Context, req *models.
 	var thinking *anthropicThinking
 	if effort := strings.ToLower(strings.TrimSpace(req.ReasoningEffort)); effort != "" {
 		outputConfig = &anthropicOutputConfig{Effort: effort}
-		thinking = &anthropicThinking{Type: "adaptive"}
+		if t.cfg.Capabilities.AdaptiveThinking {
+			thinking = &anthropicThinking{Type: "adaptive"}
+		}
 	}
 	if req.ResponseFormat != nil && strings.EqualFold(strings.TrimSpace(req.ResponseFormat.Type), "json_schema") {
+		schema, err := translatedChatAnnotatedJSONSchema("anthropic", req.ResponseFormat.JSONSchema)
+		if err != nil {
+			return nil, err
+		}
 		if outputConfig == nil {
 			outputConfig = &anthropicOutputConfig{}
 		}
 		outputConfig.Format = &anthropicJSONOutputFormat{
 			Type:   "json_schema",
-			Schema: req.ResponseFormat.JSONSchema.Schema,
+			Schema: schema,
 		}
 	}
 	toolChoice, _ := mapOpenAIToolChoiceToAnthropic(req.ToolChoice)
@@ -382,9 +649,7 @@ func openAIInstructionToAnthropicBlocks(msg *models.Message) ([]anthropicContent
 }
 
 func (t *AnthropicTranslator) ParseResponse(resp *http.Response) (*models.UnifiedResponse, error) {
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
+	body, err := readUpstreamResponseBody(resp, "anthropic")
 	if err != nil {
 		return nil, fmt.Errorf("failed to read anthropic response body: %w", err)
 	}
@@ -443,7 +708,14 @@ func (t *AnthropicTranslator) toUnified(resp *anthropicResponse) *models.Unified
 		}
 	}
 
-	finishReason := mapAnthropicStopReason(resp.StopReason)
+	finishReason := mapAnthropicStopReason(resp.StopReason, resp.StopDetails)
+	refusal := anthropicRefusalExplanation(resp.StopReason, resp.StopDetails)
+	if isAnthropicRefusal(resp.StopReason, resp.StopDetails) {
+		// Anthropic refusal output may contain a partial answer or tool call that
+		// must not be used. Preserve only the refusal signal and explanation.
+		text.Reset()
+		toolCalls = nil
+	}
 
 	return &models.UnifiedResponse{
 		ID:      resp.ID,
@@ -456,6 +728,7 @@ func (t *AnthropicTranslator) toUnified(resp *anthropicResponse) *models.Unified
 				Message: &models.Message{
 					Role:    "assistant",
 					Content: text.String(),
+					Refusal: refusal,
 					ToolCalls: func() []models.ToolCall {
 						if len(toolCalls) == 0 {
 							return nil
@@ -466,12 +739,48 @@ func (t *AnthropicTranslator) toUnified(resp *anthropicResponse) *models.Unified
 				FinishReason: finishReason,
 			},
 		},
-		Usage: &models.Usage{
-			PromptTokens:     resp.Usage.InputTokens,
-			CompletionTokens: resp.Usage.OutputTokens,
-			TotalTokens:      resp.Usage.InputTokens + resp.Usage.OutputTokens,
-		},
+		Usage: anthropicUsageToUnified(resp.Usage),
 	}
+}
+
+func anthropicUsageToUnified(usage anthropicUsage) *models.Usage {
+	cacheWrite5m := 0
+	cacheWrite1h := 0
+	if usage.CacheCreation != nil {
+		cacheWrite5m = models.NonNegativeTokenCount(usage.CacheCreation.Ephemeral5mInputTokens)
+		cacheWrite1h = models.NonNegativeTokenCount(usage.CacheCreation.Ephemeral1hInputTokens)
+	}
+	cacheWrite := models.NonNegativeTokenCount(usage.CacheCreationInputTokens)
+	if classified := models.SaturatingTokenSum(cacheWrite5m, cacheWrite1h); classified > cacheWrite {
+		cacheWrite = classified
+	}
+	cacheRead := models.NonNegativeTokenCount(usage.CacheReadInputTokens)
+	uncachedInput := models.NonNegativeTokenCount(usage.InputTokens)
+	output := models.NonNegativeTokenCount(usage.OutputTokens)
+	input := models.SaturatingTokenSum(uncachedInput, cacheRead, cacheWrite)
+
+	result := &models.Usage{
+		PromptTokens:     input,
+		CompletionTokens: output,
+		TotalTokens:      models.SaturatingTokenSum(input, output),
+	}
+	if cacheRead > 0 || cacheWrite > 0 {
+		result.PromptTokensDetails = &models.InputTokensDetails{
+			CachedTokens:       cacheRead,
+			CacheWriteTokens:   cacheWrite,
+			CacheWriteTokens5m: cacheWrite5m,
+			CacheWriteTokens1h: cacheWrite1h,
+		}
+	}
+	return result
+}
+
+func anthropicUsageHasTokens(usage anthropicUsage) bool {
+	if usage.InputTokens != 0 || usage.OutputTokens != 0 || usage.CacheCreationInputTokens != 0 || usage.CacheReadInputTokens != 0 {
+		return true
+	}
+	return usage.CacheCreation != nil &&
+		(usage.CacheCreation.Ephemeral5mInputTokens != 0 || usage.CacheCreation.Ephemeral1hInputTokens != 0)
 }
 
 func (t *AnthropicTranslator) ParseStreamChunk(data []byte) (*models.StreamChunk, error) {
@@ -485,31 +794,59 @@ func (t *AnthropicTranslator) SupportsStreaming() bool {
 func (t *AnthropicTranslator) Models() []models.ModelInfo {
 	now := time.Now().Unix()
 	return []models.ModelInfo{
-		{ID: "claude-3-opus-20240229", Object: "model", Created: now, OwnedBy: "anthropic"},
-		{ID: "claude-3-sonnet-20240229", Object: "model", Created: now, OwnedBy: "anthropic"},
-		{ID: "claude-3-haiku-20240307", Object: "model", Created: now, OwnedBy: "anthropic"},
-		{ID: "claude-3-5-sonnet-20241022", Object: "model", Created: now, OwnedBy: "anthropic"},
+		{ID: "claude-fable-5-1", Object: "model", Created: now, OwnedBy: "anthropic"},
+		{ID: "claude-opus-5", Object: "model", Created: now, OwnedBy: "anthropic"},
+		{ID: "claude-sonnet-5", Object: "model", Created: now, OwnedBy: "anthropic"},
+		{ID: "claude-sonnet-4-6", Object: "model", Created: now, OwnedBy: "anthropic"},
+		{ID: "claude-haiku-4-5-20251001", Object: "model", Created: now, OwnedBy: "anthropic"},
 	}
 }
 
-func mapAnthropicStopReason(reason *string) *string {
+func mapAnthropicStopReason(reason *string, details *anthropicStopDetails) *string {
 	if reason == nil {
 		return nil
 	}
+	if details != nil && strings.EqualFold(strings.TrimSpace(details.Type), "refusal") {
+		mapped := "content_filter"
+		return &mapped
+	}
 	mapped := "stop"
-	switch *reason {
+	switch strings.ToLower(strings.TrimSpace(*reason)) {
 	case "end_turn":
 		mapped = "stop"
-	case "max_tokens":
+	case "max_tokens", "model_context_window_exceeded":
+		mapped = "length"
+	case "pause_turn":
+		// Chat Completions has no server-tool continuation reason. "length" is
+		// its standard signal that the otherwise valid response is incomplete.
 		mapped = "length"
 	case "stop_sequence":
 		mapped = "stop"
 	case "tool_use":
 		mapped = "tool_calls"
+	case "refusal":
+		mapped = "content_filter"
 	default:
 		mapped = *reason
 	}
 	return &mapped
+}
+
+func anthropicRefusalExplanation(reason *string, details *anthropicStopDetails) string {
+	if details == nil || details.Explanation == nil {
+		return ""
+	}
+	if !isAnthropicRefusal(reason, details) {
+		return ""
+	}
+	return *details.Explanation
+}
+
+func isAnthropicRefusal(reason *string, details *anthropicStopDetails) bool {
+	if details != nil && strings.EqualFold(strings.TrimSpace(details.Type), "refusal") {
+		return true
+	}
+	return reason != nil && strings.EqualFold(strings.TrimSpace(*reason), "refusal")
 }
 
 func contentToString(v interface{}) string {
@@ -528,14 +865,15 @@ func contentToString(v interface{}) string {
 }
 
 func parseDataURL(dataURL string) (mediaType string, data string, ok bool) {
-	if !strings.HasPrefix(dataURL, "data:") {
+	dataURL = strings.TrimSpace(dataURL)
+	if len(dataURL) < len("data:") || !strings.EqualFold(dataURL[:len("data:")], "data:") {
 		return "", "", false
 	}
 	parts := strings.SplitN(dataURL, ",", 2)
 	if len(parts) != 2 {
 		return "", "", false
 	}
-	meta := strings.TrimPrefix(parts[0], "data:")
+	meta := parts[0][len("data:"):]
 	data = strings.TrimSpace(parts[1])
 
 	if data == "" {
@@ -546,16 +884,35 @@ func parseDataURL(dataURL string) (mediaType string, data string, ok bool) {
 	if semi < 0 {
 		return "", "", false
 	}
-	mediaType = meta[:semi]
-	flags := meta[semi+1:]
-	if mediaType == "" {
+	mediaType = strings.ToLower(strings.TrimSpace(meta[:semi]))
+	if !isAnthropicBase64ImageMediaType(mediaType) {
 		return "", "", false
 	}
-	if !strings.Contains(flags, "base64") {
+	flags := strings.Split(meta[semi+1:], ";")
+	hasBase64 := false
+	for _, flag := range flags {
+		if strings.EqualFold(strings.TrimSpace(flag), "base64") {
+			hasBase64 = true
+			break
+		}
+	}
+	if !hasBase64 {
+		return "", "", false
+	}
+	if _, err := base64.StdEncoding.DecodeString(data); err != nil {
 		return "", "", false
 	}
 
 	return mediaType, data, true
+}
+
+func isAnthropicBase64ImageMediaType(mediaType string) bool {
+	switch mediaType {
+	case "image/jpeg", "image/png", "image/gif", "image/webp":
+		return true
+	default:
+		return false
+	}
 }
 
 func openAIMessageToAnthropicBlocks(msg *models.Message) ([]anthropicContentBlock, error) {
@@ -637,11 +994,8 @@ func openAIMessageToAnthropicBlocks(msg *models.Message) ([]anthropicContentBloc
 
 	if msg.Role == "assistant" {
 		for _, tc := range msg.ToolCalls {
-			if tc.Function.Name == "" {
-				continue
-			}
-			var input interface{}
-			if tc.Function.Arguments != "" {
+			input := interface{}(map[string]interface{}{})
+			if strings.TrimSpace(tc.Function.Arguments) != "" {
 				if err := json.Unmarshal([]byte(tc.Function.Arguments), &input); err != nil {
 					return nil, fmt.Errorf("invalid tool arguments JSON for %s: %w", tc.Function.Name, err)
 				}
@@ -666,12 +1020,57 @@ func openAIToolResultToAnthropicBlocks(msg *models.Message) ([]anthropicContentB
 	if msg.ToolCallID == "" {
 		return nil, fmt.Errorf("tool result message missing tool_call_id")
 	}
-	content := contentToString(msg.Content)
+	content, err := openAIToolResultContentToAnthropic(msg.Content)
+	if err != nil {
+		return nil, err
+	}
 	return []anthropicContentBlock{{
 		Type:      "tool_result",
 		ToolUseID: msg.ToolCallID,
 		Content:   content,
 	}}, nil
+}
+
+func openAIToolResultContentToAnthropic(content interface{}) (interface{}, error) {
+	switch value := content.(type) {
+	case nil:
+		return nil, nil
+	case string:
+		if value == "" {
+			return nil, nil
+		}
+		return value, nil
+	case []interface{}:
+		blocks := make([]anthropicContentBlock, 0, len(value))
+		for index, part := range value {
+			encoded, err := json.Marshal(part)
+			if err != nil {
+				return nil, fmt.Errorf("invalid tool result content part %d: %w", index, err)
+			}
+			var object map[string]interface{}
+			if err := json.Unmarshal(encoded, &object); err != nil || object == nil {
+				return nil, fmt.Errorf("invalid tool result content part %d", index)
+			}
+			partType, _ := object["type"].(string)
+			if partType != "text" && partType != "input_text" {
+				return nil, fmt.Errorf("unsupported tool result content part %q", partType)
+			}
+			text, ok := object["text"].(string)
+			if !ok {
+				return nil, fmt.Errorf("tool result content part %d requires string text", index)
+			}
+			if text == "" {
+				continue
+			}
+			blocks = append(blocks, anthropicContentBlock{Type: "text", Text: text})
+		}
+		if len(blocks) == 0 {
+			return nil, nil
+		}
+		return blocks, nil
+	default:
+		return nil, fmt.Errorf("unsupported tool result content type %T", content)
+	}
 }
 
 func mapOpenAIToolsToAnthropic(tools []models.Tool) []anthropicTool {
@@ -687,6 +1086,7 @@ func mapOpenAIToolsToAnthropic(tools []models.Tool) []anthropicTool {
 			Name:        t.Function.Name,
 			Description: t.Function.Description,
 			InputSchema: t.Function.Parameters,
+			Strict:      t.Function.Strict,
 		})
 	}
 	return out
@@ -774,4 +1174,25 @@ func isAnthropicEffort(effort string) bool {
 	default:
 		return false
 	}
+}
+
+func anthropicEffortEnabled(capabilities config.ProviderCapabilities, effort string) bool {
+	effort = strings.ToLower(strings.TrimSpace(effort))
+	if !capabilities.ReasoningEffort || !isAnthropicEffort(effort) {
+		return false
+	}
+	if len(capabilities.ReasoningEffortLevels) == 0 {
+		switch effort {
+		case "low", "medium", "high":
+			return true
+		default:
+			return false
+		}
+	}
+	for _, enabled := range capabilities.ReasoningEffortLevels {
+		if strings.EqualFold(strings.TrimSpace(enabled), effort) {
+			return true
+		}
+	}
+	return false
 }

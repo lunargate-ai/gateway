@@ -15,6 +15,9 @@ func TestIncludeClientStreamUsageFollowsClientContract(t *testing.T) {
 	if includeClientStreamUsage(requestTypeChatCompletions, exclude) {
 		t.Fatal("Chat Completions include_usage=false was ignored")
 	}
+	if includeClientStreamUsage(requestTypeChatCompletions, nil) {
+		t.Fatal("Chat Completions exposed usage without stream_options")
+	}
 	if !includeClientStreamUsage(requestTypeResponses, nil) {
 		t.Fatal("Responses terminal usage must always be retained")
 	}

@@ -26,11 +26,12 @@ update_check:
 providers:
   openai:
     api_key: "${OPENAI_API_KEY}"
-    default_model: "gpt-4-turbo"
+    default_model: "gpt-5.6-terra"
     organization: "${OPENAI_ORG_ID}"
     # Extended APIs are opt-in. Enable only contracts implemented by the
     # exact upstream behind base_url.
     capabilities:
+      chat_completions_lifecycle: true
       responses_lifecycle: true
       conversations: true
       background_responses: true
@@ -46,7 +47,12 @@ providers:
 
   anthropic:
     api_key: "${ANTHROPIC_API_KEY}"
-    default_model: "claude-3-sonnet-20240229"
+    default_model: "claude-sonnet-4-6"
+    capabilities:
+      structured_outputs: true
+      reasoning_effort: true
+      reasoning_effort_levels: [low, medium, high, max]
+      adaptive_thinking: true
 
   abacus:
     type: "openai"
@@ -76,7 +82,7 @@ routing:
           x-lunargate-complexity: "2-3"
       targets:
         - provider: openai
-          model: gpt-4-turbo
+          model: gpt-5.6-terra
           weight: 100
 
     - name: "complexity-tier-4-5"
@@ -86,7 +92,7 @@ routing:
           x-lunargate-complexity: "4-5"
       targets:
         - provider: anthropic
-          model: claude-3-sonnet-20240229
+          model: claude-sonnet-4-6
           weight: 100
 
     - name: "complexity-tier-6plus"
@@ -104,17 +110,17 @@ routing:
         path: "*"
       targets:
         - provider: openai
-          model: gpt-4-turbo
+          model: gpt-5.6-terra
           weight: 70
         - provider: openai-second-account
-          model: gpt-4-turbo
+          model: gpt-5.6-terra
           weight: 10
         - provider: anthropic
-          model: claude-3-sonnet-20240229
+          model: claude-sonnet-4-6
           weight: 30
       fallback:
         - provider: anthropic
-          model: claude-3-sonnet-20240229
+          model: claude-sonnet-4-6
 
 model_selection:
   enabled: true

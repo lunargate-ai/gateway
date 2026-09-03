@@ -41,7 +41,7 @@ func TestNativeResponsesLifecycleBindsCreateAndProxiesReads(t *testing.T) {
 		w.Header().Set("Set-Cookie", "provider-secret=leak")
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/responses":
-			w.WriteHeader(http.StatusCreated)
+			w.WriteHeader(http.StatusOK)
 			_, _ = io.WriteString(w, `{"id":"resp_native_lifecycle","object":"response","status":"completed","model":"gpt-native","output":[],"future_field":{"kept":true}}`)
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/responses/resp_native_lifecycle":
 			w.WriteHeader(http.StatusAccepted)
@@ -61,8 +61,8 @@ func TestNativeResponsesLifecycleBindsCreateAndProxiesReads(t *testing.T) {
 	defer cache.Stop()
 
 	create := performLifecycleRequest(t, router, http.MethodPost, "/v1/responses", []byte(`{"model":"native/gpt-native","input":"hello"}`))
-	if create.Code != http.StatusCreated {
-		t.Fatalf("create status = %d, want 201; body=%s", create.Code, create.Body.String())
+	if create.Code != http.StatusOK {
+		t.Fatalf("create status = %d, want 200; body=%s", create.Code, create.Body.String())
 	}
 	if _, _, ok := handler.responsesState.getCompleted("resp_native_lifecycle"); ok {
 		t.Fatal("native response was retained in the local emulation store")

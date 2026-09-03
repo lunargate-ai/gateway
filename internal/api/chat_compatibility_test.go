@@ -1,8 +1,13 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/lunargate-ai/gateway/internal/config"
@@ -25,6 +30,244 @@ func TestValidateChatCompatibilityRejectsExplicitTopKForOpenAI(t *testing.T) {
 	}
 	if compatibilityErr.Field != "top_k" || compatibilityErr.Provider != "openai-primary" {
 		t.Fatalf("compatibility error = %#v", compatibilityErr)
+	}
+}
+
+func TestValidateChatCompatibilityRejectsUnknownFieldsForTranslatedChatTargets(t *testing.T) {
+	handler := &Handler{registry: providers.NewRegistry(map[string]config.ProviderConfig{
+		"anthropic-primary": {Type: "anthropic"},
+		"ollama-primary":    {Type: "ollama"},
+	})}
+
+	for _, providerID := range []string{"anthropic-primary", "ollama-primary"} {
+		t.Run(providerID, func(t *testing.T) {
+			err := handler.validateChatCompatibility(routing.Target{Provider: providerID}, &models.UnifiedRequest{
+				SourceRequestType: requestTypeChatCompletions,
+				RawJSON:           json.RawMessage(`{"model":"model","messages":[],"service_tier":"priority"}`),
+			})
+			var compatibilityErr *models.CompatibilityError
+			if !errors.As(err, &compatibilityErr) {
+				t.Fatalf("error = %v, want CompatibilityError", err)
+			}
+			if compatibilityErr.Field != "service_tier" || compatibilityErr.Provider != providerID {
+				t.Fatalf("compatibility error = %#v", compatibilityErr)
+			}
+		})
+	}
+}
+
+func TestValidateChatCompatibilityAllowsMaxCompletionTokensForTranslatedTargets(t *testing.T) {
+	handler := &Handler{registry: providers.NewRegistry(map[string]config.ProviderConfig{
+		"anthropic-primary": {Type: "anthropic"},
+		"ollama-primary":    {Type: "ollama"},
+	})}
+	maxTokens := 128
+
+	for _, providerID := range []string{"anthropic-primary", "ollama-primary"} {
+		t.Run(providerID, func(t *testing.T) {
+			err := handler.validateChatCompatibility(routing.Target{Provider: providerID}, &models.UnifiedRequest{
+				SourceRequestType: requestTypeChatCompletions,
+				RawJSON:           json.RawMessage(`{"model":"model","messages":[{"role":"user","content":"hi"}],"max_completion_tokens":128}`),
+				Messages:          []models.Message{{Role: "user", Content: "hi"}},
+				MaxTokens:         &maxTokens,
+			})
+			if err != nil {
+				t.Fatalf("validateChatCompatibility returned error: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateChatCompatibilityRejectsBothTokenLimitsForTranslatedTargets(t *testing.T) {
+	handler := &Handler{registry: providers.NewRegistry(map[string]config.ProviderConfig{
+		"anthropic-primary": {Type: "anthropic"},
+	})}
+	maxTokens := 128
+	err := handler.validateChatCompatibility(routing.Target{Provider: "anthropic-primary"}, &models.UnifiedRequest{
+		SourceRequestType: requestTypeChatCompletions,
+		RawJSON:           json.RawMessage(`{"model":"model","messages":[{"role":"user","content":"hi"}],"max_tokens":64,"max_completion_tokens":128}`),
+		Messages:          []models.Message{{Role: "user", Content: "hi"}},
+		MaxTokens:         &maxTokens,
+	})
+	var compatibilityErr *models.CompatibilityError
+	if !errors.As(err, &compatibilityErr) {
+		t.Fatalf("error = %v, want CompatibilityError", err)
+	}
+	if compatibilityErr.Field != "max_completion_tokens" || compatibilityErr.Provider != "anthropic-primary" {
+		t.Fatalf("compatibility error = %#v", compatibilityErr)
+	}
+}
+
+func TestChatCompletionsRejectsUnknownTranslatedFieldBeforeUpstream(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"model":"qwen3.5","message":{"role":"assistant","content":"unexpected"},"done":true}`))
+	}))
+	defer upstream.Close()
+
+	handler := newUpstreamErrorTestHandler(t, map[string]config.ProviderConfig{
+		"local-ollama": {Type: "ollama", BaseURL: upstream.URL},
+	}, config.RouteConfig{
+		Name:    "default",
+		Match:   config.MatchConfig{Path: "*"},
+		Targets: []config.TargetConfig{{Provider: "local-ollama", Model: "qwen3.5", Weight: 1}},
+	}, config.RetryConfig{Enabled: false})
+	recorder := httptest.NewRecorder()
+	handler.ChatCompletions(recorder, httptest.NewRequest(
+		http.MethodPost,
+		"/v1/chat/completions",
+		bytes.NewBufferString(`{"model":"qwen3.5","messages":[{"role":"user","content":"hi"}],"service_tier":"priority"}`),
+	))
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response models.ErrorResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if response.Error.Param == nil || *response.Error.Param != "service_tier" {
+		t.Fatalf("error param = %#v, want service_tier", response.Error.Param)
+	}
+	if calls := upstreamCalls.Load(); calls != 0 {
+		t.Fatalf("upstream calls = %d, want 0", calls)
+	}
+}
+
+func TestValidateChatCompatibilityRejectsChatControlForResponsesTarget(t *testing.T) {
+	handler := &Handler{registry: providers.NewRegistry(map[string]config.ProviderConfig{
+		"openai-responses": {Type: "openai"},
+	})}
+	one := 1
+	err := handler.validateChatCompatibility(
+		routing.Target{Provider: "openai-responses", UpstreamRequestType: requestTypeResponses},
+		&models.UnifiedRequest{SourceRequestType: requestTypeChatCompletions, N: &one},
+	)
+	var compatibilityErr *models.CompatibilityError
+	if !errors.As(err, &compatibilityErr) {
+		t.Fatalf("error = %v, want CompatibilityError", err)
+	}
+	if compatibilityErr.Field != "n" || compatibilityErr.Provider != "openai-responses" {
+		t.Fatalf("compatibility error = %#v", compatibilityErr)
+	}
+}
+
+func TestChatCompletionsRejectsUnmappedResponsesControlBeforeUpstream(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"unexpected","object":"response","output":[]}`))
+	}))
+	defer upstream.Close()
+
+	handler, _ := newObservedOpenAIHandler(t, upstream.URL, config.TargetConfig{
+		Provider:            "openai-responses",
+		Model:               "gpt-5.4",
+		Weight:              1,
+		UpstreamRequestType: requestTypeResponses,
+	}, nil, config.CacheConfig{Enabled: false})
+	recorder := httptest.NewRecorder()
+	handler.ChatCompletions(recorder, httptest.NewRequest(
+		http.MethodPost,
+		"/v1/chat/completions",
+		bytes.NewBufferString(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}],"stop":"END"}`),
+	))
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response models.ErrorResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if response.Error.Param == nil || *response.Error.Param != "stop" {
+		t.Fatalf("error param = %#v, want stop", response.Error.Param)
+	}
+	if response.Error.Code == nil || *response.Error.Code != "unsupported_feature" {
+		t.Fatalf("error code = %#v, want unsupported_feature", response.Error.Code)
+	}
+	if calls := upstreamCalls.Load(); calls != 0 {
+		t.Fatalf("upstream calls = %d, want 0", calls)
+	}
+}
+
+func TestChatCompletionsRejectsUnsupportedOllamaToolChoiceBeforeUpstream(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"model":"qwen3.5","message":{"role":"assistant","content":"unexpected"},"done":true}`))
+	}))
+	defer upstream.Close()
+
+	handler := newUpstreamErrorTestHandler(t, map[string]config.ProviderConfig{
+		"local-ollama": {Type: "ollama", BaseURL: upstream.URL},
+	}, config.RouteConfig{
+		Name:    "default",
+		Match:   config.MatchConfig{Path: "*"},
+		Targets: []config.TargetConfig{{Provider: "local-ollama", Model: "qwen3.5", Weight: 1}},
+	}, config.RetryConfig{Enabled: false})
+
+	tests := []struct {
+		name       string
+		toolChoice interface{}
+		wantReason string
+	}{
+		{name: "required", toolChoice: "required", wantReason: "cannot enforce required tool use"},
+		{
+			name: "named function",
+			toolChoice: map[string]interface{}{
+				"type":     "function",
+				"function": map[string]interface{}{"name": "lookup"},
+			},
+			wantReason: "cannot enforce a named function tool choice",
+		},
+	}
+
+	for _, tt := range tests {
+		for _, stream := range []bool{false, true} {
+			name := tt.name + "/non-stream"
+			if stream {
+				name = tt.name + "/stream"
+			}
+			t.Run(name, func(t *testing.T) {
+				body, err := json.Marshal(map[string]interface{}{
+					"model":       "qwen3.5",
+					"messages":    []map[string]interface{}{{"role": "user", "content": "hi"}},
+					"stream":      stream,
+					"tools":       []map[string]interface{}{{"type": "function", "function": map[string]interface{}{"name": "lookup", "parameters": map[string]interface{}{"type": "object"}}}},
+					"tool_choice": tt.toolChoice,
+				})
+				if err != nil {
+					t.Fatalf("marshal request: %v", err)
+				}
+				recorder := httptest.NewRecorder()
+				handler.ChatCompletions(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body)))
+
+				if recorder.Code != http.StatusBadRequest {
+					t.Fatalf("status = %d, want 400; body=%s", recorder.Code, recorder.Body.String())
+				}
+				var response models.ErrorResponse
+				if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+					t.Fatalf("decode error response: %v", err)
+				}
+				if response.Error.Param == nil || *response.Error.Param != "tool_choice" {
+					t.Fatalf("error param = %#v, want tool_choice", response.Error.Param)
+				}
+				if response.Error.Code == nil || *response.Error.Code != "unsupported_feature" {
+					t.Fatalf("error code = %#v, want unsupported_feature", response.Error.Code)
+				}
+				if !strings.Contains(response.Error.Message, tt.wantReason) {
+					t.Fatalf("error message = %q, want substring %q", response.Error.Message, tt.wantReason)
+				}
+				if calls := upstreamCalls.Load(); calls != 0 {
+					t.Fatalf("upstream calls = %d, want 0", calls)
+				}
+			})
+		}
 	}
 }
 
@@ -205,6 +448,45 @@ func TestValidateChatCompatibilityAllowsResponsesStoreHandledLocallyForOllama(t 
 
 	if err := handler.validateChatCompatibility(routing.Target{Provider: "local-ollama"}, req); err != nil {
 		t.Fatalf("Responses store handled locally was rejected: %v", err)
+	}
+}
+
+func TestValidateChatCompatibilityRejectsFalseNativeResponsesTargets(t *testing.T) {
+	handler := &Handler{registry: providers.NewRegistry(map[string]config.ProviderConfig{
+		"openai-native": {Type: "openai"},
+		"anthropic":     {Type: "anthropic"},
+		"ollama":        {Type: "ollama"},
+	})}
+	req := &models.UnifiedRequest{SourceRequestType: requestTypeResponses}
+
+	tests := []struct {
+		name     string
+		provider string
+		upstream string
+		wantErr  bool
+	}{
+		{name: "openai responses", provider: "openai-native", upstream: requestTypeResponses},
+		{name: "anthropic responses", provider: "anthropic", upstream: requestTypeResponses, wantErr: true},
+		{name: "ollama responses", provider: "ollama", upstream: requestTypeResponses, wantErr: true},
+		{name: "unknown protocol", provider: "openai-native", upstream: "messages", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := handler.validateChatCompatibility(routing.Target{
+				Provider:            test.provider,
+				UpstreamRequestType: test.upstream,
+			}, req)
+			if !test.wantErr {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			var compatibilityErr *models.CompatibilityError
+			if !errors.As(err, &compatibilityErr) || compatibilityErr.Field != "upstream_request_type" {
+				t.Fatalf("error = %#v, want upstream_request_type CompatibilityError", err)
+			}
+		})
 	}
 }
 

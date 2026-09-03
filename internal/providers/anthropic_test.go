@@ -1,10 +1,13 @@
 package providers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/lunargate-ai/gateway/internal/config"
@@ -50,6 +53,40 @@ func TestAnthropicTranslator_UsesProviderDefaultSamplingOptions(t *testing.T) {
 	}
 	if payload.TopK == nil || *payload.TopK != 64 {
 		t.Fatalf("expected top_k=64 in upstream payload, got %#v", payload.TopK)
+	}
+}
+
+func TestAnthropicTranslatorUsesCurrentDefaultAndModelCatalog(t *testing.T) {
+	translator := NewAnthropicTranslator(config.ProviderConfig{})
+	if got := translator.DefaultModel(); got != "claude-sonnet-4-6" {
+		t.Fatalf("default model = %q, want claude-sonnet-4-6", got)
+	}
+
+	want := map[string]bool{
+		"claude-fable-5-1":          false,
+		"claude-opus-5":             false,
+		"claude-sonnet-5":           false,
+		"claude-sonnet-4-6":         false,
+		"claude-haiku-4-5-20251001": false,
+	}
+	retired := map[string]bool{
+		"claude-3-opus-20240229":     true,
+		"claude-3-sonnet-20240229":   true,
+		"claude-3-haiku-20240307":    true,
+		"claude-3-5-sonnet-20241022": true,
+	}
+	for _, model := range translator.Models() {
+		if retired[model.ID] {
+			t.Fatalf("retired model %q remains in catalog", model.ID)
+		}
+		if _, exists := want[model.ID]; exists {
+			want[model.ID] = true
+		}
+	}
+	for model, found := range want {
+		if !found {
+			t.Errorf("current model %q missing from catalog", model)
+		}
 	}
 }
 
@@ -108,8 +145,10 @@ func TestAnthropicTranslator_MapsSupportedClientControls(t *testing.T) {
 		APIKey:  "dummy",
 		BaseURL: "https://api.anthropic.com",
 		Capabilities: config.ProviderCapabilities{
-			ReasoningEffort:   true,
-			StructuredOutputs: true,
+			ReasoningEffort:       true,
+			ReasoningEffortLevels: []string{"xhigh"},
+			AdaptiveThinking:      true,
+			StructuredOutputs:     true,
 		},
 	})
 	one := 1
@@ -152,6 +191,107 @@ func TestAnthropicTranslator_MapsSupportedClientControls(t *testing.T) {
 	choice, ok := payload.ToolChoice.(map[string]interface{})
 	if !ok || choice["type"] != "any" {
 		t.Fatalf("tool_choice = %#v", payload.ToolChoice)
+	}
+}
+
+func TestAnthropicTranslator_MapsEffortWithoutFabricatingThinkingBudget(t *testing.T) {
+	tests := []struct {
+		name             string
+		model            string
+		adaptiveThinking bool
+		wantThinking     bool
+	}{
+		{
+			name:         "effort without thinking",
+			model:        "claude-opus-4-5-20251101",
+			wantThinking: false,
+		},
+		{
+			name:             "adaptive thinking",
+			model:            "claude-opus-4-8",
+			adaptiveThinking: true,
+			wantThinking:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			translator := NewAnthropicTranslator(config.ProviderConfig{
+				APIKey: "dummy",
+				Capabilities: config.ProviderCapabilities{
+					ReasoningEffort:  true,
+					AdaptiveThinking: tt.adaptiveThinking,
+				},
+			})
+			maxTokens := 512
+			req, err := translator.TranslateRequest(context.Background(), &models.UnifiedRequest{
+				Model:           tt.model,
+				MaxTokens:       &maxTokens,
+				Messages:        []models.Message{{Role: "user", Content: "Solve this."}},
+				ReasoningEffort: "medium",
+			})
+			if err != nil {
+				t.Fatalf("TranslateRequest returned error: %v", err)
+			}
+			body, err := io.ReadAll(req.Body)
+			if err != nil {
+				t.Fatalf("read request body: %v", err)
+			}
+			if bytes.Contains(body, []byte("budget_tokens")) {
+				t.Fatalf("request fabricated a manual thinking budget: %s", body)
+			}
+			var payload anthropicRequest
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("decode request body: %v", err)
+			}
+			if payload.OutputConfig == nil || payload.OutputConfig.Effort != "medium" {
+				t.Fatalf("output_config = %#v, want effort=medium", payload.OutputConfig)
+			}
+			if tt.wantThinking {
+				if payload.Thinking == nil || payload.Thinking.Type != "adaptive" {
+					t.Fatalf("thinking = %#v, want adaptive", payload.Thinking)
+				}
+			} else if payload.Thinking != nil {
+				t.Fatalf("thinking = %#v, want omitted", payload.Thinking)
+			}
+		})
+	}
+}
+
+func TestAnthropicTranslator_RejectsEffortOutsideConfiguredContract(t *testing.T) {
+	tests := []struct {
+		name         string
+		effort       string
+		enabled      []string
+		wantFragment string
+	}{
+		{name: "unknown level", effort: "minimal", wantFragment: "unsupported Anthropic effort level"},
+		{name: "xhigh needs opt in", effort: "xhigh", wantFragment: "is not enabled for this provider"},
+		{name: "max needs opt in", effort: "max", wantFragment: "is not enabled for this provider"},
+		{name: "allowlist remains exact", effort: "max", enabled: []string{"xhigh"}, wantFragment: "is not enabled for this provider"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			translator := NewAnthropicTranslator(config.ProviderConfig{
+				APIKey: "dummy",
+				Capabilities: config.ProviderCapabilities{
+					ReasoningEffort:       true,
+					ReasoningEffortLevels: tt.enabled,
+				},
+			})
+			err := translator.ValidateRequestCompatibility("anthropic-backup", &models.UnifiedRequest{ReasoningEffort: tt.effort})
+			var compatibilityErr *models.CompatibilityError
+			if !errors.As(err, &compatibilityErr) {
+				t.Fatalf("error = %v, want CompatibilityError", err)
+			}
+			if compatibilityErr.Field != "reasoning_effort" || compatibilityErr.Provider != "anthropic-backup" {
+				t.Fatalf("compatibility error = %#v", compatibilityErr)
+			}
+			if !strings.Contains(compatibilityErr.Reason, tt.wantFragment) {
+				t.Fatalf("reason = %q, want substring %q", compatibilityErr.Reason, tt.wantFragment)
+			}
+		})
 	}
 }
 
@@ -283,5 +423,32 @@ func assertAnthropicSystemText(t *testing.T, blocks []anthropicContentBlock, wan
 		if block.Text != want[i] {
 			t.Fatalf("expected system block %d text %q, got %q", i, want[i], block.Text)
 		}
+	}
+}
+
+func TestAnthropicTranslatorSaturatesUsageTotal(t *testing.T) {
+	maximum := int(^uint(0) >> 1)
+	body, err := json.Marshal(map[string]interface{}{
+		"id":          "msg_overflow",
+		"type":        "message",
+		"role":        "assistant",
+		"content":     []interface{}{map[string]interface{}{"type": "text", "text": "ok"}},
+		"model":       "claude-sonnet-4-6",
+		"stop_reason": "end_turn",
+		"usage":       map[string]int{"input_tokens": maximum, "output_tokens": maximum},
+	})
+	if err != nil {
+		t.Fatalf("encode response: %v", err)
+	}
+
+	response, err := NewAnthropicTranslator(config.ProviderConfig{}).ParseResponse(&http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(bytes.NewReader(body)),
+	})
+	if err != nil {
+		t.Fatalf("ParseResponse returned error: %v", err)
+	}
+	if response.Usage == nil || response.Usage.TotalTokens != maximum {
+		t.Fatalf("usage = %#v, want total saturated to %d", response.Usage, maximum)
 	}
 }

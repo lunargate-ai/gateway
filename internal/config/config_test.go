@@ -75,6 +75,45 @@ general:
 	}
 }
 
+func TestValidateConfigRejectsInvalidUpstreamRequestTypes(t *testing.T) {
+	tests := []struct {
+		name         string
+		providerID   string
+		providerType string
+		requestType  string
+		fallback     bool
+		wantErr      bool
+	}{
+		{name: "openai responses", providerID: "custom", providerType: "openai", requestType: "responses"},
+		{name: "built-in openai responses", providerID: "openai", requestType: "responses"},
+		{name: "anthropic responses", providerID: "anthropic", providerType: "anthropic", requestType: "responses", wantErr: true},
+		{name: "ollama fallback responses", providerID: "ollama", providerType: "ollama", requestType: "responses", fallback: true, wantErr: true},
+		{name: "unknown protocol", providerID: "custom", providerType: "openai", requestType: "messages", wantErr: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			target := TargetConfig{Provider: test.providerID, UpstreamRequestType: test.requestType}
+			route := RouteConfig{Name: "test"}
+			if test.fallback {
+				route.Fallback = []TargetConfig{target}
+			} else {
+				route.Targets = []TargetConfig{target}
+			}
+			cfg := &Config{
+				Providers: map[string]ProviderConfig{
+					test.providerID: {Type: test.providerType},
+				},
+				Routing: RoutingConfig{Routes: []RouteConfig{route}},
+			}
+			err := validateConfig(cfg)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("validateConfig() error = %v, wantErr %v", err, test.wantErr)
+			}
+		})
+	}
+}
+
 func TestNewManager_DefaultsUpdateChecksOn(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	configBody := `providers:
@@ -261,6 +300,7 @@ func TestNewManager_ParsesAndNormalizesProviderCapabilities(t *testing.T) {
   openai:
     api_key: "test-key"
     capabilities:
+      chat_completions_lifecycle: true
       responses_lifecycle: true
       conversations: true
       background_responses: true
@@ -270,6 +310,8 @@ func TestNewManager_ParsesAndNormalizesProviderCapabilities(t *testing.T) {
       embeddings_base64: true
       structured_outputs: true
       reasoning_effort: true
+      reasoning_effort_levels: [" LOW ", "xhigh", "low", ""]
+      adaptive_thinking: true
       hosted_tools: [" Web_Search ", "file_search", "web_search", ""]
 routing:
   routes:
@@ -287,12 +329,16 @@ routing:
 	}
 
 	capabilities := manager.Get().Providers["openai"].Capabilities
-	if !capabilities.ResponsesLifecycle || !capabilities.Conversations ||
+	if !capabilities.ChatCompletionsLifecycle || !capabilities.ResponsesLifecycle || !capabilities.Conversations ||
 		!capabilities.BackgroundResponses || !capabilities.ResponseCancellation ||
 		!capabilities.ResponseCompaction || !capabilities.ResponseInputTokens ||
 		!capabilities.EmbeddingsBase64 || !capabilities.StructuredOutputs ||
-		!capabilities.ReasoningEffort {
+		!capabilities.ReasoningEffort || !capabilities.AdaptiveThinking {
 		t.Fatalf("capability flags were not preserved: %#v", capabilities)
+	}
+	wantEffortLevels := []string{"low", "xhigh"}
+	if !reflect.DeepEqual(capabilities.ReasoningEffortLevels, wantEffortLevels) {
+		t.Fatalf("reasoning_effort_levels = %#v, want %#v", capabilities.ReasoningEffortLevels, wantEffortLevels)
 	}
 	wantTools := []string{"web_search", "file_search"}
 	if !reflect.DeepEqual(capabilities.HostedTools, wantTools) {

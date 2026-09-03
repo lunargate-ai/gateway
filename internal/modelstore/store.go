@@ -2,7 +2,6 @@ package modelstore
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"sort"
@@ -43,8 +42,13 @@ type Store struct {
 func NewStore(reg *providers.Registry, providersCfg map[string]config.ProviderConfig) *Store {
 	s := &Store{
 		registry: reg,
-		client:   &http.Client{Timeout: 15 * time.Second},
-		cache:    make(map[string]cacheEntry),
+		client: &http.Client{
+			Timeout: 15 * time.Second,
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+		cache: make(map[string]cacheEntry),
 	}
 	s.UpdateProvidersConfig(providersCfg)
 	return s
@@ -271,7 +275,7 @@ func (s *Store) fetchModels(ctx context.Context, providerID string, pcfg config.
 			return nil, fmt.Errorf("ollama tags returned status=%d", resp.StatusCode)
 		}
 		var tr ollamaTagsResponse
-		if err := json.NewDecoder(resp.Body).Decode(&tr); err != nil {
+		if err := decodeModelsResponse(resp.Body, &tr); err != nil {
 			return nil, fmt.Errorf("failed to decode ollama tags response: %w", err)
 		}
 		out := make([]string, 0, len(tr.Models))
@@ -304,7 +308,7 @@ func (s *Store) fetchModels(ctx context.Context, providerID string, pcfg config.
 			return nil, fmt.Errorf("openai models returned status=%d", resp.StatusCode)
 		}
 		var ml openAIModelsList
-		if err := json.NewDecoder(resp.Body).Decode(&ml); err != nil {
+		if err := decodeModelsResponse(resp.Body, &ml); err != nil {
 			return nil, fmt.Errorf("failed to decode openai models response: %w", err)
 		}
 		out := make([]string, 0, len(ml.Data))

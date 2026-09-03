@@ -53,6 +53,44 @@ func TestResponsesPassesUnknownPreviousResponseIDToNativeTarget(t *testing.T) {
 	}
 }
 
+func TestResponsesPassesPromptOnlyRequestToNativeTarget(t *testing.T) {
+	var upstreamPayload map[string]interface{}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			t.Fatalf("upstream path = %q, want /v1/responses", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&upstreamPayload); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_prompt","object":"response","created_at":1,"status":"completed","model":"gpt-5.4","output":[],"output_text":"ok"}`))
+	}))
+	defer upstream.Close()
+
+	handler, cache := newNativeContinuationTestHandler(t, upstream.URL+"/v1", "responses")
+	defer cache.Stop()
+	recorder := httptest.NewRecorder()
+	handler.Responses(recorder, httptest.NewRequest(
+		http.MethodPost,
+		"/v1/responses",
+		bytes.NewBufferString(`{"prompt":{"id":"pmpt_1","version":"2"},"store":false}`),
+	))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	prompt, ok := upstreamPayload["prompt"].(map[string]interface{})
+	if !ok || prompt["id"] != "pmpt_1" || prompt["version"] != "2" {
+		t.Fatalf("prompt = %#v, want preserved prompt reference", upstreamPayload["prompt"])
+	}
+	if _, exists := upstreamPayload["input"]; exists {
+		t.Fatalf("native request gained input: %#v", upstreamPayload)
+	}
+	if upstreamPayload["model"] != "gpt-5.4" {
+		t.Fatalf("route-selected model = %#v, want gpt-5.4", upstreamPayload["model"])
+	}
+}
+
 func TestResponsesRejectsUnknownPreviousResponseIDForTranslatedTarget(t *testing.T) {
 	upstreamCalls := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

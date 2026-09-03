@@ -44,6 +44,7 @@ type ResponsesTool struct {
 	Name        string        `json:"name,omitempty"`
 	Description string        `json:"description,omitempty"`
 	Parameters  interface{}   `json:"parameters,omitempty"`
+	Strict      *bool         `json:"strict,omitempty"`
 }
 
 type ResponsesResponse struct {
@@ -77,6 +78,7 @@ type ResponsesOutput struct {
 type ResponsesContentPart struct {
 	Type        string `json:"type"`
 	Text        string `json:"text,omitempty"`
+	Refusal     string `json:"refusal,omitempty"`
 	Annotations []any  `json:"annotations,omitempty"`
 }
 
@@ -86,9 +88,10 @@ type ResponsesSummaryPart struct {
 }
 
 type ResponsesUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
-	TotalTokens  int `json:"total_tokens"`
+	InputTokens        int                 `json:"input_tokens"`
+	OutputTokens       int                 `json:"output_tokens"`
+	TotalTokens        int                 `json:"total_tokens"`
+	InputTokensDetails *InputTokensDetails `json:"input_tokens_details,omitempty"`
 }
 
 const (
@@ -113,13 +116,14 @@ func ResponsesToUnifiedRequest(req *ResponsesRequest) (*UnifiedRequest, error) {
 	if req == nil {
 		return nil, fmt.Errorf("request is required")
 	}
-	if strings.TrimSpace(req.Model) == "" {
-		return nil, fmt.Errorf("model is required")
-	}
 
-	messages, err := responsesInputToMessages(req.Input)
-	if err != nil {
-		return nil, err
+	var messages []Message
+	if req.Input != nil {
+		var err error
+		messages, err = responsesInputToMessages(req.Input)
+		if err != nil {
+			return nil, err
+		}
 	}
 	instructions, err := responsesInstructionsToMessages(req.Instructions)
 	if err != nil {
@@ -236,6 +240,9 @@ func UnifiedResponseToResponses(resp *UnifiedResponse) *ResponsesResponse {
 				outputText = append(outputText, text)
 			}
 		}
+		if refusal := choice.Message.Refusal; refusal != "" {
+			parts = append(parts, ResponsesContentPart{Type: "refusal", Refusal: refusal})
+		}
 
 		output = append(output, ResponsesOutput{
 			Type:    "message",
@@ -284,9 +291,10 @@ func UnifiedResponseToResponses(resp *UnifiedResponse) *ResponsesResponse {
 
 	if resp.Usage != nil {
 		out.Usage = &ResponsesUsage{
-			InputTokens:  resp.Usage.PromptTokens,
-			OutputTokens: resp.Usage.CompletionTokens,
-			TotalTokens:  resp.Usage.TotalTokens,
+			InputTokens:        resp.Usage.PromptTokens,
+			OutputTokens:       resp.Usage.CompletionTokens,
+			TotalTokens:        resp.Usage.TotalTokens,
+			InputTokensDetails: CloneInputTokensDetails(resp.Usage.PromptTokensDetails),
 		}
 	}
 
@@ -572,6 +580,12 @@ func responsesToolsToUnified(tools []ResponsesTool) ([]Tool, error) {
 		}
 		if fn.Parameters == nil {
 			fn.Parameters = t.Parameters
+		}
+		if fn.Strict != nil && t.Strict != nil && *fn.Strict != *t.Strict {
+			return nil, fmt.Errorf("tools[%d].strict conflicts with tools[%d].function.strict", i, i)
+		}
+		if fn.Strict == nil {
+			fn.Strict = t.Strict
 		}
 
 		if strings.TrimSpace(fn.Name) == "" {

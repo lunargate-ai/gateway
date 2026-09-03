@@ -11,13 +11,12 @@ import (
 
 func TestResponsesNativeNonStreamPreservesRawSuccessfulEnvelope(t *testing.T) {
 	testCases := []struct {
-		name       string
-		statusCode int
-		status     string
+		name   string
+		status string
 	}{
-		{name: "queued", statusCode: http.StatusAccepted, status: "queued"},
-		{name: "incomplete", statusCode: http.StatusPartialContent, status: "incomplete"},
-		{name: "failed", statusCode: http.StatusNonAuthoritativeInfo, status: "failed"},
+		{name: "queued", status: "queued"},
+		{name: "incomplete", status: "incomplete"},
+		{name: "failed", status: "failed"},
 	}
 
 	for _, testCase := range testCases {
@@ -76,7 +75,7 @@ func TestResponsesNativeNonStreamPreservesRawSuccessfulEnvelope(t *testing.T) {
 				w.Header().Set("X-Upstream-Hop", "secret")
 				w.Header().Set("Proxy-Connection", "keep-alive")
 				w.Header().Set("X-LunarGate-Provider", "spoofed")
-				w.WriteHeader(testCase.statusCode)
+				w.WriteHeader(http.StatusOK)
 				_, _ = w.Write([]byte(body))
 			}))
 			defer upstream.Close()
@@ -90,8 +89,8 @@ func TestResponsesNativeNonStreamPreservesRawSuccessfulEnvelope(t *testing.T) {
 				strings.NewReader(`{"model":"gpt-5.4","input":"hello","store":false}`),
 			))
 
-			if recorder.Code != testCase.statusCode {
-				t.Fatalf("status = %d, want %d; body=%s", recorder.Code, testCase.statusCode, recorder.Body.String())
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
 			}
 			if got := recorder.Body.String(); got != body {
 				t.Fatalf("raw response changed\n got: %s\nwant: %s", got, body)

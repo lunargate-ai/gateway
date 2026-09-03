@@ -45,8 +45,8 @@ func TestFallbackExecutor_NoFallbacks_PreservesRetryMetadataOnFailure(t *testing
 	if fallbackUsed {
 		t.Fatalf("expected fallbackUsed=false when no fallback targets exist")
 	}
-	if retryCount != 3 {
-		t.Fatalf("expected retryCount=3, got %d", retryCount)
+	if retryCount != 2 {
+		t.Fatalf("expected retryCount=2, got %d", retryCount)
 	}
 	if cbState == "" {
 		t.Fatalf("expected non-empty circuit breaker state")
@@ -61,6 +61,46 @@ func TestFallbackExecutor_NoFallbacks_PreservesRetryMetadataOnFailure(t *testing
 	}
 	if statusErr.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("expected status code 429, got %d", statusErr.StatusCode)
+	}
+}
+
+func TestFallbackExecutorReportsTotalRetriesAcrossTargets(t *testing.T) {
+	fallback := NewFallbackExecutor(NewRetrier(config.RetryConfig{
+		Enabled:         true,
+		MaxAttempts:     2,
+		InitialDelay:    0,
+		MaxDelay:        0,
+		Multiplier:      1,
+		RetryableErrors: []int{http.StatusTooManyRequests},
+	}), NewCircuitBreakerManager())
+	primary := routing.Target{Provider: "primary", Model: "model-a"}
+	backup := routing.Target{Provider: "backup", Model: "model-b"}
+	calls := map[string]int{}
+
+	resp, usedTarget, fallbackUsed, retryCount, _, err := fallback.Execute(
+		context.Background(),
+		primary,
+		[]routing.Target{backup},
+		func(_ context.Context, target routing.Target) (*http.Response, error) {
+			calls[target.Provider]++
+			if target.Provider == primary.Provider || calls[target.Provider] == 1 {
+				return &http.Response{StatusCode: http.StatusTooManyRequests, Body: http.NoBody}, nil
+			}
+			return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
+		},
+	)
+
+	if err != nil {
+		t.Fatalf("fallback error: %v", err)
+	}
+	if resp == nil || usedTarget != backup || !fallbackUsed {
+		t.Fatalf("response/target/fallback = %#v/%#v/%v", resp, usedTarget, fallbackUsed)
+	}
+	if calls[primary.Provider] != 2 || calls[backup.Provider] != 2 {
+		t.Fatalf("calls = %#v, want two attempts per target", calls)
+	}
+	if retryCount != 2 {
+		t.Fatalf("retryCount = %d, want two total retries", retryCount)
 	}
 }
 
@@ -102,8 +142,8 @@ func TestFallbackExecutor_WithFallbackDisabledStaysOnPrimary(t *testing.T) {
 	if usedTarget != primary || fallbackUsed {
 		t.Fatalf("usedTarget=%#v fallbackUsed=%v", usedTarget, fallbackUsed)
 	}
-	if retryCount != 1 {
-		t.Fatalf("retryCount=%d, want 1", retryCount)
+	if retryCount != 0 {
+		t.Fatalf("retryCount=%d, want 0", retryCount)
 	}
 }
 

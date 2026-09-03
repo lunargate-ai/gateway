@@ -7,7 +7,7 @@ routing:
     - name: "default"
       targets:
         - provider: openai
-          model: gpt-5.2
+          model: gpt-5.6-terra
 
 # Optional: enable inbound API-key auth for /v1/*
 # security:

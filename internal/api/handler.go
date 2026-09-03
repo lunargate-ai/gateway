@@ -31,20 +31,21 @@ import (
 
 // Handler is the main API handler that orchestrates the request lifecycle.
 type Handler struct {
-	registry             *providers.Registry
-	router               *routing.Engine
-	fallback             *resilience.FallbackExecutor
-	cache                *middleware.Cache
-	streamer             *streaming.Handler
-	metrics              *observability.Metrics
-	collector            *observability.CollectorClient
-	selector             *modelselect.Engine
-	store                *modelstore.Store
-	providerClients      *providerClientRegistry
-	responsesState       *responsesStateStore
-	responseBindings     *responseBindingStore
-	conversationBindings *conversationBindingStore
-	conversationsState   *conversationStateStore
+	registry               *providers.Registry
+	router                 *routing.Engine
+	fallback               *resilience.FallbackExecutor
+	cache                  *middleware.Cache
+	streamer               *streaming.Handler
+	metrics                *observability.Metrics
+	collector              *observability.CollectorClient
+	selector               *modelselect.Engine
+	store                  *modelstore.Store
+	providerClients        *providerClientRegistry
+	responsesState         *responsesStateStore
+	responseBindings       *responseBindingStore
+	chatCompletionBindings *chatCompletionBindingStore
+	conversationBindings   *conversationBindingStore
+	conversationsState     *conversationStateStore
 }
 
 type trackedResponseWriter struct {
@@ -116,6 +117,9 @@ func newProviderHTTPClient(timeout time.Duration) *http.Client {
 	transport.ResponseHeaderTimeout = timeout
 	return &http.Client{
 		Transport: transport,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
 }
 
@@ -274,20 +278,21 @@ func NewHandler(
 	store *modelstore.Store,
 ) *Handler {
 	return &Handler{
-		registry:             registry,
-		router:               router,
-		fallback:             fallback,
-		cache:                cache,
-		streamer:             streamer,
-		metrics:              metrics,
-		collector:            collector,
-		selector:             selector,
-		store:                store,
-		providerClients:      newProviderClientRegistry(nil),
-		responsesState:       newResponsesStateStore(30 * time.Minute),
-		responseBindings:     newResponseBindingStore(30 * time.Minute),
-		conversationBindings: newConversationBindingStore(30 * time.Minute),
-		conversationsState:   newConversationStateStore(30 * time.Minute),
+		registry:               registry,
+		router:                 router,
+		fallback:               fallback,
+		cache:                  cache,
+		streamer:               streamer,
+		metrics:                metrics,
+		collector:              collector,
+		selector:               selector,
+		store:                  store,
+		providerClients:        newProviderClientRegistry(nil),
+		responsesState:         newResponsesStateStore(30 * time.Minute),
+		responseBindings:       newResponseBindingStore(30 * time.Minute),
+		chatCompletionBindings: newChatCompletionBindingStore(30 * time.Minute),
+		conversationBindings:   newConversationBindingStore(30 * time.Minute),
+		conversationsState:     newConversationStateStore(30 * time.Minute),
 	}
 }
 
@@ -525,7 +530,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				requestTypes: resolvedRequestTypes,
 				provider:     resolved.Target.Provider,
 				model:        cachedModelCanonical,
-				metricsModel: cachedModelRaw,
+				metricsModel: boundedModelMetricLabel(resolved.Target, cachedModelRaw),
 				route:        resolved.RouteName,
 				targetIndex:  resolved.Index,
 				user:         userPtr,
@@ -598,6 +603,15 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	requestCtx := requestContextWithRetryPolicy(r)
+	// A stored Chat Completion is a stateful upstream operation. If the
+	// provider persisted the completion before returning a retryable failure,
+	// replaying it here could create duplicate stored objects. Keep ordinary
+	// stateless Chat requests retryable, but make store:true single-attempt and
+	// single-target just like Responses create.
+	if req.Store != nil && *req.Store {
+		requestCtx = resilience.WithRetryDisabled(requestCtx)
+		requestCtx = resilience.WithFallbackDisabled(requestCtx)
+	}
 	resp, usedTarget, fallbackUsed, retryCount, cbState, err := h.fallback.Execute(requestCtx, resolved.Target, resolved.Fallbacks, executeFunc)
 	h.observeCircuitBreakerState(usedTarget.Provider, cbState)
 	usedSampling := h.resolveCollectorInferenceParameters(usedTarget.Provider, &req)
@@ -668,6 +682,16 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			routeUsed := resolved.RouteName
 			targetIndex := resolved.Index
+			failedModelRaw := strings.TrimSpace(usedTarget.Model)
+			if failedModelRaw == "" {
+				failedModelRaw = modelid.ModelName(req.Model)
+				if failedModelRaw == "" {
+					if translator, ok := h.registry.Get(usedTarget.Provider); ok {
+						failedModelRaw = strings.TrimSpace(translator.DefaultModel())
+					}
+				}
+			}
+			failedModelCanonical := modelid.BuildCanonical(usedTarget.Provider, failedModelRaw)
 			var upstreamPtr *int64
 			if upstreamStartMS >= 0 {
 				v := upstreamStartMS
@@ -683,22 +707,21 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 					DurationMS:           duration.Milliseconds(),
 					GatewayPreUpstreamMS: upstreamPtr,
 					Provider:             usedTarget.Provider,
-					Model:                req.Model,
+					Model:                failedModelCanonical,
 					User:                 userPtr,
 					SessionID:            sessionIDPtr,
 					TokensInput:          0,
 					TokensOutput:         0,
 					CostUSD:              0,
 					StatusCode:           status,
-					ErrorCode:            &errCodeForCollector,
-					ErrorMessage:         &errMsgForCollector,
+					ErrorCode:            observability.MetricErrorClass(status, true),
 					CacheHit:             cacheHit,
 					RouteUsed:            &routeUsed,
 					TargetIndex:          &targetIndex,
 					FallbackUsed:         fallbackUsed,
 					RetryCount:           retryCount,
 					CircuitBreakerState:  &cbState,
-					Tags:                 h.enrichCollectorTagsWithInference(usedCollectorHeaders, usedTarget.Provider, req.Model, req.Stream, usedSampling),
+					Tags:                 h.enrichCollectorTagsWithInference(usedCollectorHeaders, usedTarget.Provider, failedModelCanonical, req.Stream, usedSampling),
 				},
 			}}
 
@@ -714,7 +737,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 						User:                userPtr,
 						SessionID:           sessionIDPtr,
 						Provider:            usedTarget.Provider,
-						Model:               req.Model,
+						Model:               failedModelCanonical,
 						StatusCode:          status,
 						DurationMS:          duration.Milliseconds(),
 						RouteUsed:           &routeUsed,
@@ -723,7 +746,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 						RetryCount:          retryCount,
 						ErrorCode:           &errCodeForCollector,
 						ErrorMessage:        &errMsgForCollector,
-						Tags:                h.enrichCollectorTagsWithInference(usedCollectorHeaders, usedTarget.Provider, req.Model, req.Stream, usedSampling),
+						Tags:                h.enrichCollectorTagsWithInference(usedCollectorHeaders, usedTarget.Provider, failedModelCanonical, req.Stream, usedSampling),
 						Request:             reqAny,
 					},
 				})
@@ -754,6 +777,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	usedModelCanonical := modelid.BuildCanonical(usedTarget.Provider, usedModelRaw)
+	metricsModelRaw := boundedModelMetricLabel(usedTarget, usedModelRaw)
 	req.Model = usedModelCanonical
 	w.Header().Set("X-LunarGate-Model", usedModelCanonical)
 
@@ -790,22 +814,20 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		toolCallOrder := make([]string, 0, 8)
 		tokensIn := 0
 		tokensOut := 0
+		streamTokenUsage := models.TokenUsage{}
 		var finishReason *string
 		var ttftMS int64 = -1
 		var ttltMS int64 = -1
 		var nativeTerminal *nativeResponsesStreamTerminal
+		var chatCompletionCandidate chatCompletionStreamBindingCandidate
 		streamObserver := func(chunk *models.StreamChunk) {
 			if chunk == nil {
 				return
 			}
-			if chunk.Usage != nil {
-				if chunk.Usage.PromptTokens > tokensIn {
-					tokensIn = chunk.Usage.PromptTokens
-				}
-				if chunk.Usage.CompletionTokens > tokensOut {
-					tokensOut = chunk.Usage.CompletionTokens
-				}
-			}
+			chatCompletionCandidate.observe(chunk)
+			mergeObservedTokenUsage(&streamTokenUsage, chunk.Usage)
+			tokensIn = streamTokenUsage.InputTokens
+			tokensOut = streamTokenUsage.OutputTokens
 
 			hasContent := false
 			for _, c := range chunk.Choices {
@@ -884,20 +906,25 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 
 		var streamErr error
-		nativeResponsesStream := strings.EqualFold(strings.TrimSpace(requestType), requestTypeResponses) &&
-			strings.EqualFold(strings.TrimSpace(usedRequestTypes.upstream), requestTypeResponses) &&
-			resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices
+		nativeResponsesRequest := strings.EqualFold(strings.TrimSpace(requestType), requestTypeResponses) &&
+			strings.EqualFold(strings.TrimSpace(usedRequestTypes.upstream), requestTypeResponses)
+		nativeResponsesStream := nativeResponsesRequest && resp.StatusCode == http.StatusOK
 		nativeResponseStatus := http.StatusOK
-		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		if nativeResponsesRequest && resp.StatusCode != http.StatusOK && resp.StatusCode < http.StatusBadRequest {
+			resp.Body.Close()
+			streamErr = invalidNativeResponsesCreateStatus(usedTarget.Provider, resp.StatusCode)
+		} else if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 			streamErr = readUpstreamHTTPError(resp, usedProviderType)
 		} else if nativeResponsesStream {
 			nativeResponseStatus = resp.StatusCode
 			copyHeaders(w.Header(), resp.Header)
 			nativeSink, _ := w.(nativeResponsesStreamSink)
+			var nativeEventTransformer streaming.SSEEventDataTransformer
 			if nativeSink != nil {
 				nativeSink.enableNativePassthrough()
+				nativeEventTransformer = nativeSink.transformNativeEventData
 			}
-			streamErr = h.streamer.ProxySSE(
+			streamErr = h.streamer.ProxySSEWithDataTransformer(
 				r.Context(),
 				tw,
 				resp,
@@ -914,12 +941,14 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 					nativeTerminal = terminal
 					tokensIn = terminal.tokensInput
 					tokensOut = terminal.tokensOutput
+					streamTokenUsage = terminal.tokenUsage
 					ttltMS = now
 					if nativeSink != nil {
 						nativeSink.recordNativeTerminal(terminal)
 					}
 					return true
 				},
+				nativeEventTransformer,
 			)
 		} else if usedProviderType == "anthropic" {
 			streamErr = h.streamer.StreamAnthropicResponseWithObserverAndUsage(
@@ -1052,21 +1081,23 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				ev.Msg("stream completed")
 			}
 		}
+		if streamErr == nil && req.Store != nil && *req.Store {
+			h.retainNativeChatCompletionBinding(
+				chatCompletionCandidate.completionID(),
+				requestType,
+				usedRequestTypes.upstream,
+				w.Header(),
+			)
+		}
 
-		h.metrics.RequestsTotal.WithLabelValues(usedTarget.Provider, usedModelRaw, strconv.Itoa(status), resolved.RouteName).Inc()
-		h.metrics.RequestDuration.WithLabelValues(usedTarget.Provider, usedModelRaw).Observe(duration.Seconds())
-		if tokensIn > 0 {
-			h.metrics.TokensTotal.WithLabelValues(usedTarget.Provider, usedModelRaw, "input").Add(float64(tokensIn))
-		}
-		if tokensOut > 0 {
-			h.metrics.TokensTotal.WithLabelValues(usedTarget.Provider, usedModelRaw, "output").Add(float64(tokensOut))
-		}
+		h.metrics.RequestsTotal.WithLabelValues(usedTarget.Provider, metricsModelRaw, strconv.Itoa(status), resolved.RouteName).Inc()
+		h.metrics.RequestDuration.WithLabelValues(usedTarget.Provider, metricsModelRaw).Observe(duration.Seconds())
+		h.metrics.ObserveTokenUsage(usedTarget.Provider, metricsModelRaw, streamTokenUsage)
 
 		if h.collector != nil {
 			routeUsed := resolved.RouteName
 			targetIndex := resolved.Index
-			costUSD := observability.EstimateCostUSD(usedProviderType, usedModelRaw, tokensIn, tokensOut)
-			costUSD = observability.EstimateCostUSD(usedProviderType, usedModelRaw, tokensIn, tokensOut)
+			costUSD := observability.EstimateTokenUsageCostUSD(usedTarget.Provider, usedProviderType, usedModelRaw, streamTokenUsage)
 
 			// Build optional timing pointers
 			var upstreamPtr *int64
@@ -1087,31 +1118,34 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			events := []observability.Event{{
 				Type: "metric",
 				Data: observability.MetricEventData{
-					RequestID:            requestID,
-					Timestamp:            startTime.UTC(),
-					RequestType:          usedRequestTypes.client,
-					UpstreamRequestType:  usedRequestTypes.upstream,
-					DurationMS:           duration.Milliseconds(),
-					GatewayPreUpstreamMS: upstreamPtr,
-					TtftMS:               ttftPtr,
-					TtltMS:               ttltPtr,
-					Provider:             usedTarget.Provider,
-					Model:                usedModelCanonical,
-					User:                 userPtr,
-					SessionID:            sessionIDPtr,
-					TokensInput:          tokensIn,
-					TokensOutput:         tokensOut,
-					CostUSD:              costUSD,
-					StatusCode:           status,
-					ErrorCode:            errCodePtr,
-					ErrorMessage:         errMsgPtr,
-					CacheHit:             cacheHit,
-					RouteUsed:            &routeUsed,
-					TargetIndex:          &targetIndex,
-					FallbackUsed:         fallbackUsed,
-					RetryCount:           retryCount,
-					CircuitBreakerState:  &cbState,
-					Tags:                 h.enrichCollectorTagsWithInference(usedCollectorHeaders, usedTarget.Provider, usedModelCanonical, req.Stream, usedSampling),
+					RequestID:               requestID,
+					Timestamp:               startTime.UTC(),
+					RequestType:             usedRequestTypes.client,
+					UpstreamRequestType:     usedRequestTypes.upstream,
+					DurationMS:              duration.Milliseconds(),
+					GatewayPreUpstreamMS:    upstreamPtr,
+					TtftMS:                  ttftPtr,
+					TtltMS:                  ttltPtr,
+					Provider:                usedTarget.Provider,
+					Model:                   usedModelCanonical,
+					User:                    userPtr,
+					SessionID:               sessionIDPtr,
+					TokensInput:             tokensIn,
+					TokensOutput:            tokensOut,
+					TokensInputCached:       streamTokenUsage.CachedInputTokens,
+					TokensInputCacheWrite:   streamTokenUsage.CacheWriteInputTokens,
+					TokensInputCacheWrite5m: streamTokenUsage.CacheWriteInputTokens5m,
+					TokensInputCacheWrite1h: streamTokenUsage.CacheWriteInputTokens1h,
+					CostUSD:                 costUSD,
+					StatusCode:              status,
+					ErrorCode:               observability.MetricErrorClass(status, errCodePtr != nil),
+					CacheHit:                cacheHit,
+					RouteUsed:               &routeUsed,
+					TargetIndex:             &targetIndex,
+					FallbackUsed:            fallbackUsed,
+					RetryCount:              retryCount,
+					CircuitBreakerState:     &cbState,
+					Tags:                    h.enrichCollectorTagsWithInference(usedCollectorHeaders, usedTarget.Provider, usedModelCanonical, req.Stream, usedSampling),
 				},
 			}}
 
@@ -1123,12 +1157,13 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 				var respObj interface{}
 				if h.collector.ShareResponses() && nativeTerminal != nil {
-					respObj = nativeTerminal.response
+					respObj = nativeTerminal.collectorResponse
 				} else if h.collector.ShareResponses() {
 					usage := &models.Usage{
-						PromptTokens:     tokensIn,
-						CompletionTokens: tokensOut,
-						TotalTokens:      tokensIn + tokensOut,
+						PromptTokens:        tokensIn,
+						CompletionTokens:    tokensOut,
+						TotalTokens:         models.SaturatingTokenSum(tokensIn, tokensOut),
+						PromptTokensDetails: inputTokenDetailsFromTokenUsage(streamTokenUsage),
 					}
 					if tokensIn == 0 && tokensOut == 0 {
 						usage = nil
@@ -1200,9 +1235,9 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// needed by metrics and local state handling.
 	responseStatus := http.StatusOK
 	var responseHeaders http.Header
-	nativeResponsesEnvelope := strings.EqualFold(strings.TrimSpace(requestType), requestTypeResponses) &&
-		strings.EqualFold(strings.TrimSpace(usedRequestTypes.upstream), requestTypeResponses) &&
-		resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices
+	nativeResponsesRequest := strings.EqualFold(strings.TrimSpace(requestType), requestTypeResponses) &&
+		strings.EqualFold(strings.TrimSpace(usedRequestTypes.upstream), requestTypeResponses)
+	nativeResponsesEnvelope := nativeResponsesRequest && resp.StatusCode == http.StatusOK
 	if nativeResponsesEnvelope {
 		responseStatus = resp.StatusCode
 		responseHeaders = resp.Header.Clone()
@@ -1212,11 +1247,17 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// native OpenAI error document is not reduced by a typed translator.
 	var unified *models.UnifiedResponse
 	var upstreamFailure *upstreamHTTPError
-	if resp.StatusCode >= http.StatusBadRequest {
+	if nativeResponsesRequest && resp.StatusCode != http.StatusOK && resp.StatusCode < http.StatusBadRequest {
+		resp.Body.Close()
+		err = invalidNativeResponsesCreateStatus(usedTarget.Provider, resp.StatusCode)
+	} else if resp.StatusCode >= http.StatusBadRequest {
 		upstreamFailure = readUpstreamHTTPError(resp, usedProviderType)
 		err = upstreamFailure
 	} else {
 		unified, err = providerSnapshot.Translator.ParseResponse(resp)
+		if err == nil {
+			normalizeUnifiedResponseUsage(unified)
+		}
 	}
 	if err != nil {
 		duration := time.Since(startTime)
@@ -1265,7 +1306,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			Str("provider", usedTarget.Provider).
 			Dur("duration", duration).
 			Msg("failed to parse provider response")
-		h.metrics.ProviderErrors.WithLabelValues(usedTarget.Provider, metricErrType).Inc()
+		h.metrics.ProviderErrors.WithLabelValues(usedTarget.Provider, boundedProviderErrorMetricType(status, metricErrType)).Inc()
 		setTimingHeaders(w, duration.Milliseconds(), upstreamStartMS)
 		if upstreamFailure != nil {
 			upstreamFailure.write(w)
@@ -1298,8 +1339,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 					TokensOutput:         0,
 					CostUSD:              0,
 					StatusCode:           status,
-					ErrorCode:            &errCode,
-					ErrorMessage:         &errMsg,
+					ErrorCode:            observability.MetricErrorClass(status, true),
 					CacheHit:             cacheHit,
 					RouteUsed:            &routeUsed,
 					TargetIndex:          &targetIndex,
@@ -1343,6 +1383,14 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if nativeResponsesEnvelope {
 		copyHeaders(w.Header(), responseHeaders)
 	}
+	if req.Store != nil && *req.Store {
+		h.retainNativeChatCompletionBinding(
+			unified.ID,
+			requestType,
+			usedRequestTypes.upstream,
+			w.Header(),
+		)
+	}
 
 	// Cache the response
 	if !noCache && h.cache.Enabled() {
@@ -1353,13 +1401,11 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// Record metrics
 	duration := time.Since(startTime)
 	statusCode := strconv.Itoa(responseStatus)
-	h.metrics.RequestsTotal.WithLabelValues(usedTarget.Provider, usedModelRaw, statusCode, resolved.RouteName).Inc()
-	h.metrics.RequestDuration.WithLabelValues(usedTarget.Provider, usedModelRaw).Observe(duration.Seconds())
+	h.metrics.RequestsTotal.WithLabelValues(usedTarget.Provider, metricsModelRaw, statusCode, resolved.RouteName).Inc()
+	h.metrics.RequestDuration.WithLabelValues(usedTarget.Provider, metricsModelRaw).Observe(duration.Seconds())
 
-	if unified.Usage != nil {
-		h.metrics.TokensTotal.WithLabelValues(usedTarget.Provider, usedModelRaw, "input").Add(float64(unified.Usage.PromptTokens))
-		h.metrics.TokensTotal.WithLabelValues(usedTarget.Provider, usedModelRaw, "output").Add(float64(unified.Usage.CompletionTokens))
-	}
+	tokenUsage := models.TokenUsageFromUsage(unified.Usage)
+	h.metrics.ObserveTokenUsage(usedTarget.Provider, metricsModelRaw, tokenUsage)
 
 	setTimingHeaders(w, duration.Milliseconds(), upstreamStartMS)
 
@@ -1375,12 +1421,9 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		routeUsed := resolved.RouteName
 		targetIndex := resolved.Index
 		status := responseStatus
-		var tokensIn, tokensOut int
-		if unified.Usage != nil {
-			tokensIn = unified.Usage.PromptTokens
-			tokensOut = unified.Usage.CompletionTokens
-		}
-		costUSD := observability.EstimateCostUSD(usedProviderType, req.Model, tokensIn, tokensOut)
+		tokensIn := tokenUsage.InputTokens
+		tokensOut := tokenUsage.OutputTokens
+		costUSD := observability.EstimateTokenUsageCostUSD(usedTarget.Provider, usedProviderType, usedModelRaw, tokenUsage)
 		var upstreamPtr *int64
 		if upstreamStartMS >= 0 {
 			v := upstreamStartMS
@@ -1390,27 +1433,31 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		events := []observability.Event{{
 			Type: "metric",
 			Data: observability.MetricEventData{
-				RequestID:            requestID,
-				Timestamp:            startTime.UTC(),
-				RequestType:          usedRequestTypes.client,
-				UpstreamRequestType:  usedRequestTypes.upstream,
-				DurationMS:           duration.Milliseconds(),
-				GatewayPreUpstreamMS: upstreamPtr,
-				Provider:             usedTarget.Provider,
-				Model:                usedModelCanonical,
-				User:                 userPtr,
-				SessionID:            sessionIDPtr,
-				TokensInput:          tokensIn,
-				TokensOutput:         tokensOut,
-				CostUSD:              costUSD,
-				StatusCode:           status,
-				CacheHit:             cacheHit,
-				RouteUsed:            &routeUsed,
-				TargetIndex:          &targetIndex,
-				FallbackUsed:         fallbackUsed,
-				RetryCount:           retryCount,
-				CircuitBreakerState:  &cbState,
-				Tags:                 h.enrichCollectorTagsWithInference(usedCollectorHeaders, usedTarget.Provider, usedModelCanonical, req.Stream, usedSampling),
+				RequestID:               requestID,
+				Timestamp:               startTime.UTC(),
+				RequestType:             usedRequestTypes.client,
+				UpstreamRequestType:     usedRequestTypes.upstream,
+				DurationMS:              duration.Milliseconds(),
+				GatewayPreUpstreamMS:    upstreamPtr,
+				Provider:                usedTarget.Provider,
+				Model:                   usedModelCanonical,
+				User:                    userPtr,
+				SessionID:               sessionIDPtr,
+				TokensInput:             tokensIn,
+				TokensOutput:            tokensOut,
+				TokensInputCached:       tokenUsage.CachedInputTokens,
+				TokensInputCacheWrite:   tokenUsage.CacheWriteInputTokens,
+				TokensInputCacheWrite5m: tokenUsage.CacheWriteInputTokens5m,
+				TokensInputCacheWrite1h: tokenUsage.CacheWriteInputTokens1h,
+				CostUSD:                 costUSD,
+				StatusCode:              status,
+				CacheHit:                cacheHit,
+				RouteUsed:               &routeUsed,
+				TargetIndex:             &targetIndex,
+				FallbackUsed:            fallbackUsed,
+				RetryCount:              retryCount,
+				CircuitBreakerState:     &cbState,
+				Tags:                    h.enrichCollectorTagsWithInference(usedCollectorHeaders, usedTarget.Provider, usedModelCanonical, req.Stream, usedSampling),
 			},
 		}}
 
@@ -1586,6 +1633,15 @@ func (h *Handler) callProvider(ctx context.Context, target routing.Target, req *
 	}
 
 	return resp, nil
+}
+
+func invalidNativeResponsesCreateStatus(provider string, status int) *providers.ProviderError {
+	return &providers.ProviderError{
+		StatusCode: http.StatusBadGateway,
+		Provider:   strings.TrimSpace(provider),
+		Type:       "invalid_response_status",
+		Message:    fmt.Sprintf("native Responses upstream returned status %d; expected 200", status),
+	}
 }
 
 // extractHeaders pulls relevant headers into a map for route matching.

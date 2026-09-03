@@ -2,6 +2,7 @@ package observability
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -94,6 +95,55 @@ func TestCollectorClient_DropsQueuedPayloadAfterIdentityChange(t *testing.T) {
 	}
 	if len(secondAuthorizations) != 2 || secondAuthorizations[1] != "Bearer replacement-secret" {
 		t.Fatalf("second collector authorizations = %q, want replacement credential", secondAuthorizations)
+	}
+}
+
+func TestCollectorClient_DoesNotFollowRedirects(t *testing.T) {
+	var targetRequests atomic.Int32
+	var targetAuthorization atomic.Value
+	targetAuthorization.Store("")
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetRequests.Add(1)
+		targetAuthorization.Store(r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer target.Close()
+
+	var sourceAuthorization atomic.Value
+	sourceAuthorization.Store("")
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sourceAuthorization.Store(r.Header.Get("Authorization"))
+		w.Header().Set("Location", target.URL+"/collector")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer source.Close()
+
+	client := NewCollectorClient(config.GeneralConfig{
+		APIKey:     "collector-secret",
+		BackendURL: source.URL,
+	}, config.DataSharingConfig{Enabled: true}, "test")
+	defer client.Stop()
+
+	err := client.send(context.Background(), collectorItem{
+		requestID: "redirect-test",
+		payload:   []byte(`{"version":"1","events":[]}`),
+		identity: collectorIdentity{
+			backendURL: source.URL,
+			apiKey:     "collector-secret",
+		},
+	})
+	var statusErr *httpStatusError
+	if !errors.As(err, &statusErr) || statusErr.statusCode != http.StatusTemporaryRedirect {
+		t.Fatalf("send error = %v, want 307 httpStatusError", err)
+	}
+	if authorization := sourceAuthorization.Load().(string); authorization != "Bearer collector-secret" {
+		t.Fatalf("source Authorization = %q, want configured collector credential", authorization)
+	}
+	if requests := targetRequests.Load(); requests != 0 {
+		t.Fatalf("redirect target requests = %d, want zero", requests)
+	}
+	if authorization := targetAuthorization.Load().(string); authorization != "" {
+		t.Fatalf("redirect target received Authorization = %q, want empty", authorization)
 	}
 }
 

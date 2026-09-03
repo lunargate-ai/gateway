@@ -91,6 +91,7 @@ func buildRegistryEntries(providers map[string]config.ProviderConfig) map[string
 
 func cloneProviderCapabilities(capabilities config.ProviderCapabilities) config.ProviderCapabilities {
 	capabilities.HostedTools = append([]string(nil), capabilities.HostedTools...)
+	capabilities.ReasoningEffortLevels = append([]string(nil), capabilities.ReasoningEffortLevels...)
 	return capabilities
 }
 

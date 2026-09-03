@@ -22,6 +22,8 @@ func (n *chatStreamEnvelopeNormalizer) normalize(chunk *models.StreamChunk) *mod
 	if chunk == nil {
 		return nil
 	}
+	models.NormalizeUsage(chunk.Usage)
+	chunk.RawJSON = models.NormalizeRawUsageCounters(chunk.RawJSON)
 	if n == nil {
 		return chunk
 	}

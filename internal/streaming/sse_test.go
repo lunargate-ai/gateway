@@ -84,6 +84,99 @@ func TestStreamHandlersRecognizeWrappedTerminalError(t *testing.T) {
 	}
 }
 
+func TestStreamResponseParsesCompleteSSEEvents(t *testing.T) {
+	translator := providers.NewOpenAITranslator(config.ProviderConfig{
+		APIKey:  "dummy",
+		BaseURL: "https://api.openai.com/v1",
+	})
+	providerResp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body: io.NopCloser(strings.NewReader(
+			": keepalive\r\n\r\n" +
+				"event:chat.completion.chunk\r\n" +
+				"data:{\"id\":\"chatcmpl_sse\",\"object\":\"chat.completion.chunk\",\r\n" +
+				": ignored within event\r\n" +
+				"data: \"created\":123,\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello\"},\"finish_reason\":null}]}\r\n\r\n" +
+				"data:{\"id\":\"chatcmpl_sse\",\"object\":\"chat.completion.chunk\",\"created\":123,\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\r\n\r\n" +
+				"data:[DONE]\r\n\r\n",
+		)),
+	}
+	recorder := httptest.NewRecorder()
+
+	if err := NewHandler().StreamResponse(context.Background(), recorder, providerResp, translator); err != nil {
+		t.Fatalf("stream failed: %v", err)
+	}
+
+	frames := strings.Split(strings.TrimSpace(recorder.Body.String()), "\n\n")
+	if len(frames) != 3 {
+		t.Fatalf("stream frames = %d, want 3: %q", len(frames), recorder.Body.String())
+	}
+	var contentChunk models.StreamChunk
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(frames[0], "data: ")), &contentChunk); err != nil {
+		t.Fatalf("decode content chunk: %v", err)
+	}
+	if len(contentChunk.Choices) != 1 || contentChunk.Choices[0].Delta == nil || contentChunk.Choices[0].Delta.ContentString() != "hello" {
+		t.Fatalf("unexpected content chunk: %#v", contentChunk)
+	}
+	var terminalChunk models.StreamChunk
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(frames[1], "data: ")), &terminalChunk); err != nil {
+		t.Fatalf("decode terminal chunk: %v", err)
+	}
+	if len(terminalChunk.Choices) != 1 || terminalChunk.Choices[0].FinishReason == nil || *terminalChunk.Choices[0].FinishReason != "stop" {
+		t.Fatalf("unexpected terminal chunk: %#v", terminalChunk)
+	}
+	if frames[2] != "data: [DONE]" {
+		t.Fatalf("terminal frame = %q, want data: [DONE]", frames[2])
+	}
+}
+
+func TestStreamAnthropicResponseParsesCompleteSSEEvents(t *testing.T) {
+	base := providers.NewAnthropicTranslator(config.ProviderConfig{
+		APIKey:  "dummy",
+		BaseURL: "https://api.anthropic.com/v1",
+	})
+	providerResp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body: io.NopCloser(strings.NewReader(
+			": keepalive\r\n\r\n" +
+				"event:message_start\r\n" +
+				"data:{\"message\":{\"id\":\"msg_sse\",\"model\":\"claude-test\",\"usage\":{\"input_tokens\":1}},\r\n" +
+				": ignored within event\r\n" +
+				"data: \"type\":\"message_start\"}\r\n\r\n" +
+				"event:content_block_delta\r\n" +
+				"data:{\"index\":0,\r\n" +
+				"data: \"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\r\n\r\n" +
+				"event:message_stop\r\n" +
+				"data:{}\r\n\r\n",
+		)),
+	}
+	recorder := httptest.NewRecorder()
+
+	if err := NewHandler().StreamAnthropicResponse(
+		context.Background(),
+		recorder,
+		providerResp,
+		providers.NewAnthropicStreamTranslator(base),
+	); err != nil {
+		t.Fatalf("stream failed: %v", err)
+	}
+
+	frames := strings.Split(strings.TrimSpace(recorder.Body.String()), "\n\n")
+	if len(frames) != 3 {
+		t.Fatalf("stream frames = %d, want 3: %q", len(frames), recorder.Body.String())
+	}
+	var contentChunk models.StreamChunk
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(frames[1], "data: ")), &contentChunk); err != nil {
+		t.Fatalf("decode content chunk: %v", err)
+	}
+	if len(contentChunk.Choices) != 1 || contentChunk.Choices[0].Delta == nil || contentChunk.Choices[0].Delta.ContentString() != "hello" {
+		t.Fatalf("unexpected content chunk: %#v", contentChunk)
+	}
+	if frames[2] != "data: [DONE]" {
+		t.Fatalf("terminal frame = %q, want data: [DONE]", frames[2])
+	}
+}
+
 type wrappedEOFReadCloser struct{}
 
 func (wrappedEOFReadCloser) Read([]byte) (int, error) {
@@ -327,20 +420,117 @@ func TestStreamAnthropicResponseRespectsIncludeUsageWithoutHidingMetrics(t *test
 			if observedUsage != 2 {
 				t.Fatalf("observer saw %d usage chunks, want 2", observedUsage)
 			}
-			gotUsage := strings.Count(recorder.Body.String(), `"usage":`)
-			if includeUsage && gotUsage != 2 {
-				t.Fatalf("client saw %d usage chunks, want 2: %s", gotUsage, recorder.Body.String())
+
+			frames := strings.Split(strings.TrimSpace(recorder.Body.String()), "\n\n")
+			wantFrames := 3
+			if includeUsage {
+				wantFrames = 4
 			}
-			if !includeUsage && gotUsage != 0 {
-				t.Fatalf("client saw usage without opting in: %s", recorder.Body.String())
+			if len(frames) != wantFrames {
+				t.Fatalf("stream frames = %d, want %d: %s", len(frames), wantFrames, recorder.Body.String())
+			}
+			for index, frame := range frames[:2] {
+				if strings.Contains(frame, `"usage":`) {
+					t.Fatalf("ordinary chunk %d contains usage: %s", index, frame)
+				}
+			}
+			if includeUsage {
+				assertCanonicalUsageTrailer(t, frames[2], 3, 2, 5)
+			} else if got := strings.Count(recorder.Body.String(), `"usage":`); got != 0 {
+				t.Fatalf("client saw %d usage chunks without opting in: %s", got, recorder.Body.String())
+			}
+			if frames[len(frames)-1] != "data: [DONE]" {
+				t.Fatalf("terminal frame = %q, want data: [DONE]", frames[len(frames)-1])
 			}
 		})
 	}
 }
 
+func TestStreamNDJSONResponseEmitsCanonicalUsageTrailer(t *testing.T) {
+	for _, includeUsage := range []bool{false, true} {
+		t.Run(map[bool]string{false: "excluded", true: "included"}[includeUsage], func(t *testing.T) {
+			base := providers.NewOllamaTranslator(config.ProviderConfig{BaseURL: "http://localhost:11434"})
+			providerResp := &http.Response{
+				StatusCode: http.StatusOK,
+				Body: io.NopCloser(strings.NewReader(
+					"{\"model\":\"qwen\",\"message\":{\"role\":\"assistant\",\"content\":\"hello\"},\"done\":false}\n" +
+						"{\"model\":\"qwen\",\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\",\"prompt_eval_count\":3,\"eval_count\":2}\n",
+				)),
+			}
+			recorder := httptest.NewRecorder()
+			observedUsage := 0
+
+			err := NewHandler().StreamNDJSONResponseWithObserverAndUsage(
+				context.Background(),
+				recorder,
+				providerResp,
+				providers.NewOllamaStreamTranslator(base),
+				func(chunk *models.StreamChunk) {
+					if chunk.Usage != nil {
+						observedUsage++
+					}
+				},
+				includeUsage,
+			)
+			if err != nil {
+				t.Fatalf("stream failed: %v", err)
+			}
+			if observedUsage != 1 {
+				t.Fatalf("observer saw %d usage chunks, want 1", observedUsage)
+			}
+
+			frames := strings.Split(strings.TrimSpace(recorder.Body.String()), "\n\n")
+			wantFrames := 3
+			if includeUsage {
+				wantFrames = 4
+			}
+			if len(frames) != wantFrames {
+				t.Fatalf("stream frames = %d, want %d: %s", len(frames), wantFrames, recorder.Body.String())
+			}
+			for index, frame := range frames[:2] {
+				if strings.Contains(frame, `"usage":`) {
+					t.Fatalf("ordinary chunk %d contains usage: %s", index, frame)
+				}
+			}
+			var finishChunk models.StreamChunk
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(frames[1], "data: ")), &finishChunk); err != nil {
+				t.Fatalf("decode finish chunk: %v", err)
+			}
+			if len(finishChunk.Choices) != 1 || finishChunk.Choices[0].FinishReason == nil || *finishChunk.Choices[0].FinishReason != "stop" {
+				t.Fatalf("unexpected finish chunk: %#v", finishChunk)
+			}
+			if includeUsage {
+				assertCanonicalUsageTrailer(t, frames[2], 3, 2, 5)
+			} else if got := strings.Count(recorder.Body.String(), `"usage":`); got != 0 {
+				t.Fatalf("client saw %d usage chunks without opting in: %s", got, recorder.Body.String())
+			}
+			if frames[len(frames)-1] != "data: [DONE]" {
+				t.Fatalf("terminal frame = %q, want data: [DONE]", frames[len(frames)-1])
+			}
+		})
+	}
+}
+
+func assertCanonicalUsageTrailer(t *testing.T, frame string, promptTokens, completionTokens, totalTokens int) {
+	t.Helper()
+	var chunk models.StreamChunk
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(frame, "data: ")), &chunk); err != nil {
+		t.Fatalf("decode usage trailer: %v", err)
+	}
+	if len(chunk.Choices) != 0 {
+		t.Fatalf("usage trailer choices = %#v, want empty", chunk.Choices)
+	}
+	if chunk.Usage == nil ||
+		chunk.Usage.PromptTokens != promptTokens ||
+		chunk.Usage.CompletionTokens != completionTokens ||
+		chunk.Usage.TotalTokens != totalTokens {
+		t.Fatalf("usage trailer = %#v, want prompt=%d completion=%d total=%d", chunk.Usage, promptTokens, completionTokens, totalTokens)
+	}
+}
+
 func TestStreamResponseStopsReadingAfterDownstreamFailure(t *testing.T) {
 	chunk := func(content string) string {
-		return "data: {\"id\":\"chatcmpl_write_failure\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":" + strconv.Quote(content) + "}}]}\n"
+		return "data: {\"id\":\"chatcmpl_write_failure\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":" + strconv.Quote(content) + "}}]}\n\n"
 	}
 	tests := []struct {
 		name        string
@@ -363,13 +553,13 @@ func TestStreamResponseStopsReadingAfterDownstreamFailure(t *testing.T) {
 		},
 		{
 			name:        "done write",
-			upstream:    []string{"data: [DONE]\n", chunk("must not be read")},
+			upstream:    []string{"data: [DONE]\n\n", chunk("must not be read")},
 			failWriteAt: 1,
 			wantReads:   1,
 		},
 		{
 			name:        "done flush",
-			upstream:    []string{"data: [DONE]\n", chunk("must not be read")},
+			upstream:    []string{"data: [DONE]\n\n", chunk("must not be read")},
 			failFlushAt: 2,
 			wantReads:   1,
 		},
@@ -407,9 +597,9 @@ func TestStreamAnthropicResponseStopsReadingAfterDownstreamFailure(t *testing.T)
 			name: "chunk write",
 			upstream: []string{
 				"event: message_start\n",
-				"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_failure\",\"model\":\"claude\",\"usage\":{\"input_tokens\":1}}}\n",
+				"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_failure\",\"model\":\"claude\",\"usage\":{\"input_tokens\":1}}}\n\n",
 				"event: message_stop\n",
-				"data: {\"type\":\"message_stop\"}\n",
+				"data: {\"type\":\"message_stop\"}\n\n",
 			},
 			failWriteAt: 1,
 		},
@@ -417,7 +607,7 @@ func TestStreamAnthropicResponseStopsReadingAfterDownstreamFailure(t *testing.T)
 			name: "done flush",
 			upstream: []string{
 				"event: message_stop\n",
-				"data: {\"type\":\"message_stop\"}\n",
+				"data: {\"type\":\"message_stop\"}\n\n",
 				"event: message_start\n",
 			},
 			failFlushAt: 2,

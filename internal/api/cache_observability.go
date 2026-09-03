@@ -4,10 +4,35 @@ import (
 	"context"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/lunargate-ai/gateway/internal/observability"
+	"github.com/lunargate-ai/gateway/internal/routing"
 )
+
+const dynamicModelMetricLabel = "_dynamic"
+
+func boundedModelMetricLabel(target routing.Target, resolvedModel string) string {
+	if strings.TrimSpace(target.Model) == "" {
+		return dynamicModelMetricLabel
+	}
+	if model := strings.TrimSpace(resolvedModel); model != "" {
+		return model
+	}
+	return dynamicModelMetricLabel
+}
+
+func boundedProviderErrorMetricType(status int, candidate string) string {
+	switch strings.ToLower(strings.TrimSpace(candidate)) {
+	case "parse_error", "upstream_timeout", "invalid_response_status", "provider_error":
+		return strings.ToLower(strings.TrimSpace(candidate))
+	}
+	if class := observability.MetricErrorClass(status, true); class != nil && strings.TrimSpace(*class) != "" {
+		return strings.TrimSpace(*class)
+	}
+	return "upstream_error"
+}
 
 type cacheHitObservation struct {
 	requestID    string

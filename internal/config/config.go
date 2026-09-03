@@ -85,16 +85,22 @@ type ProviderConfig struct {
 // ProviderCapabilities declares optional API contracts that must never be
 // inferred from a provider's type or URL. Zero values are deliberately safe.
 type ProviderCapabilities struct {
-	ResponsesLifecycle   bool     `mapstructure:"responses_lifecycle"`
-	Conversations        bool     `mapstructure:"conversations"`
-	BackgroundResponses  bool     `mapstructure:"background_responses"`
-	ResponseCancellation bool     `mapstructure:"response_cancellation"`
-	ResponseCompaction   bool     `mapstructure:"response_compaction"`
-	ResponseInputTokens  bool     `mapstructure:"response_input_tokens"`
-	EmbeddingsBase64     bool     `mapstructure:"embeddings_base64"`
-	StructuredOutputs    bool     `mapstructure:"structured_outputs"`
-	ReasoningEffort      bool     `mapstructure:"reasoning_effort"`
-	HostedTools          []string `mapstructure:"hosted_tools"`
+	ChatCompletionsLifecycle bool `mapstructure:"chat_completions_lifecycle"`
+	ResponsesLifecycle       bool `mapstructure:"responses_lifecycle"`
+	Conversations            bool `mapstructure:"conversations"`
+	BackgroundResponses      bool `mapstructure:"background_responses"`
+	ResponseCancellation     bool `mapstructure:"response_cancellation"`
+	ResponseCompaction       bool `mapstructure:"response_compaction"`
+	ResponseInputTokens      bool `mapstructure:"response_input_tokens"`
+	EmbeddingsBase64         bool `mapstructure:"embeddings_base64"`
+	StructuredOutputs        bool `mapstructure:"structured_outputs"`
+	ReasoningEffort          bool `mapstructure:"reasoning_effort"`
+	// ReasoningEffortLevels narrows model-dependent levels. An empty list
+	// enables only the common low, medium, and high levels.
+	ReasoningEffortLevels []string `mapstructure:"reasoning_effort_levels"`
+	// AdaptiveThinking permits thinking.type=adaptive in translated requests.
+	AdaptiveThinking bool     `mapstructure:"adaptive_thinking"`
+	HostedTools      []string `mapstructure:"hosted_tools"`
 }
 
 type ProviderModelsConfig struct {
@@ -405,25 +411,34 @@ func normalizeProviderCapabilities(cfg *Config) {
 		return
 	}
 	for providerID, providerCfg := range cfg.Providers {
-		if len(providerCfg.Capabilities.HostedTools) == 0 {
-			continue
+		if len(providerCfg.Capabilities.HostedTools) > 0 {
+			providerCfg.Capabilities.HostedTools = normalizeCapabilityValues(providerCfg.Capabilities.HostedTools)
 		}
-		seen := make(map[string]struct{}, len(providerCfg.Capabilities.HostedTools))
-		hostedTools := make([]string, 0, len(providerCfg.Capabilities.HostedTools))
-		for _, raw := range providerCfg.Capabilities.HostedTools {
-			toolType := strings.ToLower(strings.TrimSpace(raw))
-			if toolType == "" {
-				continue
-			}
-			if _, ok := seen[toolType]; ok {
-				continue
-			}
-			seen[toolType] = struct{}{}
-			hostedTools = append(hostedTools, toolType)
+		if len(providerCfg.Capabilities.ReasoningEffortLevels) > 0 {
+			providerCfg.Capabilities.ReasoningEffortLevels = normalizeCapabilityValues(providerCfg.Capabilities.ReasoningEffortLevels)
 		}
-		providerCfg.Capabilities.HostedTools = hostedTools
 		cfg.Providers[providerID] = providerCfg
 	}
+}
+
+func normalizeCapabilityValues(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(values))
+	normalized := make([]string, 0, len(values))
+	for _, raw := range values {
+		value := strings.ToLower(strings.TrimSpace(raw))
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		normalized = append(normalized, value)
+	}
+	return normalized
 }
 
 func normalizeSecurityConfig(cfg *Config) {
@@ -506,6 +521,9 @@ func validateConfig(cfg *Config) error {
 	if cfg == nil {
 		return nil
 	}
+	if err := validateRoutingRequestTypes(cfg); err != nil {
+		return err
+	}
 
 	securityCfg := cfg.Security
 	provider := strings.ToLower(strings.TrimSpace(securityCfg.Provider))
@@ -538,6 +556,42 @@ func validateConfig(cfg *Config) error {
 	default:
 		return fmt.Errorf("unsupported security.provider %q", securityCfg.Provider)
 	}
+}
+
+func validateRoutingRequestTypes(cfg *Config) error {
+	for routeIndex, route := range cfg.Routing.Routes {
+		groups := []struct {
+			name    string
+			targets []TargetConfig
+		}{
+			{name: "targets", targets: route.Targets},
+			{name: "fallback", targets: route.Fallback},
+		}
+		for _, group := range groups {
+			for targetIndex, target := range group.targets {
+				requestType := strings.ToLower(strings.TrimSpace(target.UpstreamRequestType))
+				if requestType == "" || requestType == "chat_completions" {
+					continue
+				}
+				field := fmt.Sprintf("routing.routes[%d].%s[%d].upstream_request_type", routeIndex, group.name, targetIndex)
+				if requestType != "responses" {
+					return fmt.Errorf("%s must be chat_completions or responses", field)
+				}
+				providerCfg, ok := cfg.Providers[strings.TrimSpace(target.Provider)]
+				if !ok {
+					return fmt.Errorf("%s references unknown provider %q", field, target.Provider)
+				}
+				providerType := strings.ToLower(strings.TrimSpace(providerCfg.Type))
+				if providerType == "" {
+					providerType = strings.ToLower(strings.TrimSpace(target.Provider))
+				}
+				if providerType != "openai" {
+					return fmt.Errorf("%s requires an openai provider, got %q", field, providerType)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // expandEnv replaces ${VAR} patterns with environment variable values.

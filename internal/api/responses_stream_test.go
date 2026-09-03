@@ -173,16 +173,16 @@ func TestResponsesStreamProxy_ToolCallIDsStayStableAcrossCallAndFC(t *testing.T)
 func TestResponsesStreamProxy_MergeTextDelta_PreservesRepeatedDeltas(t *testing.T) {
 	proxy := newResponsesStreamProxy(httptest.NewRecorder())
 
-	if got := proxy.mergeTextDelta("ha"); got != "ha" {
+	if got, err := proxy.mergeTextDelta("ha"); err != nil || got != "ha" {
 		t.Fatalf("expected first delta to pass through, got %q", got)
 	}
-	if got := proxy.mergeTextDelta("ha"); got != "ha" {
+	if got, err := proxy.mergeTextDelta("ha"); err != nil || got != "ha" {
 		t.Fatalf("expected repeated delta to pass through, got %q", got)
 	}
-	if got := proxy.mergeReasoningDelta("think"); got != "think" {
+	if got, err := proxy.mergeReasoningDelta("think"); err != nil || got != "think" {
 		t.Fatalf("expected first reasoning delta to pass through, got %q", got)
 	}
-	if got := proxy.mergeReasoningDelta("think"); got != "think" {
+	if got, err := proxy.mergeReasoningDelta("think"); err != nil || got != "think" {
 		t.Fatalf("expected repeated reasoning delta to pass through, got %q", got)
 	}
 	if final := proxy.text.String(); final != "haha" {
@@ -610,6 +610,31 @@ func TestResponsesStreamProxy_FunctionArgumentsDoneIncludesName(t *testing.T) {
 	}
 }
 
+func TestResponsesStreamProxyWritesNamedSSEEvents(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	proxy := newResponsesStreamProxy(recorder)
+
+	if err := proxy.writeEvent(map[string]interface{}{
+		"type": "response.created",
+		"response": map[string]interface{}{
+			"id":     "resp_named",
+			"object": "response",
+			"status": "in_progress",
+		},
+	}); err != nil {
+		t.Fatalf("write event: %v", err)
+	}
+
+	body := recorder.Body.String()
+	if !strings.HasPrefix(body, "event: response.created\ndata: ") {
+		t.Fatalf("named SSE event missing: %q", body)
+	}
+	events := decodeSSEEvents(t, body)
+	if len(events) != 1 || events[0]["type"] != "response.created" {
+		t.Fatalf("decoded events = %#v", events)
+	}
+}
+
 func decodeSSEEvents(t *testing.T, body string) []map[string]interface{} {
 	t.Helper()
 	frames := strings.Split(body, "\n\n")
@@ -619,10 +644,14 @@ func decodeSSEEvents(t *testing.T, body string) []map[string]interface{} {
 		if frame == "" {
 			continue
 		}
-		if !strings.HasPrefix(frame, "data:") {
-			continue
+		var dataLines []string
+		for _, line := range strings.Split(frame, "\n") {
+			line = strings.TrimSuffix(line, "\r")
+			if strings.HasPrefix(line, "data:") {
+				dataLines = append(dataLines, strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " "))
+			}
 		}
-		payload := strings.TrimSpace(strings.TrimPrefix(frame, "data:"))
+		payload := strings.TrimSpace(strings.Join(dataLines, "\n"))
 		if payload == "" || payload == "[DONE]" {
 			continue
 		}

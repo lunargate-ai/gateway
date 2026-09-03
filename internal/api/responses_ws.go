@@ -16,6 +16,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/lunargate-ai/gateway/internal/middleware"
 	"github.com/lunargate-ai/gateway/internal/security"
+	"github.com/lunargate-ai/gateway/internal/streaming"
 	"github.com/lunargate-ai/gateway/pkg/models"
 	"github.com/rs/zerolog/log"
 )
@@ -24,6 +25,11 @@ const (
 	responsesWebSocketWriteTimeout = 10 * time.Second
 	responsesWebSocketPongTimeout  = 60 * time.Second
 	responsesWebSocketPingInterval = 30 * time.Second
+	// A complete SSE record may be followed by a CRLF blank-line delimiter,
+	// which is transport framing and is not counted in MaxStreamRecordBytes.
+	responsesWebSocketSSEBufferLimit  = streaming.MaxStreamRecordBytes + 2
+	responsesWebSocketMaxCachedStates = 1
+	responsesWebSocketMaxCachedBytes  = 16 << 20
 )
 
 var responsesWebSocketUpgrader = websocket.Upgrader{
@@ -91,27 +97,35 @@ func canonicalWebSocketOriginHost(rawHost string, scheme string) (string, bool) 
 }
 
 type responsesWebSocketSession struct {
-	conn         *websocket.Conn
-	sessionID    string
-	cachedStates map[string]*responsesWebSocketCachedState
+	conn                *websocket.Conn
+	sessionID           string
+	cachedStates        map[string]*responsesWebSocketCachedState
+	cachedStateBytes    int
+	maxCachedStateBytes int
 }
 
 type responsesWebSocketMessagePolicy func(*http.Request) (*http.Request, *responsesWebSocketEventError)
 
 type responsesWebSocketProxy struct {
-	session           *responsesWebSocketSession
-	headers           http.Header
-	statusCode        int
-	buffer            bytes.Buffer
-	done              bool
-	responseID        string
-	completedResponse map[string]interface{}
-	terminalError     *responsesWebSocketEventError
+	session            *responsesWebSocketSession
+	headers            http.Header
+	statusCode         int
+	buffer             bytes.Buffer
+	errorBodyTruncated bool
+	done               bool
+	terminalSeen       bool
+	responseID         string
+	completedResponse  map[string]interface{}
+	terminalResponse   map[string]interface{}
+	terminalError      *responsesWebSocketEventError
+	cacheBasePayload   map[string]json.RawMessage
+	stateCached        bool
 }
 
 type responsesWebSocketCachedState struct {
 	responseID string
 	payload    map[string]json.RawMessage
+	sizeBytes  int
 }
 
 type responsesWebSocketCreateRequest struct {
@@ -169,9 +183,10 @@ func (h *Handler) responsesWebSocket(w http.ResponseWriter, r *http.Request, pol
 		sessionID = "wsresp_" + uuid.NewString()
 	}
 	session := &responsesWebSocketSession{
-		conn:         conn,
-		sessionID:    sessionID,
-		cachedStates: make(map[string]*responsesWebSocketCachedState),
+		conn:                conn,
+		sessionID:           sessionID,
+		cachedStates:        make(map[string]*responsesWebSocketCachedState),
+		maxCachedStateBytes: responsesWebSocketMaxCachedBytes,
 	}
 
 	for {
@@ -313,7 +328,10 @@ func (s *responsesWebSocketSession) handleCreate(h *Handler, baseReq *http.Reque
 			return nil
 		}
 		responseID := "resp_ws_" + uuid.NewString()
-		s.cacheState(responseID, resolvedPayload)
+		if cacheErr := s.cacheState(responseID, resolvedPayload); cacheErr != nil {
+			_ = s.writeErrorEvent(cacheErr)
+			return nil
+		}
 		return s.writeWarmupResponse(responseID, model)
 	}
 
@@ -324,6 +342,7 @@ func (s *responsesWebSocketSession) handleCreate(h *Handler, baseReq *http.Reque
 
 	req := makeResponsesWebSocketHTTPRequest(baseReq, body, s.sessionID)
 	proxy := newResponsesWebSocketProxy(s)
+	proxy.cacheBasePayload = resolvedPayload
 	h.Responses(proxy, req)
 	if err := proxy.finalize(); err != nil {
 		if createReq.previousResponseID != "" {
@@ -336,10 +355,6 @@ func (s *responsesWebSocketSession) handleCreate(h *Handler, baseReq *http.Reque
 			s.evictState(createReq.previousResponseID)
 		}
 		return nil
-	}
-
-	if proxy.responseID != "" {
-		s.cacheState(proxy.responseID, withCompletedResponseHistory(resolvedPayload, proxy.completedResponse))
 	}
 	return nil
 }
@@ -462,27 +477,73 @@ func (p *responsesWebSocketProxy) WriteHeader(statusCode int) {
 }
 
 func (p *responsesWebSocketProxy) Write(b []byte) (int, error) {
+	written := len(b)
 	if p.statusCode >= 400 {
-		_, _ = p.buffer.Write(b)
-		return len(b), nil
+		p.appendHTTPErrorBody(b)
+		return written, nil
 	}
 
-	_, _ = p.buffer.Write(b)
-	for {
-		all := p.buffer.String()
-		idx := strings.Index(all, "\n\n")
-		if idx < 0 {
-			break
+	for len(b) > 0 {
+		available := responsesWebSocketSSEBufferLimit - p.buffer.Len()
+		if available <= 0 {
+			p.buffer = bytes.Buffer{}
+			return written, streaming.ErrStreamRecordTooLarge
 		}
-		frame := all[:idx]
-		remaining := all[idx+2:]
-		p.buffer.Reset()
-		_, _ = p.buffer.WriteString(remaining)
-		if _, err := p.processSSEFrame(frame); err != nil {
-			return len(b), err
+		chunkSize := len(b)
+		if chunkSize > available {
+			chunkSize = available
+		}
+		_, _ = p.buffer.Write(b[:chunkSize])
+		b = b[chunkSize:]
+
+		if err := p.drainCompleteSSEFrames(); err != nil {
+			p.buffer = bytes.Buffer{}
+			return written, err
 		}
 	}
-	return len(b), nil
+	return written, nil
+}
+
+func (p *responsesWebSocketProxy) appendHTTPErrorBody(b []byte) {
+	if p.errorBodyTruncated || len(b) == 0 {
+		return
+	}
+	available := upstreamErrorBodyLimit - p.buffer.Len()
+	if available <= 0 {
+		p.errorBodyTruncated = true
+		return
+	}
+	if len(b) > available {
+		_, _ = p.buffer.Write(b[:available])
+		p.errorBodyTruncated = true
+		return
+	}
+	_, _ = p.buffer.Write(b)
+}
+
+func (p *responsesWebSocketProxy) drainCompleteSSEFrames() error {
+	remaining := p.buffer.Bytes()
+	consumed := false
+	for len(remaining) > 0 {
+		frame, next, ok, err := nextResponsesSSEFrame(remaining)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			break
+		}
+		consumed = true
+		if _, err := p.processSSEFrame(frame); err != nil {
+			return err
+		}
+		remaining = next
+	}
+	if consumed {
+		tail := append([]byte(nil), remaining...)
+		p.buffer = bytes.Buffer{}
+		_, _ = p.buffer.Write(tail)
+	}
+	return nil
 }
 
 // FlushError satisfies http.ResponseController. Each complete SSE frame is
@@ -494,55 +555,144 @@ func (p *responsesWebSocketProxy) FlushError() error {
 
 func (p *responsesWebSocketProxy) finalize() error {
 	if p.statusCode >= 400 {
-		p.terminalError = parseResponsesHTTPError(p.statusCode, p.buffer.Bytes())
+		if p.errorBodyTruncated {
+			p.terminalError = &responsesWebSocketEventError{
+				status:  http.StatusBadGateway,
+				errType: "provider_error",
+				code:    "upstream_response_too_large",
+				message: "upstream error response exceeds the 1 MiB limit",
+			}
+		} else {
+			p.terminalError = parseResponsesHTTPError(p.statusCode, p.buffer.Bytes())
+		}
+		p.buffer = bytes.Buffer{}
 		return p.session.writeErrorEvent(p.terminalError)
 	}
 
 	if p.buffer.Len() > 0 {
-		emitted, err := p.processSSEFrame(p.buffer.String())
-		if err != nil {
-			return err
-		}
-		if !emitted && !p.done {
-			raw := bytes.TrimSpace(p.buffer.Bytes())
-			if len(raw) > 0 {
-				if err := p.sendEvent(raw); err != nil {
-					return err
-				}
-			}
-		}
-		p.buffer.Reset()
+		p.buffer = bytes.Buffer{}
+		return p.writeIncompleteStreamError()
+	}
+	if !p.terminalSeen {
+		return p.writeIncompleteStreamError()
 	}
 	return nil
 }
 
-func (p *responsesWebSocketProxy) processSSEFrame(frame string) (bool, error) {
-	emitted := false
-	lines := strings.Split(frame, "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "data:") {
-			continue
-		}
-		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if payload == "" {
-			continue
-		}
-		if payload == "[DONE]" {
-			p.done = true
-			continue
-		}
-		emitted = true
-		if err := p.sendEvent([]byte(payload)); err != nil {
-			return emitted, err
-		}
+func (p *responsesWebSocketProxy) writeIncompleteStreamError() error {
+	p.done = true
+	p.terminalError = &responsesWebSocketEventError{
+		status:  http.StatusBadGateway,
+		errType: "provider_error",
+		code:    "upstream_stream_incomplete",
+		message: "response stream ended before a terminal event",
 	}
-	return emitted, nil
+	return p.session.writeErrorEvent(p.terminalError)
+}
+
+func (p *responsesWebSocketProxy) processSSEFrame(frame []byte) (bool, error) {
+	payload, ok := responsesSSEData(frame)
+	if !ok || len(bytes.TrimSpace(payload)) == 0 {
+		return false, nil
+	}
+	if string(bytes.TrimSpace(payload)) == "[DONE]" {
+		p.done = true
+		return false, nil
+	}
+	if p.terminalSeen {
+		// A native Responses stream has exactly one authoritative terminal.
+		// Consume every later application event while still allowing [DONE]
+		// above to close the underlying transport normally.
+		return false, nil
+	}
+	if err := p.sendEvent(payload); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+// nextResponsesSSEFrame extracts one complete SSE event while accepting both
+// LF and CRLF line endings. The returned slices borrow data and remain valid
+// only until the source buffer is reused.
+func nextResponsesSSEFrame(data []byte) (frame []byte, remaining []byte, ok bool, err error) {
+	lineStart := 0
+	for lineStart < len(data) {
+		relativeEnd := bytes.IndexByte(data[lineStart:], '\n')
+		if relativeEnd < 0 {
+			if len(data) > streaming.MaxStreamRecordBytes {
+				return nil, nil, false, streaming.ErrStreamRecordTooLarge
+			}
+			return nil, nil, false, nil
+		}
+		lineEnd := lineStart + relativeEnd + 1
+		line := data[lineStart:lineEnd]
+		if bytes.Equal(line, []byte{'\n'}) || bytes.Equal(line, []byte{'\r', '\n'}) {
+			if lineStart > streaming.MaxStreamRecordBytes {
+				return nil, nil, false, streaming.ErrStreamRecordTooLarge
+			}
+			return data[:lineStart], data[lineEnd:], true, nil
+		}
+		if lineEnd > streaming.MaxStreamRecordBytes {
+			return nil, nil, false, streaming.ErrStreamRecordTooLarge
+		}
+		lineStart = lineEnd
+	}
+	return nil, nil, false, nil
+}
+
+// responsesSSEData follows the SSE data-field rules: comments and other
+// fields are ignored, one optional leading space is removed, and multiple
+// data lines are joined with a newline before the JSON event is decoded.
+func responsesSSEData(frame []byte) ([]byte, bool) {
+	dataLines := make([][]byte, 0, 1)
+	for _, rawLine := range bytes.Split(frame, []byte{'\n'}) {
+		line := bytes.TrimSuffix(rawLine, []byte{'\r'})
+		if len(line) == 0 || line[0] == ':' {
+			continue
+		}
+		field, value, found := bytes.Cut(line, []byte{':'})
+		if !found || !bytes.Equal(field, []byte("data")) {
+			continue
+		}
+		if len(value) > 0 && value[0] == ' ' {
+			value = value[1:]
+		}
+		dataLines = append(dataLines, append([]byte(nil), value...))
+	}
+	if len(dataLines) == 0 {
+		return nil, false
+	}
+	return bytes.Join(dataLines, []byte{'\n'}), true
 }
 
 func (p *responsesWebSocketProxy) sendEvent(payload []byte) error {
 	p.captureEventState(payload)
-	return p.session.writeMessage(websocket.TextMessage, payload)
+	cachedTerminal := false
+	if p.terminalSeen && p.terminalError == nil && !p.stateCached && p.cacheBasePayload != nil {
+		terminalResponse := p.terminalResponse
+		if terminalResponse == nil {
+			terminalResponse = p.completedResponse
+		}
+		if terminalResponse != nil && strings.TrimSpace(p.responseID) != "" {
+			nextState := withCompletedResponseHistory(p.cacheBasePayload, terminalResponse)
+			if cacheErr := p.session.cacheState(p.responseID, nextState); cacheErr != nil {
+				p.terminalError = cacheErr
+				p.terminalResponse = nil
+				p.completedResponse = nil
+				return p.session.writeErrorEvent(cacheErr)
+			}
+			p.stateCached = true
+			cachedTerminal = true
+		}
+	}
+	if err := p.session.writeMessage(websocket.TextMessage, payload); err != nil {
+		if cachedTerminal {
+			p.session.evictState(p.responseID)
+			p.stateCached = false
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *responsesWebSocketSession) writeMessage(messageType int, payload []byte) error {
@@ -671,27 +821,101 @@ func (s *responsesWebSocketSession) resolveCreatePayload(createReq *responsesWeb
 			message: fmt.Sprintf("Previous response with id '%s' not found.", strings.TrimSpace(createReq.previousResponseID)),
 		}
 	}
-	return mergeResponsesWebSocketPayloads(state.payload, createReq.payload)
+	merged, err := mergeResponsesWebSocketPayloads(state.payload, createReq.payload)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := responsesWebSocketCachedStateSize(
+		strings.TrimSpace(createReq.previousResponseID),
+		merged,
+		s.cachedStateLimit(),
+	); !ok {
+		s.clearCachedStates()
+		return nil, responsesWebSocketStateTooLargeError()
+	}
+	return merged, nil
 }
 
-func (s *responsesWebSocketSession) cacheState(responseID string, payload map[string]json.RawMessage) {
+func (s *responsesWebSocketSession) cacheState(responseID string, payload map[string]json.RawMessage) *responsesWebSocketEventError {
 	id := strings.TrimSpace(responseID)
 	if id == "" || len(payload) == 0 {
-		return
+		return nil
 	}
-	s.cachedStates = map[string]*responsesWebSocketCachedState{
-		id: {
-			responseID: id,
-			payload:    cloneResponsesRawMap(payload),
-		},
+	stateSize, ok := responsesWebSocketCachedStateSize(id, payload, s.cachedStateLimit())
+	if !ok {
+		s.clearCachedStates()
+		return responsesWebSocketStateTooLargeError()
 	}
+	if s.cachedStates == nil {
+		s.cachedStates = make(map[string]*responsesWebSocketCachedState, responsesWebSocketMaxCachedStates)
+	}
+	if len(s.cachedStates) >= responsesWebSocketMaxCachedStates {
+		s.clearCachedStates()
+	}
+	s.cachedStates[id] = &responsesWebSocketCachedState{
+		responseID: id,
+		payload:    cloneResponsesRawMap(payload),
+		sizeBytes:  stateSize,
+	}
+	s.cachedStateBytes = stateSize
+	return nil
 }
 
 func (s *responsesWebSocketSession) evictState(responseID string) {
 	if s == nil {
 		return
 	}
-	delete(s.cachedStates, strings.TrimSpace(responseID))
+	id := strings.TrimSpace(responseID)
+	if state := s.cachedStates[id]; state != nil {
+		s.cachedStateBytes -= state.sizeBytes
+		if s.cachedStateBytes < 0 {
+			s.cachedStateBytes = 0
+		}
+	}
+	delete(s.cachedStates, id)
+	if len(s.cachedStates) == 0 {
+		s.cachedStateBytes = 0
+	}
+}
+
+func (s *responsesWebSocketSession) clearCachedStates() {
+	if s == nil {
+		return
+	}
+	s.cachedStates = make(map[string]*responsesWebSocketCachedState, responsesWebSocketMaxCachedStates)
+	s.cachedStateBytes = 0
+}
+
+func (s *responsesWebSocketSession) cachedStateLimit() int {
+	if s != nil && s.maxCachedStateBytes > 0 {
+		return s.maxCachedStateBytes
+	}
+	return responsesWebSocketMaxCachedBytes
+}
+
+func responsesWebSocketCachedStateSize(id string, payload map[string]json.RawMessage, limit int) (int, bool) {
+	if limit <= 0 || len(id) > limit-len(id) {
+		return 0, false
+	}
+	size := 2 * len(id) // map key plus cached responseID
+	for key, value := range payload {
+		componentSize := len(key) + len(value)
+		if componentSize > limit-size {
+			return 0, false
+		}
+		size += componentSize
+	}
+	return size, true
+}
+
+func responsesWebSocketStateTooLargeError() *responsesWebSocketEventError {
+	return &responsesWebSocketEventError{
+		status:  http.StatusRequestEntityTooLarge,
+		errType: "invalid_request_error",
+		code:    "state_too_large",
+		param:   "previous_response_id",
+		message: "websocket continuation state exceeds the 16 MiB limit",
+	}
 }
 
 func (s *responsesWebSocketSession) writeWarmupResponse(responseID string, model string) error {
@@ -926,8 +1150,25 @@ func (p *responsesWebSocketProxy) captureEventState(payload []byte) {
 		return
 	}
 	eventType := parseJSONStringRaw(raw["type"])
-	if eventType == "response.failed" || eventType == "response.incomplete" || eventType == "error" {
+	if eventType == "response.failed" || eventType == "response.incomplete" {
 		p.done = true
+		p.terminalSeen = true
+		var response map[string]interface{}
+		if err := json.Unmarshal(raw["response"], &response); err != nil || response == nil {
+			p.terminalError = &responsesWebSocketEventError{
+				status:  http.StatusBadGateway,
+				errType: "provider_error",
+				code:    "invalid_terminal_response",
+				message: "response stream returned an invalid terminal response",
+			}
+			return
+		}
+		p.terminalResponse = response
+		return
+	}
+	if eventType == "response.cancelled" || eventType == "response.canceled" || eventType == "error" {
+		p.done = true
+		p.terminalSeen = true
 		p.terminalError = &responsesWebSocketEventError{
 			status:  http.StatusBadGateway,
 			errType: "provider_error",
@@ -940,6 +1181,7 @@ func (p *responsesWebSocketProxy) captureEventState(payload []byte) {
 		return
 	}
 	p.done = true
+	p.terminalSeen = true
 	var response map[string]interface{}
 	if err := json.Unmarshal(raw["response"], &response); err != nil {
 		return

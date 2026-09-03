@@ -33,21 +33,21 @@ type ExecuteFunc func(ctx context.Context, target routing.Target) (*http.Respons
 func (f *FallbackExecutor) Execute(ctx context.Context, primary routing.Target, fallbacks []routing.Target, fn ExecuteFunc) (*http.Response, routing.Target, bool, int, string, error) {
 	// Try primary target with retries
 	resp, retryCount, cbState, err := f.executeWithCircuitBreaker(ctx, primary, fn)
-	lastRetryCount := retryCount
+	totalRetryCount := retryCount
 	lastCBState := cbState
 	lastTarget := primary
 	fallbackAttempted := false
 	if err == nil {
-		return resp, primary, false, retryCount, cbState, nil
+		return resp, primary, false, totalRetryCount, cbState, nil
 	}
 	if errors.Is(err, context.Canceled) || ctx.Err() != nil {
-		return nil, primary, false, retryCount, cbState, err
+		return nil, primary, false, totalRetryCount, cbState, err
 	}
 	if IsRequestError(err) {
-		return nil, primary, false, retryCount, cbState, err
+		return nil, primary, false, totalRetryCount, cbState, err
 	}
 	if fallbackDisabled(ctx) {
-		return nil, primary, false, retryCount, cbState, err
+		return nil, primary, false, totalRetryCount, cbState, err
 	}
 
 	log.Warn().
@@ -66,11 +66,11 @@ func (f *FallbackExecutor) Execute(ctx context.Context, primary routing.Target, 
 			Msg("attempting fallback")
 
 		resp, retryCount, cbState, err = f.executeWithCircuitBreaker(ctx, fb, fn)
-		lastRetryCount = retryCount
+		totalRetryCount += retryCount
 		lastCBState = cbState
 		lastTarget = fb
 		if err == nil {
-			return resp, fb, true, retryCount, cbState, nil
+			return resp, fb, true, totalRetryCount, cbState, nil
 		}
 
 		log.Warn().
@@ -81,7 +81,7 @@ func (f *FallbackExecutor) Execute(ctx context.Context, primary routing.Target, 
 			Msg("fallback target failed")
 	}
 
-	return nil, lastTarget, fallbackAttempted, lastRetryCount, lastCBState, fmt.Errorf("all targets failed (primary + %d fallbacks): %w", len(fallbacks), err)
+	return nil, lastTarget, fallbackAttempted, totalRetryCount, lastCBState, fmt.Errorf("all targets failed (primary + %d fallbacks): %w", len(fallbacks), err)
 }
 
 type execResult struct {

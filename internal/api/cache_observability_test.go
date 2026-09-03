@@ -230,3 +230,25 @@ func assertRequestMetricCounts(t *testing.T, metrics *observability.Metrics, pro
 		t.Fatalf("request_duration count = %d, want %d", got, want)
 	}
 }
+
+func TestBoundedProviderErrorMetricTypeRejectsDynamicUpstreamLabels(t *testing.T) {
+	if got := boundedProviderErrorMetricType(http.StatusBadRequest, "attacker-controlled-123"); got != "invalid_request" {
+		t.Fatalf("400 label = %q, want invalid_request", got)
+	}
+	if got := boundedProviderErrorMetricType(http.StatusBadGateway, "attacker-controlled-456"); got != "upstream_error" {
+		t.Fatalf("502 label = %q, want upstream_error", got)
+	}
+	if got := boundedProviderErrorMetricType(http.StatusBadGateway, "parse_error"); got != "parse_error" {
+		t.Fatalf("trusted parser label = %q, want parse_error", got)
+	}
+}
+
+func TestBoundedModelMetricLabelCollapsesUnconfiguredModels(t *testing.T) {
+	if got := boundedModelMetricLabel(routing.Target{}, "attacker-model-123"); got != dynamicModelMetricLabel {
+		t.Fatalf("dynamic model label = %q, want %q", got, dynamicModelMetricLabel)
+	}
+	configured := routing.Target{Model: "gpt-configured"}
+	if got := boundedModelMetricLabel(configured, "gpt-configured"); got != "gpt-configured" {
+		t.Fatalf("configured model label = %q, want gpt-configured", got)
+	}
+}

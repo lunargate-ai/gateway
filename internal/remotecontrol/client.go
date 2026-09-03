@@ -24,27 +24,35 @@ type ModelListFunc func(context.Context) []string
 type ModelSnapshotFunc func() []string
 
 const (
-	defaultHeartbeatInterval   = 20 * time.Second
-	defaultModelRefreshTimeout = 8 * time.Second
+	defaultHeartbeatInterval    = 20 * time.Second
+	defaultModelRefreshTimeout  = 8 * time.Second
+	defaultSandboxConcurrency   = 8
+	defaultSandboxResponseLimit = 16 << 20
+	defaultWebSocketReadLimit   = 16 << 20
 )
 
 type Client struct {
-	backendURL          string
-	apiKey              string
-	instanceID          string
-	version             string
-	localBaseURL        string
-	localAuthHeader     string
-	localAuthValue      string
-	routeNames          func() []string
-	modelSnapshotIDs    ModelSnapshotFunc
-	modelIDs            ModelListFunc
-	httpClient          *http.Client
-	refreshCh           chan struct{}
-	heartbeatInterval   time.Duration
-	modelRefreshTimeout time.Duration
-	lastLogKey          string
-	lastLogAt           time.Time
+	backendURL           string
+	apiKey               string
+	instanceID           string
+	version              string
+	localBaseURL         string
+	localAuthHeader      string
+	localAuthValue       string
+	routeNames           func() []string
+	modelSnapshotIDs     ModelSnapshotFunc
+	modelIDs             ModelListFunc
+	httpClient           *http.Client
+	refreshCh            chan struct{}
+	heartbeatInterval    time.Duration
+	modelRefreshTimeout  time.Duration
+	sandboxCommandLimit  int
+	sandboxCommandOnce   sync.Once
+	sandboxCommandSlots  chan struct{}
+	sandboxResponseLimit int64
+	websocketReadLimit   int64
+	lastLogKey           string
+	lastLogAt            time.Time
 }
 
 type helloMessage struct {
@@ -120,20 +128,27 @@ func NewClient(
 	}
 	localAuthHeader, localAuthValue := loopbackCredential(security)
 	return &Client{
-		backendURL:          backendURL,
-		apiKey:              apiKey,
-		instanceID:          instanceID,
-		version:             version,
-		localBaseURL:        strings.TrimRight(strings.TrimSpace(localBaseURL), "/"),
-		localAuthHeader:     localAuthHeader,
-		localAuthValue:      localAuthValue,
-		routeNames:          routeNames,
-		modelSnapshotIDs:    modelSnapshotIDs,
-		modelIDs:            modelIDs,
-		httpClient:          &http.Client{Timeout: 5 * time.Minute},
+		backendURL:       backendURL,
+		apiKey:           apiKey,
+		instanceID:       instanceID,
+		version:          version,
+		localBaseURL:     strings.TrimRight(strings.TrimSpace(localBaseURL), "/"),
+		localAuthHeader:  localAuthHeader,
+		localAuthValue:   localAuthValue,
+		routeNames:       routeNames,
+		modelSnapshotIDs: modelSnapshotIDs,
+		modelIDs:         modelIDs,
+		httpClient: &http.Client{
+			Timeout: 5 * time.Minute,
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 		refreshCh:           make(chan struct{}, 1),
 		heartbeatInterval:   defaultHeartbeatInterval,
 		modelRefreshTimeout: defaultModelRefreshTimeout,
+		sandboxCommandLimit: defaultSandboxConcurrency,
+		websocketReadLimit:  defaultWebSocketReadLimit,
 	}
 }
 
@@ -212,6 +227,11 @@ func (c *Client) connectAndServe(ctx context.Context) error {
 		return classifyDialError(err, resp)
 	}
 	defer conn.Close()
+	readLimit := c.websocketReadLimit
+	if readLimit <= 0 {
+		readLimit = defaultWebSocketReadLimit
+	}
+	conn.SetReadLimit(readLimit)
 
 	var writeMu sync.Mutex
 	writeJSON := func(v interface{}) error {
@@ -224,8 +244,12 @@ func (c *Client) connectAndServe(ctx context.Context) error {
 		return err
 	}
 
+	connectionCtx, cancelConnection := context.WithCancel(ctx)
+	defer cancelConnection()
 	errCh := make(chan error, 1)
-	go c.readLoop(ctx, conn, writeJSON, errCh)
+	asyncResponses := make(chan sandboxResponseMessage, c.sandboxConcurrency())
+	go c.sandboxResponseLoop(connectionCtx, writeJSON, asyncResponses, errCh)
+	go c.readLoop(connectionCtx, conn, writeJSON, asyncResponses, errCh)
 
 	closeCh := make(chan struct{})
 	go func() {
@@ -323,6 +347,7 @@ func (c *Client) readLoop(
 	ctx context.Context,
 	conn *websocket.Conn,
 	writeJSON func(interface{}) error,
+	asyncResponses chan<- sandboxResponseMessage,
 	errCh chan<- error,
 ) {
 	for {
@@ -342,14 +367,92 @@ func (c *Client) readLoop(
 			var msg sandboxExecuteMessage
 			b, err := json.Marshal(payload)
 			if err != nil {
-				go c.sendSandboxError(writeJSON, "", fmt.Errorf("failed to marshal sandbox command: %w", err))
+				if !queueSandboxResponse(asyncResponses, errCh, c.sandboxErrorResponse("", fmt.Errorf("failed to marshal sandbox command: %w", err))) {
+					return
+				}
 				continue
 			}
 			if err := json.Unmarshal(b, &msg); err != nil {
-				go c.sendSandboxError(writeJSON, "", fmt.Errorf("failed to decode sandbox command: %w", err))
+				if !queueSandboxResponse(asyncResponses, errCh, c.sandboxErrorResponse("", fmt.Errorf("failed to decode sandbox command: %w", err))) {
+					return
+				}
 				continue
 			}
-			go c.handleSandboxCommand(ctx, writeJSON, msg)
+			slots := c.sandboxSlots()
+			select {
+			case slots <- struct{}{}:
+				go func(command sandboxExecuteMessage) {
+					defer func() { <-slots }()
+					c.handleSandboxCommand(ctx, writeJSON, command)
+				}(msg)
+			default:
+				if !queueSandboxResponse(asyncResponses, errCh, c.sandboxOverloadResponse(msg.CommandID)) {
+					return
+				}
+			}
+		}
+	}
+}
+
+func queueSandboxResponse(responses chan<- sandboxResponseMessage, errCh chan<- error, response sandboxResponseMessage) bool {
+	select {
+	case responses <- response:
+		return true
+	default:
+		select {
+		case errCh <- fmt.Errorf("sandbox response queue is full"):
+		default:
+		}
+		return false
+	}
+}
+
+func (c *Client) sandboxConcurrency() int {
+	if c.sandboxCommandLimit > 0 {
+		return c.sandboxCommandLimit
+	}
+	return defaultSandboxConcurrency
+}
+
+func (c *Client) sandboxSlots() chan struct{} {
+	c.sandboxCommandOnce.Do(func() {
+		if c.sandboxCommandSlots == nil {
+			c.sandboxCommandSlots = make(chan struct{}, c.sandboxConcurrency())
+		}
+	})
+	return c.sandboxCommandSlots
+}
+
+func (c *Client) sandboxOverloadResponse(commandID string) sandboxResponseMessage {
+	return sandboxResponseMessage{
+		Type:       "sandbox.response",
+		CommandID:  commandID,
+		InstanceID: c.instanceID,
+		OK:         false,
+		StatusCode: http.StatusTooManyRequests,
+		Error:      "sandbox command concurrency limit reached",
+		Headers:    map[string]string{},
+	}
+}
+
+func (c *Client) sandboxResponseLoop(
+	ctx context.Context,
+	writeJSON func(interface{}) error,
+	responses <-chan sandboxResponseMessage,
+	errCh chan<- error,
+) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case response := <-responses:
+			if err := writeJSON(response); err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+				return
+			}
 		}
 	}
 }
@@ -392,8 +495,8 @@ func (c *Client) handleSandboxCommand(ctx context.Context, writeJSON func(interf
 	}
 }
 
-func (c *Client) sendSandboxError(writeJSON func(interface{}) error, commandID string, err error) {
-	_ = writeJSON(sandboxResponseMessage{
+func (c *Client) sandboxErrorResponse(commandID string, err error) sandboxResponseMessage {
+	return sandboxResponseMessage{
 		Type:       "sandbox.response",
 		CommandID:  commandID,
 		InstanceID: c.instanceID,
@@ -401,7 +504,7 @@ func (c *Client) sendSandboxError(writeJSON func(interface{}) error, commandID s
 		StatusCode: http.StatusBadRequest,
 		Error:      err.Error(),
 		Headers:    map[string]string{},
-	})
+	}
 }
 
 func (c *Client) executeSandbox(ctx context.Context, msg sandboxExecuteMessage) (int, map[string]string, interface{}, error) {
@@ -441,12 +544,27 @@ func (c *Client) executeSandbox(ctx context.Context, msg sandboxExecuteMessage) 
 		return 0, map[string]string{}, nil, fmt.Errorf("failed to execute local sandbox request: %w", err)
 	}
 	defer resp.Body.Close()
-	respBytes, err := io.ReadAll(resp.Body)
+	responseLimit := c.sandboxResponseLimit
+	if responseLimit <= 0 {
+		responseLimit = defaultSandboxResponseLimit
+	}
+	respBytes, err := readSandboxResponseBody(resp.Body, responseLimit)
 	if err != nil {
 		return resp.StatusCode, collectHeaders(resp.Header), nil, fmt.Errorf("failed to read sandbox response: %w", err)
 	}
 	parsedBody := parseBody(respBytes)
 	return resp.StatusCode, collectHeaders(resp.Header), parsedBody, nil
+}
+
+func readSandboxResponseBody(body io.Reader, limit int64) ([]byte, error) {
+	payload, err := io.ReadAll(io.LimitReader(body, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(payload)) > limit {
+		return nil, fmt.Errorf("sandbox response exceeds %d byte limit", limit)
+	}
+	return payload, nil
 }
 
 func sandboxEndpointPath(requestType string) (string, error) {

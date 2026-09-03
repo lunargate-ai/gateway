@@ -4,9 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
+	"github.com/lunargate-ai/gateway/internal/streaming"
 	"github.com/lunargate-ai/gateway/pkg/models"
 )
 
@@ -94,16 +94,13 @@ func TestResponsesStreamProxy_IncompleteFinishDoesNotMaskTruncatedStream(t *test
 	tests := []struct {
 		name        string
 		streamError error
-		wantMessage string
 	}{
 		{
-			name:        "missing done frame",
-			wantMessage: "upstream stream ended before a terminal event",
+			name: "missing done frame",
 		},
 		{
 			name:        "reported transport error",
 			streamError: errors.New("upstream socket reset"),
-			wantMessage: "upstream socket reset",
 		},
 	}
 
@@ -137,8 +134,8 @@ func TestResponsesStreamProxy_IncompleteFinishDoesNotMaskTruncatedStream(t *test
 			}
 			failure, _ := failedResponse["error"].(map[string]interface{})
 			message, _ := failure["message"].(string)
-			if !strings.Contains(message, tc.wantMessage) {
-				t.Fatalf("failure message = %q, want it to contain %q", message, tc.wantMessage)
+			if message != streaming.ChatStreamErrorMessage {
+				t.Fatalf("failure message = %q, want %q", message, streaming.ChatStreamErrorMessage)
 			}
 		})
 	}

@@ -16,7 +16,20 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-var ErrUpstreamStreamIncomplete = errors.New("upstream stream ended before a terminal event")
+// MaxStreamRecordBytes bounds one upstream SSE event or NDJSON record.
+const MaxStreamRecordBytes = 4 << 20
+
+const maxUpstreamErrorBodyBytes = 1 << 20
+
+var (
+	ErrUpstreamStreamIncomplete = errors.New("upstream stream ended before a terminal event")
+	// ErrUpstreamStreamEmpty is returned when a provider does not supply a
+	// readable successful streaming response.
+	ErrUpstreamStreamEmpty = errors.New("provider returned an empty streaming response")
+	// ErrStreamRecordTooLarge is returned before an oversized record is parsed
+	// or forwarded downstream.
+	ErrStreamRecordTooLarge = errors.New("upstream stream record exceeds 4 MiB limit")
+)
 
 func upstreamProviderError(status int, provider string, body []byte) *providers.ProviderError {
 	trimmed := strings.TrimSpace(string(body))
@@ -49,11 +62,46 @@ func upstreamProviderError(status int, provider string, body []byte) *providers.
 	return &providers.ProviderError{StatusCode: status, Provider: provider, Type: "upstream_error", Message: trimmed}
 }
 
+func readUpstreamProviderError(providerResp *http.Response, provider string) *providers.ProviderError {
+	status := http.StatusBadGateway
+	if providerResp != nil && providerResp.StatusCode > 0 {
+		status = providerResp.StatusCode
+	}
+	if providerResp == nil || providerResp.Body == nil {
+		return &providers.ProviderError{
+			StatusCode: status,
+			Provider:   provider,
+			Type:       "upstream_error",
+			Message:    "upstream returned an empty error response",
+		}
+	}
+	defer providerResp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(providerResp.Body, maxUpstreamErrorBodyBytes+1))
+	if err != nil {
+		return &providers.ProviderError{
+			StatusCode: status,
+			Provider:   provider,
+			Type:       "upstream_error",
+			Message:    "failed to read upstream error response",
+		}
+	}
+	if len(body) > maxUpstreamErrorBodyBytes {
+		return &providers.ProviderError{
+			StatusCode: status,
+			Provider:   provider,
+			Type:       "upstream_response_too_large",
+			Message:    "upstream error response exceeds the 1 MiB limit",
+		}
+	}
+	return upstreamProviderError(status, provider, body)
+}
+
 type ChunkObserver func(chunk *models.StreamChunk)
 
-// SSEEvent is a parsed view used only for observing a raw SSE frame. The raw
-// frame is forwarded unchanged; Event and Data are copies for side-channel
-// telemetry and state updates.
+// SSEEvent is a parsed view used for observing or selectively transforming a
+// raw SSE frame. Event and Data are copies for side-channel telemetry and state
+// updates.
 type SSEEvent struct {
 	Event string
 	Data  []byte
@@ -61,6 +109,11 @@ type SSEEvent struct {
 
 // SSEEventObserver reports whether an observed event is terminal.
 type SSEEventObserver func(event SSEEvent) bool
+
+// SSEEventDataTransformer may replace the data field of a complete SSE event
+// before that event is forwarded and observed. A nil result preserves the raw
+// frame byte-for-byte.
+type SSEEventDataTransformer func(event SSEEvent) ([]byte, error)
 
 // Handler manages SSE streaming between providers and clients.
 type Handler struct{}
@@ -81,15 +134,38 @@ func (h *Handler) ProxySSE(
 	provider string,
 	observer SSEEventObserver,
 ) error {
+	return h.proxySSE(ctx, w, providerResp, provider, observer, nil)
+}
+
+// ProxySSEWithDataTransformer is ProxySSE with an optional event-data rewrite
+// that runs before the frame is written and before the observer records it.
+func (h *Handler) ProxySSEWithDataTransformer(
+	ctx context.Context,
+	w http.ResponseWriter,
+	providerResp *http.Response,
+	provider string,
+	observer SSEEventObserver,
+	transformer SSEEventDataTransformer,
+) error {
+	return h.proxySSE(ctx, w, providerResp, provider, observer, transformer)
+}
+
+func (h *Handler) proxySSE(
+	ctx context.Context,
+	w http.ResponseWriter,
+	providerResp *http.Response,
+	provider string,
+	observer SSEEventObserver,
+	transformer SSEEventDataTransformer,
+) error {
 	if providerResp == nil || providerResp.Body == nil {
 		return errors.New("provider returned an empty SSE response")
 	}
-	defer providerResp.Body.Close()
 
 	if providerResp.StatusCode < http.StatusOK || providerResp.StatusCode >= http.StatusMultipleChoices {
-		body, _ := io.ReadAll(providerResp.Body)
-		return upstreamProviderError(providerResp.StatusCode, provider, body)
+		return readUpstreamProviderError(providerResp, provider)
 	}
+	defer providerResp.Body.Close()
 
 	if strings.TrimSpace(w.Header().Get("Content-Type")) == "" {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -104,57 +180,135 @@ func (h *Handler) ProxySSE(
 	}
 
 	reader := bufio.NewReader(providerResp.Body)
-	var frame bytes.Buffer
 	terminalSeen := false
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 
-		line, readErr := reader.ReadBytes('\n')
-		if len(line) > 0 {
-			_, _ = frame.Write(line)
-			if isSSEBlankLine(line) {
-				rawFrame := append([]byte(nil), frame.Bytes()...)
-				if _, err := w.Write(rawFrame); err != nil {
-					return fmt.Errorf("failed to write native SSE frame: %w", err)
+		rawFrame, readErr := readSSEFrame(reader)
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				if err := ctx.Err(); err != nil {
+					return err
 				}
-				if err := controller.Flush(); err != nil {
-					return fmt.Errorf("failed to flush native SSE frame: %w", err)
+				if !terminalSeen {
+					return fmt.Errorf("%w: native sse", ErrUpstreamStreamIncomplete)
 				}
-				if observer != nil && observer(parseSSEEvent(rawFrame)) {
-					terminalSeen = true
-				}
-				frame.Reset()
+				return nil
 			}
-		}
-
-		if readErr == nil {
-			continue
-		}
-		if !errors.Is(readErr, io.EOF) {
 			return fmt.Errorf("native SSE read error: %w", readErr)
 		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if frame.Len() > 0 {
-			if _, err := w.Write(frame.Bytes()); err != nil {
-				return fmt.Errorf("failed to write trailing native SSE bytes: %w", err)
+
+		event := parseSSEEvent(rawFrame)
+		if transformer != nil {
+			transformedData, err := transformer(event)
+			if err != nil {
+				return fmt.Errorf("failed to transform native SSE event: %w", err)
 			}
-			if err := controller.Flush(); err != nil {
-				return fmt.Errorf("failed to flush trailing native SSE bytes: %w", err)
+			if transformedData != nil {
+				rawFrame, err = replaceSSEEventData(rawFrame, transformedData)
+				if err != nil {
+					return fmt.Errorf("failed to replace native SSE event data: %w", err)
+				}
+				event.Data = append([]byte(nil), transformedData...)
 			}
 		}
-		if !terminalSeen {
-			return fmt.Errorf("%w: native sse", ErrUpstreamStreamIncomplete)
+		if _, err := w.Write(rawFrame); err != nil {
+			return fmt.Errorf("failed to write native SSE frame: %w", err)
 		}
-		return nil
+		if err := controller.Flush(); err != nil {
+			return fmt.Errorf("failed to flush native SSE frame: %w", err)
+		}
+		if observer != nil && observer(event) {
+			terminalSeen = true
+		}
 	}
 }
 
+func replaceSSEEventData(frame []byte, data []byte) ([]byte, error) {
+	if len(data) > MaxStreamRecordBytes {
+		return nil, ErrStreamRecordTooLarge
+	}
+	var output bytes.Buffer
+	replaced := false
+	remaining := frame
+	for len(remaining) > 0 {
+		line := remaining
+		if newline := bytes.IndexByte(remaining, '\n'); newline >= 0 {
+			line = remaining[:newline+1]
+			remaining = remaining[newline+1:]
+		} else {
+			remaining = nil
+		}
+
+		content, lineEnding := splitSSELineEnding(line)
+		if !isSSEDataField(content) {
+			_, _ = output.Write(line)
+			continue
+		}
+		if replaced {
+			continue
+		}
+
+		prefix := []byte("data:")
+		if bytes.HasPrefix(content, []byte("data: ")) {
+			prefix = []byte("data: ")
+		}
+		dataLines := bytes.Split(data, []byte{'\n'})
+		for _, dataLine := range dataLines {
+			_, _ = output.Write(prefix)
+			_, _ = output.Write(dataLine)
+			_, _ = output.Write(lineEnding)
+		}
+		replaced = true
+	}
+	if !replaced {
+		return nil, errors.New("SSE event has no data field")
+	}
+	result := output.Bytes()
+	if err := validateSSEFrameSize(result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func validateSSEFrameSize(frame []byte) error {
+	if sseFrameRecordSize(frame) > MaxStreamRecordBytes {
+		return ErrStreamRecordTooLarge
+	}
+	return nil
+}
+
+// sseFrameRecordSize counts the complete event, including every field and
+// line ending, but excludes the final blank line that delimits the event.
+func sseFrameRecordSize(frame []byte) int {
+	if len(frame) == 0 {
+		return 0
+	}
+	lastLineStart := bytes.LastIndexByte(frame[:len(frame)-1], '\n') + 1
+	if isSSEBlankLine(frame[lastLineStart:]) {
+		return lastLineStart
+	}
+	return len(frame)
+}
+
+func splitSSELineEnding(line []byte) ([]byte, []byte) {
+	if bytes.HasSuffix(line, []byte("\r\n")) {
+		return line[:len(line)-2], line[len(line)-2:]
+	}
+	if bytes.HasSuffix(line, []byte("\n")) {
+		return line[:len(line)-1], line[len(line)-1:]
+	}
+	return line, nil
+}
+
+func isSSEDataField(line []byte) bool {
+	return bytes.Equal(line, []byte("data")) || bytes.HasPrefix(line, []byte("data:"))
+}
+
 func isSSEBlankLine(line []byte) bool {
-	return len(bytes.TrimRight(line, "\r\n")) == 0
+	return bytes.Equal(line, []byte{'\n'}) || bytes.Equal(line, []byte{'\r', '\n'})
 }
 
 func parseSSEEvent(frame []byte) SSEEvent {
@@ -181,6 +335,49 @@ func parseSSEEvent(frame []byte) SSEEvent {
 		event.Data = []byte(strings.Join(dataLines, "\n"))
 	}
 	return event
+}
+
+func readSSEEvent(reader *bufio.Reader) (SSEEvent, error) {
+	frame, err := readSSEFrame(reader)
+	if err != nil {
+		return SSEEvent{}, err
+	}
+	return parseSSEEvent(frame), nil
+}
+
+func readSSEFrame(reader *bufio.Reader) ([]byte, error) {
+	if reader == nil {
+		return nil, errors.New("SSE reader is required")
+	}
+
+	var frame bytes.Buffer
+	for {
+		fragment, readErr := reader.ReadSlice('\n')
+		if len(fragment) > 0 {
+			if readErr == nil && isSSEBlankLine(fragment) {
+				_, _ = frame.Write(fragment)
+				return frame.Bytes(), nil
+			}
+			if len(fragment) > MaxStreamRecordBytes-frame.Len() {
+				return nil, ErrStreamRecordTooLarge
+			}
+			_, _ = frame.Write(fragment)
+		}
+
+		if readErr == nil {
+			continue
+		}
+		if errors.Is(readErr, bufio.ErrBufferFull) {
+			continue
+		}
+		if errors.Is(readErr, io.EOF) {
+			if frame.Len() == 0 {
+				return nil, readErr
+			}
+			return nil, fmt.Errorf("%w: incomplete sse event", ErrUpstreamStreamIncomplete)
+		}
+		return nil, readErr
+	}
 }
 
 // StreamResponse reads an SSE stream from a provider and forwards it to the client.
@@ -222,9 +419,10 @@ func (h *Handler) streamResponse(
 	includeUsage bool,
 ) error {
 	if providerResp != nil && providerResp.StatusCode != http.StatusOK {
-		defer providerResp.Body.Close()
-		b, _ := io.ReadAll(providerResp.Body)
-		return upstreamProviderError(providerResp.StatusCode, translator.Name(), b)
+		return readUpstreamProviderError(providerResp, translator.Name())
+	}
+	if providerResp == nil || providerResp.Body == nil {
+		return ErrUpstreamStreamEmpty
 	}
 	defer providerResp.Body.Close()
 
@@ -237,35 +435,31 @@ func (h *Handler) streamResponse(
 		return fmt.Errorf("failed to flush stream headers: %w", err)
 	}
 
-	scanner := bufio.NewScanner(providerResp.Body)
-	// Increase buffer size for large chunks
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	reader := bufio.NewReader(providerResp.Body)
 	envelope := newChatStreamEnvelopeNormalizer(translator.DefaultModel())
 
-	for scanner.Scan() {
+	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
 
-		line := scanner.Text()
-
-		// Skip empty lines and comments
-		if line == "" || strings.HasPrefix(line, ":") {
-			continue
-		}
-
-		// SSE format: "data: <json>"
-		if !strings.HasPrefix(line, "data: ") {
-			// For Anthropic which uses "event: " lines
-			if strings.HasPrefix(line, "event: ") {
-				continue
+		event, err := readSSEEvent(reader)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
 			}
+			streamErr := fmt.Errorf("stream read error: %w", err)
+			if errors.Is(err, ErrStreamRecordTooLarge) {
+				return terminateChatStreamWithError(w, controller, streamErr)
+			}
+			return streamErr
+		}
+		if event.Data == nil {
 			continue
 		}
-
-		data := strings.TrimPrefix(line, "data: ")
+		data := string(event.Data)
 
 		// Check for stream end
 		if data == "[DONE]" {
@@ -279,7 +473,8 @@ func (h *Handler) streamResponse(
 		chunk, err := translator.ParseStreamChunk([]byte(data))
 		streamDone := errors.Is(err, providers.ErrStreamDone)
 		if err != nil && !streamDone {
-			return fmt.Errorf("failed to parse stream chunk: %w", err)
+			streamErr := fmt.Errorf("failed to parse stream chunk: %w", err)
+			return terminateChatStreamWithError(w, controller, streamErr)
 		}
 
 		if chunk == nil && !streamDone {
@@ -292,20 +487,17 @@ func (h *Handler) streamResponse(
 				observer(chunk)
 			}
 			clientChunk := chunk
-			if !includeUsage && chunk.Usage != nil {
-				copyChunk := *chunk
-				copyChunk.Usage = nil
-				clientChunk = &copyChunk
+			if !includeUsage {
+				clientChunk = withoutStreamUsage(chunk)
 			}
 
 			// Marshal to OpenAI-compatible format
-			chunkJSON, err := json.Marshal(clientChunk)
+			chunkJSON, err := marshalStreamChunk(clientChunk)
 			if err != nil {
-				log.Error().Err(err).Msg("failed to marshal stream chunk")
-			} else {
-				if err := writeSSEFrame(w, controller, chunkJSON, "stream chunk"); err != nil {
-					return err
-				}
+				return fmt.Errorf("failed to marshal stream chunk: %w", err)
+			}
+			if err := writeSSEFrame(w, controller, chunkJSON, "stream chunk"); err != nil {
+				return err
 			}
 		}
 
@@ -317,9 +509,6 @@ func (h *Handler) streamResponse(
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("stream scanner error: %w", err)
-	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -329,7 +518,7 @@ func (h *Handler) streamResponse(
 // StreamAnthropicResponse handles Anthropic's different SSE format.
 // Anthropic sends "event: type\ndata: json\n\n" pairs.
 func (h *Handler) StreamAnthropicResponse(ctx context.Context, w http.ResponseWriter, providerResp *http.Response, translator models.ProviderTranslator) error {
-	return h.streamAnthropicResponse(ctx, w, providerResp, translator, nil, true)
+	return h.streamAnthropicResponse(ctx, w, providerResp, translator, nil, false)
 }
 
 func (h *Handler) StreamAnthropicResponseWithObserver(
@@ -339,7 +528,7 @@ func (h *Handler) StreamAnthropicResponseWithObserver(
 	translator models.ProviderTranslator,
 	observer ChunkObserver,
 ) error {
-	return h.streamAnthropicResponse(ctx, w, providerResp, translator, observer, true)
+	return h.streamAnthropicResponse(ctx, w, providerResp, translator, observer, false)
 }
 
 // StreamAnthropicResponseWithObserverAndUsage controls whether translated
@@ -365,9 +554,10 @@ func (h *Handler) streamAnthropicResponse(
 	includeUsage bool,
 ) error {
 	if providerResp != nil && providerResp.StatusCode != http.StatusOK {
-		defer providerResp.Body.Close()
-		b, _ := io.ReadAll(providerResp.Body)
-		return upstreamProviderError(providerResp.StatusCode, translator.Name(), b)
+		return readUpstreamProviderError(providerResp, translator.Name())
+	}
+	if providerResp == nil || providerResp.Body == nil {
+		return ErrUpstreamStreamEmpty
 	}
 	defer providerResp.Body.Close()
 
@@ -381,8 +571,8 @@ func (h *Handler) streamAnthropicResponse(
 	}
 
 	reader := bufio.NewReader(providerResp.Body)
-	var eventType string
 	envelope := newChatStreamEnvelopeNormalizer(translator.DefaultModel())
+	var usage streamUsageAccumulator
 
 	for {
 		select {
@@ -391,83 +581,76 @@ func (h *Handler) streamAnthropicResponse(
 		default:
 		}
 
-		line, err := reader.ReadString('\n')
+		event, err := readSSEEvent(reader)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				break
 			}
-			return fmt.Errorf("stream read error: %w", err)
+			streamErr := fmt.Errorf("stream read error: %w", err)
+			if errors.Is(err, ErrStreamRecordTooLarge) {
+				return terminateChatStreamWithError(w, controller, streamErr)
+			}
+			return streamErr
 		}
-
-		line = strings.TrimRight(line, "\r\n")
-
-		if line == "" {
-			eventType = ""
+		if event.Data == nil {
 			continue
 		}
 
-		if strings.HasPrefix(line, "event: ") {
-			eventType = strings.TrimPrefix(line, "event: ")
-			continue
-		}
-
-		if strings.HasPrefix(line, "data: ") {
-			data := strings.TrimPrefix(line, "data: ")
-
-			payload := []byte(data)
-			if eventType != "" {
-				trimmed := bytes.TrimSpace(payload)
-				if len(trimmed) > 0 && trimmed[0] == '{' {
-					var obj map[string]json.RawMessage
-					if err := json.Unmarshal(trimmed, &obj); err == nil {
-						if _, ok := obj["type"]; !ok {
-							obj["type"] = json.RawMessage(fmt.Sprintf("%q", eventType))
-							if b, err := json.Marshal(obj); err == nil {
-								payload = b
-							}
+		payload := event.Data
+		if event.Event != "" {
+			trimmed := bytes.TrimSpace(payload)
+			if len(trimmed) > 0 && trimmed[0] == '{' {
+				var obj map[string]json.RawMessage
+				if err := json.Unmarshal(trimmed, &obj); err == nil {
+					if _, ok := obj["type"]; !ok {
+						obj["type"] = json.RawMessage(fmt.Sprintf("%q", event.Event))
+						if b, err := json.Marshal(obj); err == nil {
+							payload = b
 						}
 					}
 				}
 			}
+		}
 
-			chunk, parseErr := translator.ParseStreamChunk(payload)
-			streamDone := errors.Is(parseErr, providers.ErrStreamDone)
-			if parseErr != nil && !streamDone {
-				return fmt.Errorf("failed to parse anthropic stream chunk: %w", parseErr)
+		chunk, parseErr := translator.ParseStreamChunk(payload)
+		streamDone := errors.Is(parseErr, providers.ErrStreamDone)
+		if parseErr != nil && !streamDone {
+			streamErr := fmt.Errorf("failed to parse anthropic stream chunk: %w", parseErr)
+			return terminateChatStreamWithError(w, controller, streamErr)
+		}
+
+		if chunk == nil && !streamDone {
+			continue
+		}
+
+		if chunk != nil {
+			chunk = envelope.normalize(chunk)
+			usage.add(chunk)
+			if observer != nil {
+				observer(chunk)
 			}
 
-			if chunk == nil && !streamDone {
-				continue
-			}
-
-			if chunk != nil {
-				chunk = envelope.normalize(chunk)
-				if observer != nil {
-					observer(chunk)
-				}
-
-				clientChunk := chunk
-				if !includeUsage && chunk.Usage != nil {
-					copyChunk := *chunk
-					copyChunk.Usage = nil
-					clientChunk = &copyChunk
-				}
-				chunkJSON, marshalErr := json.Marshal(clientChunk)
-				if marshalErr != nil {
-					log.Error().Err(marshalErr).Msg("failed to marshal stream chunk")
-				} else {
-					if err := writeSSEFrame(w, controller, chunkJSON, "stream chunk"); err != nil {
-						return err
-					}
-				}
-			}
-
-			if streamDone {
-				if err := writeSSEFrame(w, controller, []byte("[DONE]"), "done frame"); err != nil {
+			clientChunk := withoutStreamUsage(chunk)
+			chunkJSON, marshalErr := json.Marshal(clientChunk)
+			if marshalErr != nil {
+				log.Error().Err(marshalErr).Msg("failed to marshal stream chunk")
+			} else {
+				if err := writeSSEFrame(w, controller, chunkJSON, "stream chunk"); err != nil {
 					return err
 				}
-				return nil
 			}
+		}
+
+		if streamDone {
+			if includeUsage {
+				if err := writeCanonicalUsageTrailer(w, controller, envelope, usage); err != nil {
+					return err
+				}
+			}
+			if err := writeSSEFrame(w, controller, []byte("[DONE]"), "done frame"); err != nil {
+				return err
+			}
+			return nil
 		}
 	}
 

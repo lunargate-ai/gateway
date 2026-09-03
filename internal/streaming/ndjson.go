@@ -16,7 +16,7 @@ import (
 )
 
 func (h *Handler) StreamNDJSONResponse(ctx context.Context, w http.ResponseWriter, providerResp *http.Response, translator models.ProviderTranslator) error {
-	return h.streamNDJSONResponse(ctx, w, providerResp, translator, nil, true)
+	return h.streamNDJSONResponse(ctx, w, providerResp, translator, nil, false)
 }
 
 func (h *Handler) StreamNDJSONResponseWithObserver(
@@ -26,7 +26,7 @@ func (h *Handler) StreamNDJSONResponseWithObserver(
 	translator models.ProviderTranslator,
 	observer ChunkObserver,
 ) error {
-	return h.streamNDJSONResponse(ctx, w, providerResp, translator, observer, true)
+	return h.streamNDJSONResponse(ctx, w, providerResp, translator, observer, false)
 }
 
 // StreamNDJSONResponseWithObserverAndUsage controls whether translated usage
@@ -52,9 +52,10 @@ func (h *Handler) streamNDJSONResponse(
 	includeUsage bool,
 ) error {
 	if providerResp != nil && providerResp.StatusCode != http.StatusOK {
-		defer providerResp.Body.Close()
-		b, _ := io.ReadAll(providerResp.Body)
-		return upstreamProviderError(providerResp.StatusCode, translator.Name(), b)
+		return readUpstreamProviderError(providerResp, translator.Name())
+	}
+	if providerResp == nil || providerResp.Body == nil {
+		return ErrUpstreamStreamEmpty
 	}
 
 	defer providerResp.Body.Close()
@@ -67,18 +68,30 @@ func (h *Handler) streamNDJSONResponse(
 		return fmt.Errorf("failed to flush stream headers: %w", err)
 	}
 
-	scanner := bufio.NewScanner(providerResp.Body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	reader := bufio.NewReader(providerResp.Body)
 	envelope := newChatStreamEnvelopeNormalizer(translator.DefaultModel())
+	var usage streamUsageAccumulator
 
-	for scanner.Scan() {
+	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
 
-		line := bytes.TrimSpace(scanner.Bytes())
+		line, readErr := readNDJSONRecord(reader)
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			streamErr := fmt.Errorf("ndjson stream read error: %w", readErr)
+			if errors.Is(readErr, ErrStreamRecordTooLarge) {
+				return terminateChatStreamWithError(w, controller, streamErr)
+			}
+			return streamErr
+		}
+
+		line = bytes.TrimSpace(line)
 		if len(line) == 0 {
 			continue
 		}
@@ -86,7 +99,8 @@ func (h *Handler) streamNDJSONResponse(
 		chunk, err := translator.ParseStreamChunk(line)
 		streamDone := errors.Is(err, providers.ErrStreamDone)
 		if err != nil && !streamDone {
-			return fmt.Errorf("failed to parse ndjson stream chunk: %w", err)
+			streamErr := fmt.Errorf("failed to parse ndjson stream chunk: %w", err)
+			return terminateChatStreamWithError(w, controller, streamErr)
 		}
 		if chunk == nil && !streamDone {
 			continue
@@ -94,15 +108,11 @@ func (h *Handler) streamNDJSONResponse(
 
 		if chunk != nil {
 			chunk = envelope.normalize(chunk)
+			usage.add(chunk)
 			if observer != nil {
 				observer(chunk)
 			}
-			clientChunk := chunk
-			if !includeUsage && chunk.Usage != nil {
-				copyChunk := *chunk
-				copyChunk.Usage = nil
-				clientChunk = &copyChunk
-			}
+			clientChunk := withoutStreamUsage(chunk)
 
 			chunkJSON, err := json.Marshal(clientChunk)
 			if err != nil {
@@ -115,6 +125,11 @@ func (h *Handler) streamNDJSONResponse(
 		}
 
 		if streamDone {
+			if includeUsage {
+				if err := writeCanonicalUsageTrailer(w, controller, envelope, usage); err != nil {
+					return err
+				}
+			}
 			if err := writeSSEFrame(w, controller, []byte("[DONE]"), "done frame"); err != nil {
 				return err
 			}
@@ -129,6 +144,11 @@ func (h *Handler) streamNDJSONResponse(
 			}
 		}
 		if isDone {
+			if includeUsage {
+				if err := writeCanonicalUsageTrailer(w, controller, envelope, usage); err != nil {
+					return err
+				}
+			}
 			if err := writeSSEFrame(w, controller, []byte("[DONE]"), "done frame"); err != nil {
 				return err
 			}
@@ -136,11 +156,44 @@ func (h *Handler) streamNDJSONResponse(
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("stream scanner error: %w", err)
-	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	return fmt.Errorf("%w: ndjson", ErrUpstreamStreamIncomplete)
+}
+
+func readNDJSONRecord(reader *bufio.Reader) ([]byte, error) {
+	if reader == nil {
+		return nil, errors.New("NDJSON reader is required")
+	}
+
+	var record bytes.Buffer
+	for {
+		fragment, readErr := reader.ReadSlice('\n')
+		if readErr == nil {
+			delimiterBytes := 1
+			if len(fragment) >= 2 && fragment[len(fragment)-2] == '\r' {
+				delimiterBytes = 2
+			}
+			fragment = fragment[:len(fragment)-delimiterBytes]
+		}
+		if len(fragment) > MaxStreamRecordBytes-record.Len() {
+			return nil, ErrStreamRecordTooLarge
+		}
+		_, _ = record.Write(fragment)
+
+		if readErr == nil {
+			return record.Bytes(), nil
+		}
+		if errors.Is(readErr, bufio.ErrBufferFull) {
+			continue
+		}
+		if errors.Is(readErr, io.EOF) {
+			if record.Len() == 0 {
+				return nil, readErr
+			}
+			return record.Bytes(), nil
+		}
+		return nil, readErr
+	}
 }

@@ -143,6 +143,48 @@ func TestOldFetchCannotPoisonCacheAfterConfigReload(t *testing.T) {
 	}
 }
 
+func TestFetchModelsDoesNotFollowRedirects(t *testing.T) {
+	var targetRequests atomic.Int32
+	var targetAuthorization atomic.Value
+	targetAuthorization.Store("")
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetRequests.Add(1)
+		targetAuthorization.Store(r.Header.Get("Authorization"))
+		writeOpenAIModels(t, w, "redirected-model")
+	}))
+	defer target.Close()
+
+	var sourceAuthorization atomic.Value
+	sourceAuthorization.Store("")
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sourceAuthorization.Store(r.Header.Get("Authorization"))
+		w.Header().Set("Location", target.URL+"/models")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer source.Close()
+
+	providerConfigs := fetchProviderConfigs(source.URL, "local-default")
+	providerConfig := providerConfigs["custom"]
+	providerConfig.APIKey = "provider-secret"
+	providerConfigs["custom"] = providerConfig
+	store := NewStore(providers.NewRegistry(providerConfigs), providerConfigs)
+
+	got := store.AllModels(context.Background())
+
+	if authorization := sourceAuthorization.Load().(string); authorization != "Bearer provider-secret" {
+		t.Fatalf("source Authorization = %q, want configured provider credential", authorization)
+	}
+	if requests := targetRequests.Load(); requests != 0 {
+		t.Fatalf("redirect target requests = %d, want zero", requests)
+	}
+	if authorization := targetAuthorization.Load().(string); authorization != "" {
+		t.Fatalf("redirect target received Authorization = %q, want empty", authorization)
+	}
+	if !hasModel(got, "custom/local-default") || hasModel(got, "custom/redirected-model") {
+		t.Fatalf("models after redirect = %#v, want only local fallback", got)
+	}
+}
+
 func fetchProviderConfigs(baseURL, defaultModel string) map[string]config.ProviderConfig {
 	return map[string]config.ProviderConfig{
 		"custom": {

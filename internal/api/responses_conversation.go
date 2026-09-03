@@ -4,12 +4,17 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
+
+	"github.com/lunargate-ai/gateway/internal/modelid"
 )
 
 type responsesConversationAssociation struct {
-	id       string
-	rawInput json.RawMessage
+	id            string
+	rawInput      json.RawMessage
+	native        bool
+	nativeBinding conversationBinding
 }
 
 type responsesConversationRequestError struct {
@@ -26,6 +31,7 @@ func (e *responsesConversationRequestError) Error() string {
 }
 
 func (h *Handler) resolveResponsesConversationPayload(
+	r *http.Request,
 	payload map[string]json.RawMessage,
 ) (map[string]json.RawMessage, *responsesConversationAssociation, error) {
 	resolved := cloneResponsesRawMap(payload)
@@ -49,15 +55,41 @@ func (h *Handler) resolveResponsesConversationPayload(
 			code:    "invalid_value",
 		}
 	}
-	if h == nil || h.conversationsState == nil {
-		return resolved, nil, nil
+	binding, native, local, err := h.resolveConversationOwner(r, conversationID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if native {
+		if !h.providerSupportsResponseCapability(binding.Provider, responseNativeLifecycle) {
+			return nil, nil, &responsesConversationRequestError{
+				message: fmt.Sprintf("provider %q does not enable native Responses for conversations", binding.Provider),
+				param:   "conversation",
+				code:    "unsupported_feature",
+			}
+		}
+		if err := validateNativeResponsesConversationProvider(r, resolved, binding.Provider); err != nil {
+			return nil, nil, err
+		}
+		return resolved, &responsesConversationAssociation{
+			id:            conversationID,
+			native:        true,
+			nativeBinding: binding,
+		}, nil
+	}
+	if !local || h == nil || h.conversationsState == nil {
+		return nil, nil, errConversationNotFound
 	}
 	conversationItems, local := h.conversationsState.getItems(conversationID)
 	if !local {
-		// Native Responses providers may own conversation IDs which are not in
-		// the gateway's bounded local state. Compatibility validation rejects
-		// such IDs if routing selects a translated target.
-		return resolved, nil, nil
+		return nil, nil, errConversationNotFound
+	}
+	var background bool
+	if json.Unmarshal(resolved["background"], &background) == nil && background {
+		return nil, nil, &responsesConversationRequestError{
+			message: "background responses are not supported with locally managed conversations",
+			param:   "background",
+			code:    "unsupported_feature",
+		}
 	}
 
 	history := make([]interface{}, 0, len(conversationItems))
@@ -93,6 +125,34 @@ func (h *Handler) resolveResponsesConversationPayload(
 		id:       conversationID,
 		rawInput: cloneResponsesRawMessage(payload["input"]),
 	}, nil
+}
+
+func validateNativeResponsesConversationProvider(
+	r *http.Request,
+	payload map[string]json.RawMessage,
+	provider string,
+) error {
+	provider = strings.TrimSpace(provider)
+	for _, selection := range []struct {
+		value string
+		param string
+	}{
+		{value: parseJSONStringRaw(payload["model"]), param: "model"},
+		{value: strings.TrimSpace(r.Header.Get("X-LunarGate-Model")), param: "model"},
+	} {
+		selectedProvider, _, ok := modelid.SplitCanonical(selection.value)
+		if !ok || strings.EqualFold(strings.TrimSpace(selectedProvider), "lunargate") {
+			continue
+		}
+		if strings.TrimSpace(selectedProvider) != provider {
+			return &responsesConversationRequestError{
+				message: fmt.Sprintf("conversation belongs to provider %q, not model provider %q", provider, selectedProvider),
+				param:   selection.param,
+				code:    "invalid_value",
+			}
+		}
+	}
+	return nil
 }
 
 func parseResponsesConversationID(raw json.RawMessage) (string, error) {
@@ -159,7 +219,7 @@ func (h *Handler) appendResponsesConversation(
 	association *responsesConversationAssociation,
 	completedResponse map[string]interface{},
 ) error {
-	if association == nil || strings.TrimSpace(association.id) == "" {
+	if association == nil || association.native || strings.TrimSpace(association.id) == "" {
 		return nil
 	}
 	if h == nil || h.conversationsState == nil {
@@ -180,7 +240,7 @@ func attachResponsesConversation(
 	completedResponse map[string]interface{},
 	association *responsesConversationAssociation,
 ) {
-	if completedResponse == nil || association == nil || strings.TrimSpace(association.id) == "" {
+	if completedResponse == nil || association == nil || association.native || strings.TrimSpace(association.id) == "" {
 		return
 	}
 	completedResponse["conversation"] = map[string]interface{}{"id": association.id}

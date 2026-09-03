@@ -30,9 +30,16 @@ LunarGate is a Go-based AI gateway that lets you expose one stable endpoint to y
 ## Supported endpoints
 
 - `POST /v1/chat/completions`
+- `GET /v1/chat/completions` for stored completion listing
+- `GET`, `POST`, and `DELETE /v1/chat/completions/{completion_id}` for stored completion lifecycle
+- `GET /v1/chat/completions/{completion_id}/messages`
 - `POST /v1/responses`
 - `POST /v1/embeddings`
 - `GET /v1/models`
+
+Stored Chat Completions lifecycle routes are fail-closed. Enable
+`providers.<id>.capabilities.chat_completions_lifecycle` only for an exact
+OpenAI-compatible upstream account that implements those routes.
 
 ## Provider support
 
@@ -92,14 +99,14 @@ providers:
   openai:
     api_key: "${OPENAI_API_KEY}"
     base_url: "https://api.openai.com/v1"
-    default_model: "gpt-5.2"
+    default_model: "gpt-5.6-terra"
 
 routing:
   routes:
     - name: "default"
       targets:
         - provider: openai
-          model: "gpt-5.2"
+          model: "gpt-5.6-terra"
 ```
 
 If you use environment placeholders such as `${OPENAI_API_KEY}`, either export them in your shell or place them in a local `.env` file:

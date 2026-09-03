@@ -28,6 +28,26 @@ func TestParseUnifiedRequestPreservesUnknownFields(t *testing.T) {
 	}
 }
 
+func TestParseUnifiedRequestCanonicalizesMaxCompletionTokens(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{
+		"model":"gpt-5.4",
+		"messages":[{"role":"user","content":"hello"}],
+		"max_completion_tokens":321
+	}`))
+
+	_, parsed, ok := parseUnifiedRequest(rec, req, false)
+	if !ok {
+		t.Fatalf("parse failed with status %d: %s", rec.Code, rec.Body.String())
+	}
+	if parsed.MaxTokens == nil || *parsed.MaxTokens != 321 {
+		t.Fatalf("max_tokens = %#v, want 321", parsed.MaxTokens)
+	}
+	if !rawJSONObjectHasField(parsed.RawJSON, "max_completion_tokens") {
+		t.Fatal("original max_completion_tokens was not preserved")
+	}
+}
+
 func TestResponsesRawMapUsesPreservedEnvelope(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(`{

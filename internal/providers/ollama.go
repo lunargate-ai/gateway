@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"sort"
 	"strings"
@@ -109,11 +108,11 @@ func (t *OllamaTranslator) TranslateRequest(ctx context.Context, req *models.Uni
 		return nil, err
 	}
 
-	selectedTools, toolChoiceInstruction, toolChoiceMode, err := resolveOllamaToolChoice(req.Tools, req.ToolChoice)
+	selectedTools, toolChoiceMode, err := resolveOllamaToolChoice(req.Tools, req.ToolChoice, "ollama")
 	if err != nil {
 		return nil, err
 	}
-	msgs = applyOllamaToolChoiceInstruction(msgs, toolChoiceInstruction)
+	selectedTools = ollamaToolsForUpstream(selectedTools)
 	stop, err := resolveOllamaStop(req.Stop, "ollama")
 	if err != nil {
 		return nil, err
@@ -213,6 +212,9 @@ func (t *OllamaTranslator) validateRequestFields(providerID string, req *models.
 	if req == nil {
 		return nil
 	}
+	if err := validateTranslatedChatRawControls(providerID, req); err != nil {
+		return err
+	}
 	if req.N != nil && *req.N != 1 {
 		return ollamaCompatibilityError(providerID, "n", "Ollama returns exactly one choice")
 	}
@@ -225,9 +227,25 @@ func (t *OllamaTranslator) validateRequestFields(providerID string, req *models.
 	if req.Store != nil && *req.Store && !strings.EqualFold(strings.TrimSpace(req.SourceRequestType), "responses") {
 		return ollamaCompatibilityError(providerID, "store", "Ollama cannot create a stored response")
 	}
+	if len(req.Functions) > 0 {
+		return ollamaCompatibilityError(providerID, "functions", "normalize legacy functions into tools before using Ollama")
+	}
+	if req.FunctionCall != nil {
+		return ollamaCompatibilityError(providerID, "function_call", "normalize legacy function_call into tool_choice before using Ollama")
+	}
+	if err := validateTranslatedChatTypedToolChoice(providerID, req.ToolChoice); err != nil {
+		return err
+	}
+	if err := validateOllamaTools(providerID, req.Tools); err != nil {
+		return err
+	}
 	if effort := requestedOllamaReasoningEffort(req); effort != "" {
-		if _, ok := normalizeOllamaThinkValue(effort); !ok {
-			return ollamaCompatibilityError(providerID, "reasoning_effort", "Ollama supports none, minimal, low, medium, high, and max reasoning effort")
+		if _, ok := normalizeOllamaReasoningEffort(effort); !ok {
+			return ollamaCompatibilityError(
+				providerID,
+				requestedOllamaReasoningEffortField(req),
+				"Ollama supports none, low, medium, and high reasoning effort",
+			)
 		}
 	}
 	if _, err := resolveOllamaStop(req.Stop, providerID); err != nil {
@@ -236,7 +254,50 @@ func (t *OllamaTranslator) validateRequestFields(providerID string, req *models.
 	if _, err := resolveOllamaResponseFormat(req, providerID); err != nil {
 		return err
 	}
+	if _, _, err := resolveOllamaToolChoice(req.Tools, req.ToolChoice, providerID); err != nil {
+		return err
+	}
 	return nil
+}
+
+func validateOllamaTools(providerID string, tools []models.Tool) error {
+	for index := range tools {
+		path := fmt.Sprintf("tools[%d]", index)
+		tool := tools[index]
+		toolType := strings.ToLower(strings.TrimSpace(tool.Type))
+		if toolType != "" && toolType != "function" {
+			return ollamaCompatibilityError(providerID, path+".type", "Ollama only supports function tools")
+		}
+		if strings.TrimSpace(tool.Function.Name) == "" {
+			return ollamaCompatibilityError(providerID, path+".function.name", "Ollama requires a function name")
+		}
+		if tool.Function.Strict != nil && *tool.Function.Strict {
+			return ollamaCompatibilityError(providerID, path+".function.strict", "Ollama /api/chat does not guarantee strict function arguments")
+		}
+		if tool.Function.Parameters != nil {
+			encoded, err := json.Marshal(tool.Function.Parameters)
+			if err != nil {
+				return ollamaCompatibilityError(providerID, path+".function.parameters", "function parameters must be a JSON schema object")
+			}
+			var schema map[string]interface{}
+			if err := json.Unmarshal(encoded, &schema); err != nil || schema == nil {
+				return ollamaCompatibilityError(providerID, path+".function.parameters", "function parameters must be a JSON schema object")
+			}
+		}
+	}
+	return nil
+}
+
+func ollamaToolsForUpstream(tools []models.Tool) []models.Tool {
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make([]models.Tool, len(tools))
+	copy(out, tools)
+	for index := range out {
+		out[index].Function.Strict = nil
+	}
+	return out
 }
 
 func resolveOllamaStop(value interface{}, providerID string) ([]string, error) {
@@ -273,29 +334,14 @@ func resolveOllamaResponseFormat(req *models.UnifiedRequest, providerID string) 
 	case "json", "json_object":
 		return "json", nil
 	case "json_schema":
-		if req.ResponseFormat.JSONSchema == nil || req.ResponseFormat.JSONSchema.Schema == nil {
-			return nil, ollamaCompatibilityError(providerID, "response_format.json_schema.schema", "Ollama requires a JSON schema object")
-		}
-		schema, ok := ollamaJSONObject(req.ResponseFormat.JSONSchema.Schema)
-		if !ok {
-			return nil, ollamaCompatibilityError(providerID, "response_format.json_schema.schema", "Ollama requires a JSON schema object")
+		schema, err := translatedChatAnnotatedJSONSchema(providerID, req.ResponseFormat.JSONSchema)
+		if err != nil {
+			return nil, err
 		}
 		return schema, nil
 	default:
 		return nil, ollamaCompatibilityError(providerID, "response_format.type", "supported values are text, json_object, and json_schema")
 	}
-}
-
-func ollamaJSONObject(value interface{}) (interface{}, bool) {
-	encoded, err := json.Marshal(value)
-	if err != nil {
-		return nil, false
-	}
-	var object map[string]interface{}
-	if err := json.Unmarshal(encoded, &object); err != nil || object == nil {
-		return nil, false
-	}
-	return value, true
 }
 
 func ollamaCompatibilityError(providerID string, field string, reason string) *models.CompatibilityError {
@@ -331,9 +377,7 @@ func (t *OllamaTranslator) TranslateEmbeddingsRequest(ctx context.Context, req *
 }
 
 func (t *OllamaTranslator) ParseResponse(resp *http.Response) (*models.UnifiedResponse, error) {
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
+	body, err := readUpstreamResponseBody(resp, "ollama")
 	if err != nil {
 		return nil, fmt.Errorf("failed to read ollama response body: %w", err)
 	}
@@ -369,7 +413,7 @@ func (t *OllamaTranslator) ParseResponse(resp *http.Response) (*models.UnifiedRe
 		usage = &models.Usage{
 			PromptTokens:     result.PromptEvalCount,
 			CompletionTokens: result.EvalCount,
-			TotalTokens:      result.PromptEvalCount + result.EvalCount,
+			TotalTokens:      models.SaturatingTokenSum(result.PromptEvalCount, result.EvalCount),
 		}
 	}
 
@@ -430,7 +474,7 @@ func (t *OllamaTranslator) ParseResponse(resp *http.Response) (*models.UnifiedRe
 
 func resolveOllamaThink(req *models.UnifiedRequest, cfg config.ProviderConfig) interface{} {
 	if req != nil {
-		if val, ok := normalizeOllamaThinkValue(requestedOllamaReasoningEffort(req)); ok {
+		if val, ok := normalizeOllamaReasoningEffort(requestedOllamaReasoningEffort(req)); ok {
 			return val
 		}
 	}
@@ -457,6 +501,44 @@ func requestedOllamaReasoningEffort(req *models.UnifiedRequest) string {
 	return ""
 }
 
+func requestedOllamaReasoningEffortField(req *models.UnifiedRequest) string {
+	if req == nil {
+		return "reasoning_effort"
+	}
+	var payload map[string]json.RawMessage
+	if json.Unmarshal(bytes.TrimSpace(req.RawJSON), &payload) == nil && payload != nil {
+		var topLevel string
+		if json.Unmarshal(payload["reasoning_effort"], &topLevel) == nil && strings.TrimSpace(topLevel) != "" {
+			return "reasoning_effort"
+		}
+		var reasoning map[string]json.RawMessage
+		if json.Unmarshal(payload["reasoning"], &reasoning) == nil && reasoning != nil {
+			var nested string
+			if json.Unmarshal(reasoning["effort"], &nested) == nil && strings.TrimSpace(nested) != "" {
+				return "reasoning.effort"
+			}
+		}
+	}
+	if strings.TrimSpace(req.ReasoningEffort) != "" {
+		return "reasoning_effort"
+	}
+	if req.Reasoning != nil && strings.TrimSpace(req.Reasoning.Effort) != "" {
+		return "reasoning.effort"
+	}
+	return "reasoning_effort"
+}
+
+func normalizeOllamaReasoningEffort(raw string) (interface{}, bool) {
+	switch v := strings.ToLower(strings.TrimSpace(raw)); v {
+	case "none":
+		return false, true
+	case "low", "medium", "high":
+		return v, true
+	default:
+		return nil, false
+	}
+}
+
 func normalizeOllamaThinkValue(raw string) (interface{}, bool) {
 	v := strings.ToLower(strings.TrimSpace(raw))
 	switch v {
@@ -466,10 +548,7 @@ func normalizeOllamaThinkValue(raw string) (interface{}, bool) {
 		return true, true
 	case "false", "0", "no", "off", "none":
 		return false, true
-	case "minimal":
-		// Ollama has no separate minimal level; low is the closest supported value.
-		return "low", true
-	case "low", "medium", "high", "max":
+	case "low", "medium", "high":
 		return v, true
 	default:
 		return nil, false
@@ -477,9 +556,7 @@ func normalizeOllamaThinkValue(raw string) (interface{}, bool) {
 }
 
 func (t *OllamaTranslator) ParseEmbeddingsResponse(resp *http.Response) (*models.EmbeddingsResponse, error) {
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
+	body, err := readUpstreamResponseBody(resp, "ollama")
 	if err != nil {
 		return nil, fmt.Errorf("failed to read ollama embeddings response body: %w", err)
 	}
@@ -573,6 +650,9 @@ func translateOllamaMessages(messages []models.Message, providerID string) ([]ol
 
 		if message.FunctionCall != nil {
 			return nil, ollamaCompatibilityError(providerID, messagePath+".function_call", "normalize legacy function_call into assistant.tool_calls before using Ollama")
+		}
+		if message.Refusal != "" {
+			return nil, ollamaCompatibilityError(providerID, messagePath+".refusal", "Ollama /api/chat has no assistant refusal-history field")
 		}
 		if message.Name != "" && role != "tool" {
 			return nil, ollamaCompatibilityError(providerID, messagePath+".name", "Ollama only represents a name as tool_name on tool-result messages")
@@ -837,10 +917,10 @@ func mapOllamaDoneReason(reason string) *string {
 	return &mapped
 }
 
-func resolveOllamaToolChoice(tools []models.Tool, choice interface{}) ([]models.Tool, string, string, error) {
+func resolveOllamaToolChoice(tools []models.Tool, choice interface{}, providerID string) ([]models.Tool, string, error) {
 	mode, functionName, err := parseOllamaToolChoice(choice)
 	if err != nil {
-		return nil, "", "", err
+		return nil, "", err
 	}
 	if mode == "" {
 		mode = "auto"
@@ -848,46 +928,46 @@ func resolveOllamaToolChoice(tools []models.Tool, choice interface{}) ([]models.
 
 	switch mode {
 	case "auto":
-		return tools, "", mode, nil
+		return tools, mode, nil
 	case "none":
-		return nil, "", mode, nil
+		return nil, mode, nil
 	case "required":
 		if len(tools) == 0 {
-			return nil, "", "", &ProviderError{
+			return nil, "", &ProviderError{
 				StatusCode: 400,
 				Message:    "tool_choice=required requires at least one tool",
 				Type:       "invalid_request_error",
 				Provider:   "ollama",
 			}
 		}
-		return tools, "You must call one of the available tools before responding to the user. Do not answer directly without a tool call.", mode, nil
+		return nil, "", ollamaCompatibilityError(providerID, "tool_choice", "Ollama /api/chat cannot enforce required tool use")
 	case "function":
 		if len(tools) == 0 {
-			return nil, "", "", &ProviderError{
+			return nil, "", &ProviderError{
 				StatusCode: 400,
 				Message:    "tool_choice=function requires at least one tool",
 				Type:       "invalid_request_error",
 				Provider:   "ollama",
 			}
 		}
-		filtered := make([]models.Tool, 0, 1)
+		found := false
 		for i := range tools {
 			if strings.TrimSpace(tools[i].Function.Name) == functionName {
-				filtered = append(filtered, tools[i])
+				found = true
+				break
 			}
 		}
-		if len(filtered) == 0 {
-			return nil, "", "", &ProviderError{
+		if !found {
+			return nil, "", &ProviderError{
 				StatusCode: 400,
 				Message:    fmt.Sprintf("tool_choice references unknown tool %q", functionName),
 				Type:       "invalid_request_error",
 				Provider:   "ollama",
 			}
 		}
-		instruction := fmt.Sprintf("You must call the function %q before responding to the user. Do not answer directly without a tool call.", functionName)
-		return filtered, instruction, mode + ":" + functionName, nil
+		return nil, "", ollamaCompatibilityError(providerID, "tool_choice", "Ollama /api/chat cannot enforce a named function tool choice")
 	default:
-		return nil, "", "", &ProviderError{
+		return nil, "", &ProviderError{
 			StatusCode: 400,
 			Message:    fmt.Sprintf("unsupported tool_choice %q for ollama", mode),
 			Type:       "invalid_request_error",
@@ -967,27 +1047,6 @@ func parseOllamaToolChoice(choice interface{}) (mode string, functionName string
 			Provider:   "ollama",
 		}
 	}
-}
-
-func applyOllamaToolChoiceInstruction(messages []ollamaMessage, instruction string) []ollamaMessage {
-	if strings.TrimSpace(instruction) == "" {
-		return messages
-	}
-
-	out := append([]ollamaMessage(nil), messages...)
-	for i := range out {
-		if strings.TrimSpace(out[i].Role) != "system" {
-			continue
-		}
-		if strings.TrimSpace(out[i].Content) == "" {
-			out[i].Content = instruction
-		} else {
-			out[i].Content += "\n\nTool-use requirement:\n" + instruction
-		}
-		return out
-	}
-
-	return append([]ollamaMessage{{Role: "system", Content: instruction}}, out...)
 }
 
 func ollamaMessageRoles(messages []ollamaMessage) []string {

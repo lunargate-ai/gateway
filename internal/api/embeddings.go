@@ -428,7 +428,7 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 					requestTypes: requestTypes,
 					provider:     resolved.Target.Provider,
 					model:        cachedModelCanonical,
-					metricsModel: cachedModelRaw,
+					metricsModel: boundedModelMetricLabel(resolved.Target, cachedModelRaw),
 					route:        resolved.RouteName,
 					targetIndex:  resolved.Index,
 					user:         userPtr,
@@ -486,6 +486,17 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 	requestCtx := requestContextWithRetryPolicy(r)
 	resp, usedTarget, fallbackUsed, retryCount, cbState, err := h.fallback.Execute(requestCtx, resolved.Target, resolved.Fallbacks, executeFunc)
 	h.observeCircuitBreakerState(usedTarget.Provider, cbState)
+	usedModelForTags := strings.TrimSpace(usedTarget.Model)
+	if usedModelForTags == "" {
+		usedModelForTags = modelid.ModelName(req.Model)
+		if usedModelForTags == "" {
+			if translator, ok := h.registry.Get(usedTarget.Provider); ok {
+				usedModelForTags = strings.TrimSpace(translator.DefaultModel())
+			}
+		}
+	}
+	usedCanonicalModelForTags := modelid.BuildCanonical(usedTarget.Provider, usedModelForTags)
+	usedTraceTags := h.enrichCollectorTags(collectorHeaders, usedTarget.Provider, usedCanonicalModelForTags, false)
 	if err != nil {
 		duration := time.Since(startTime)
 		status := http.StatusBadGateway
@@ -593,15 +604,14 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 					TokensOutput:         0,
 					CostUSD:              0,
 					StatusCode:           status,
-					ErrorCode:            &errCodeForCollector,
-					ErrorMessage:         &errMsgForCollector,
+					ErrorCode:            observability.MetricErrorClass(status, true),
 					CacheHit:             cacheHit,
 					RouteUsed:            &routeUsed,
 					TargetIndex:          &targetIndex,
 					FallbackUsed:         fallbackUsed,
 					RetryCount:           retryCount,
 					CircuitBreakerState:  &cbState,
-					Tags:                 traceTags,
+					Tags:                 usedTraceTags,
 				},
 			}}
 			if h.collector.SharePrompts() {
@@ -626,7 +636,7 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 						RetryCount:          retryCount,
 						ErrorCode:           &errCodeForCollector,
 						ErrorMessage:        &errMsgForCollector,
-						Tags:                traceTags,
+						Tags:                usedTraceTags,
 						Request:             reqAny,
 					},
 				})
@@ -655,6 +665,8 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	usedModelCanonical := modelid.BuildCanonical(usedTarget.Provider, usedModelRaw)
+	metricsModelRaw := boundedModelMetricLabel(usedTarget, usedModelRaw)
+	usedTraceTags = h.enrichCollectorTags(collectorHeaders, usedTarget.Provider, usedModelCanonical, false)
 	req.Model = usedModelCanonical
 	w.Header().Set("X-LunarGate-Model", usedModelCanonical)
 
@@ -676,6 +688,9 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 		err = upstreamFailure
 	} else {
 		embeddingsResp, err = embeddingsTranslator.ParseEmbeddingsResponse(resp)
+		if err == nil {
+			normalizeEmbeddingsResponseUsage(embeddingsResp)
+		}
 	}
 	copyHeaders(w.Header(), responseHeaders)
 	if err != nil {
@@ -725,7 +740,7 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 			Str("provider", usedTarget.Provider).
 			Dur("duration", duration).
 			Msg("failed to parse embeddings provider response")
-		h.metrics.ProviderErrors.WithLabelValues(usedTarget.Provider, metricErrType).Inc()
+		h.metrics.ProviderErrors.WithLabelValues(usedTarget.Provider, boundedProviderErrorMetricType(status, metricErrType)).Inc()
 		setTimingHeaders(w, duration.Milliseconds(), upstreamStartMS)
 		if upstreamFailure != nil {
 			upstreamFailure.write(w)
@@ -758,8 +773,7 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 					TokensOutput:         0,
 					CostUSD:              0,
 					StatusCode:           status,
-					ErrorCode:            &errCode,
-					ErrorMessage:         &errMsg,
+					ErrorCode:            observability.MetricErrorClass(status, true),
 					CacheHit:             cacheHit,
 					RouteUsed:            &routeUsed,
 					TargetIndex:          &targetIndex,
@@ -807,8 +821,8 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	duration := time.Since(startTime)
-	h.metrics.RequestsTotal.WithLabelValues(usedTarget.Provider, usedModelRaw, strconv.Itoa(http.StatusOK), resolved.RouteName).Inc()
-	h.metrics.RequestDuration.WithLabelValues(usedTarget.Provider, usedModelRaw).Observe(duration.Seconds())
+	h.metrics.RequestsTotal.WithLabelValues(usedTarget.Provider, metricsModelRaw, strconv.Itoa(http.StatusOK), resolved.RouteName).Inc()
+	h.metrics.RequestDuration.WithLabelValues(usedTarget.Provider, metricsModelRaw).Observe(duration.Seconds())
 
 	var tokensIn int
 	if embeddingsResp.Usage != nil {
@@ -817,9 +831,8 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 			tokensIn = embeddingsResp.Usage.TotalTokens
 		}
 	}
-	if tokensIn > 0 {
-		h.metrics.TokensTotal.WithLabelValues(usedTarget.Provider, usedModelRaw, "input").Add(float64(tokensIn))
-	}
+	tokenUsage := models.TokenUsage{InputTokens: tokensIn}.Normalized()
+	h.metrics.ObserveTokenUsage(usedTarget.Provider, metricsModelRaw, tokenUsage)
 
 	setTimingHeaders(w, duration.Milliseconds(), upstreamStartMS)
 
@@ -835,7 +848,7 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 	if h.collector != nil {
 		routeUsed := resolved.RouteName
 		targetIndex := resolved.Index
-		costUSD := observability.EstimateCostUSD(usedProviderType, usedModelRaw, tokensIn, 0)
+		costUSD := observability.EstimateTokenUsageCostUSD(usedTarget.Provider, usedProviderType, usedModelRaw, tokenUsage)
 		var upstreamPtr *int64
 		if upstreamStartMS >= 0 {
 			v := upstreamStartMS
@@ -864,7 +877,7 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 				FallbackUsed:         fallbackUsed,
 				RetryCount:           retryCount,
 				CircuitBreakerState:  &cbState,
-				Tags:                 traceTags,
+				Tags:                 usedTraceTags,
 			},
 		}}
 		if h.collector.SharePrompts() || h.collector.ShareResponses() {
@@ -893,7 +906,7 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 					CacheHit:            cacheHit,
 					FallbackUsed:        fallbackUsed,
 					RetryCount:          retryCount,
-					Tags:                traceTags,
+					Tags:                usedTraceTags,
 					Request:             reqObj,
 					Response:            respObj,
 				},

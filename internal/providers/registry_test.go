@@ -107,8 +107,9 @@ func TestRegistry_CapabilitiesAreExplicitAndCopied(t *testing.T) {
 		"openai": {
 			Type: "openai",
 			Capabilities: config.ProviderCapabilities{
-				ResponsesLifecycle: true,
-				HostedTools:        []string{"web_search"},
+				ResponsesLifecycle:    true,
+				ReasoningEffortLevels: []string{"low", "xhigh"},
+				HostedTools:           []string{"web_search"},
 			},
 		},
 	})
@@ -121,10 +122,14 @@ func TestRegistry_CapabilitiesAreExplicitAndCopied(t *testing.T) {
 		t.Fatal("responses lifecycle capability was not preserved")
 	}
 	capabilities.HostedTools[0] = "mutated"
+	capabilities.ReasoningEffortLevels[0] = "mutated"
 
 	again, ok := reg.Capabilities("openai")
 	if !ok || len(again.HostedTools) != 1 || again.HostedTools[0] != "web_search" {
 		t.Fatalf("registry capability slice was aliased: %#v", again.HostedTools)
+	}
+	if len(again.ReasoningEffortLevels) != 2 || again.ReasoningEffortLevels[0] != "low" {
+		t.Fatalf("registry reasoning effort levels were aliased: %#v", again.ReasoningEffortLevels)
 	}
 
 	if missing, ok := reg.Capabilities("missing"); ok || missing.ResponsesLifecycle || len(missing.HostedTools) != 0 {

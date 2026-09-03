@@ -8,6 +8,8 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -162,7 +164,7 @@ func (r *Retrier) Do(ctx context.Context, fn DoFunc) (*http.Response, int, error
 		}
 
 		if attempt < maxAttempts-1 {
-			delay := r.calculateDelay(attempt)
+			delay := calculateRetryDelay(cfg, attempt, lastErr, time.Now())
 			log.Debug().
 				Int("attempt", attempt+1).
 				Int("max_attempts", maxAttempts).
@@ -170,15 +172,22 @@ func (r *Retrier) Do(ctx context.Context, fn DoFunc) (*http.Response, int, error
 				Err(lastErr).
 				Msg("retrying request")
 
+			timer := time.NewTimer(delay)
 			select {
 			case <-ctx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
 				return nil, attempt, ctx.Err()
-			case <-time.After(delay):
+			case <-timer.C:
 			}
 		}
 	}
 
-	return nil, maxAttempts, fmt.Errorf("max retries (%d) exceeded: %w", maxAttempts, lastErr)
+	return nil, maxAttempts - 1, fmt.Errorf("max attempts (%d) exhausted: %w", maxAttempts, lastErr)
 }
 
 func isConfiguredRetryableStatus(cfg config.RetryConfig, code int) bool {
@@ -194,21 +203,50 @@ func isProviderFailureStatus(code int) bool {
 	return code >= http.StatusInternalServerError && code <= 599
 }
 
-func (r *Retrier) calculateDelay(attempt int) time.Duration {
-	cfg := r.currentConfig()
+func calculateRetryDelay(cfg config.RetryConfig, attempt int, lastErr error, now time.Time) time.Duration {
 	delay := float64(cfg.InitialDelay) * math.Pow(cfg.Multiplier, float64(attempt))
-
-	if delay > float64(cfg.MaxDelay) {
-		delay = float64(cfg.MaxDelay)
-	}
 
 	// Add jitter: delay * (1 +/- jitterFactor/2)
 	jitter := delay * cfg.JitterFactor * (rand.Float64() - 0.5)
-	result := delay + jitter
+	result := time.Duration(delay + jitter)
 
 	if result < 0 {
-		result = float64(cfg.InitialDelay)
+		result = cfg.InitialDelay
 	}
+	var statusErr *RetryableStatusError
+	if errors.As(lastErr, &statusErr) {
+		if retryAfter, ok := parseRetryAfter(statusErr.Headers.Get("Retry-After"), now); ok && retryAfter > result {
+			result = retryAfter
+		}
+	}
+	if result > cfg.MaxDelay {
+		result = cfg.MaxDelay
+	}
+	return result
+}
 
-	return time.Duration(result)
+func parseRetryAfter(value string, now time.Time) (time.Duration, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, false
+	}
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil {
+		if seconds < 0 {
+			return 0, false
+		}
+		const maxDurationSeconds = int64((1<<63 - 1) / time.Second)
+		if seconds > maxDurationSeconds {
+			return time.Duration(1<<63 - 1), true
+		}
+		return time.Duration(seconds) * time.Second, true
+	}
+	deadline, err := http.ParseTime(value)
+	if err != nil {
+		return 0, false
+	}
+	delay := deadline.Sub(now)
+	if delay < 0 {
+		delay = 0
+	}
+	return delay, true
 }

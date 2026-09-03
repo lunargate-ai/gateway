@@ -21,3 +21,18 @@ func TestNormalizeUnifiedRequest_MapsReasoningObjectToReasoningEffort(t *testing
 		t.Fatalf("expected canonicalized reasoning object to be nil")
 	}
 }
+
+func TestNormalizeUnifiedRequest_MapsMaxCompletionTokens(t *testing.T) {
+	maxCompletionTokens := 321
+	req := &UnifiedRequest{MaxCompletionTokens: &maxCompletionTokens}
+
+	if err := NormalizeUnifiedRequest(req); err != nil {
+		t.Fatalf("NormalizeUnifiedRequest returned error: %v", err)
+	}
+	if req.MaxTokens == nil || *req.MaxTokens != maxCompletionTokens {
+		t.Fatalf("max_tokens = %#v, want %d", req.MaxTokens, maxCompletionTokens)
+	}
+	if req.MaxCompletionTokens != nil {
+		t.Fatalf("max_completion_tokens was not canonicalized: %#v", req.MaxCompletionTokens)
+	}
+}

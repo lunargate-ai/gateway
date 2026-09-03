@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"sort"
 	"strings"
@@ -16,6 +15,8 @@ import (
 	"github.com/lunargate-ai/gateway/pkg/models"
 	"github.com/rs/zerolog/log"
 )
+
+const openAIDefaultModel = "gpt-5.6-terra"
 
 func splitThinkTags(s string) (reasoning string, content string, changed bool) {
 	startTag := "<think>"
@@ -68,7 +69,7 @@ func NewOpenAITranslator(cfg config.ProviderConfig) *OpenAITranslator {
 		cfg.BaseURL = "https://api.openai.com/v1"
 	}
 	if cfg.DefaultModel == "" {
-		cfg.DefaultModel = "gpt-4-turbo"
+		cfg.DefaultModel = openAIDefaultModel
 	}
 	return &OpenAITranslator{cfg: cfg}
 }
@@ -86,10 +87,14 @@ func (t *OpenAITranslator) BaseURL() string {
 }
 
 func (t *OpenAITranslator) TranslateRequest(ctx context.Context, req *models.UnifiedRequest) (*http.Request, error) {
+	upstreamRequestType := strings.TrimSpace(UpstreamRequestTypeFromContext(ctx))
+	if err := t.ValidateRequestCompatibilityForUpstream("openai", upstreamRequestType, req); err != nil {
+		return nil, err
+	}
+
 	reqCopy := normalizeOpenAICompatibleRequestForProvider(*req, t.cfg)
 	reqCopy.Reasoning = nil
 
-	upstreamRequestType := strings.TrimSpace(UpstreamRequestTypeFromContext(ctx))
 	endpoint := fmt.Sprintf("%s/chat/completions", t.cfg.BaseURL)
 	if strings.EqualFold(upstreamRequestType, "responses") {
 		endpoint = fmt.Sprintf("%s/responses", t.cfg.BaseURL)
@@ -285,9 +290,7 @@ func openAIEmbeddingsRequestBody(req *models.EmbeddingsRequest) ([]byte, error) 
 }
 
 func (t *OpenAITranslator) ParseResponse(resp *http.Response) (*models.UnifiedResponse, error) {
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
+	body, err := readUpstreamResponseBody(resp, "openai")
 	if err != nil {
 		return nil, fmt.Errorf("failed to read openai response body: %w", err)
 	}
@@ -319,14 +322,20 @@ func (t *OpenAITranslator) ParseResponse(resp *http.Response) (*models.UnifiedRe
 	}
 	_ = json.Unmarshal(body, &envelope)
 	if strings.EqualFold(strings.TrimSpace(envelope.Object), "response") {
-		var responsesResp models.ResponsesResponse
-		if err := json.Unmarshal(body, &responsesResp); err != nil {
+		responsesResp, terminalFailure, err := decodeOpenAIResponsesResponse(body)
+		if err != nil {
 			return nil, fmt.Errorf("failed to unmarshal openai responses object: %w", err)
 		}
-		result := responsesResponseToUnified(&responsesResp)
+		result := responsesResponseToUnified(responsesResp)
 		if nativeResponsesRequest {
 			result.RawJSON = append(json.RawMessage(nil), body...)
+			return result, nil
 		}
+		finishReason, err := openAIResponsesTerminalFinishReason(responsesResp, terminalFailure, "")
+		if err != nil {
+			return nil, err
+		}
+		result.Choices[0].FinishReason = finishReason
 		return result, nil
 	}
 
@@ -404,7 +413,7 @@ func normalizeOpenAIChatResponseEnvelope(body []byte, defaultModel string) ([]by
 				promptTokens, promptOK := parseOpenAIResponseInteger(usage["prompt_tokens"])
 				completionTokens, completionOK := parseOpenAIResponseInteger(usage["completion_tokens"])
 				if promptOK && completionOK {
-					setRawJSONValue(usage, "total_tokens", promptTokens+completionTokens)
+					setRawJSONValue(usage, "total_tokens", models.SaturatingTokenSum(promptTokens, completionTokens))
 					usageChanged = true
 				}
 			}
@@ -454,9 +463,7 @@ func parseOpenAIResponseInteger(raw json.RawMessage) (int, bool) {
 }
 
 func (t *OpenAITranslator) ParseEmbeddingsResponse(resp *http.Response) (*models.EmbeddingsResponse, error) {
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
+	body, err := readUpstreamResponseBody(resp, "openai")
 	if err != nil {
 		return nil, fmt.Errorf("failed to read openai embeddings response body: %w", err)
 	}
@@ -498,6 +505,10 @@ func (t *OpenAITranslator) ParseStreamChunk(data []byte) (*models.StreamChunk, e
 		return nil, ErrStreamDone
 	}
 
+	if streamErr, ok := parseOpenAIStreamError(trimmed); ok {
+		return nil, streamErr
+	}
+
 	var eventEnvelope struct {
 		Type string `json:"type"`
 	}
@@ -535,8 +546,66 @@ func (t *OpenAITranslator) ParseStreamChunk(data []byte) (*models.StreamChunk, e
 		}
 		c.Delta.Content = cleaned
 	}
+	chunk.RawJSON = append(json.RawMessage(nil), trimmed...)
 
 	return &chunk, nil
+}
+
+type openAIStreamErrorDetail struct {
+	Message string          `json:"message"`
+	Type    string          `json:"type"`
+	Code    json.RawMessage `json:"code"`
+}
+
+func parseOpenAIStreamError(data []byte) (*ProviderError, bool) {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(data, &envelope); err != nil || envelope == nil {
+		return nil, false
+	}
+
+	var detail openAIStreamErrorDetail
+	if rawError, ok := envelope["error"]; ok {
+		trimmedError := bytes.TrimSpace(rawError)
+		if len(trimmedError) > 0 && trimmedError[0] == '{' {
+			_ = json.Unmarshal(trimmedError, &detail)
+			return newOpenAIStreamProviderError(detail), true
+		}
+		if len(trimmedError) > 0 && trimmedError[0] == '"' {
+			_ = json.Unmarshal(trimmedError, &detail.Message)
+			return newOpenAIStreamProviderError(detail), true
+		}
+	}
+
+	var eventType string
+	if err := json.Unmarshal(envelope["type"], &eventType); err != nil || !strings.EqualFold(strings.TrimSpace(eventType), "error") {
+		return nil, false
+	}
+	_ = json.Unmarshal(envelope["message"], &detail.Message)
+	detail.Code = envelope["code"]
+	return newOpenAIStreamProviderError(detail), true
+}
+
+func newOpenAIStreamProviderError(detail openAIStreamErrorDetail) *ProviderError {
+	message := strings.TrimSpace(detail.Message)
+	if message == "" {
+		message = "openai stream error"
+	}
+	errorType := strings.TrimSpace(detail.Type)
+	if errorType == "" {
+		var code string
+		if err := json.Unmarshal(detail.Code, &code); err == nil {
+			errorType = strings.TrimSpace(code)
+		}
+	}
+	if errorType == "" {
+		errorType = "upstream_error"
+	}
+	return &ProviderError{
+		StatusCode: http.StatusBadGateway,
+		Message:    message,
+		Type:       errorType,
+		Provider:   "openai",
+	}
 }
 
 func normalizeOpenAICompatibleRequestForProvider(req models.UnifiedRequest, cfg config.ProviderConfig) models.UnifiedRequest {
@@ -615,6 +684,7 @@ func providerExtraBool(cfg config.ProviderConfig, key string) (bool, bool) {
 func unifiedToResponsesPayload(req *models.UnifiedRequest) *models.ResponsesRequest {
 	input := make([]interface{}, 0, len(req.Messages))
 	instructions := make([]string, 0, 1)
+	store := false
 
 	for i := range req.Messages {
 		msg := req.Messages[i]
@@ -683,7 +753,7 @@ func unifiedToResponsesPayload(req *models.UnifiedRequest) *models.ResponsesRequ
 		Tools:              make([]models.ResponsesTool, 0, len(req.Tools)),
 		ToolChoice:         normalizeResponsesToolChoiceForUpstream(req.ToolChoice),
 		Stream:             req.Stream,
-		Store:              req.Store,
+		Store:              &store,
 		User:               req.User,
 	}
 	if len(instructions) > 0 {
@@ -697,11 +767,16 @@ func unifiedToResponsesPayload(req *models.UnifiedRequest) *models.ResponsesRequ
 	}
 	for _, tool := range req.Tools {
 		fn := tool.Function
+		strict := false
+		if fn.Strict != nil {
+			strict = *fn.Strict
+		}
 		out.Tools = append(out.Tools, models.ResponsesTool{
 			Type:        "function",
 			Name:        fn.Name,
 			Description: fn.Description,
 			Parameters:  fn.Parameters,
+			Strict:      &strict,
 		})
 	}
 	if len(out.Tools) == 0 {
@@ -764,9 +839,10 @@ func responsesResponseToUnified(resp *models.ResponsesResponse) *models.UnifiedR
 	}
 	if resp.Usage != nil {
 		out.Usage = &models.Usage{
-			PromptTokens:     resp.Usage.InputTokens,
-			CompletionTokens: resp.Usage.OutputTokens,
-			TotalTokens:      resp.Usage.TotalTokens,
+			PromptTokens:        resp.Usage.InputTokens,
+			CompletionTokens:    resp.Usage.OutputTokens,
+			TotalTokens:         resp.Usage.TotalTokens,
+			PromptTokensDetails: models.CloneInputTokensDetails(resp.Usage.InputTokensDetails),
 		}
 	}
 
@@ -851,29 +927,52 @@ func responsesEventToStreamChunk(data []byte) (*models.StreamChunk, error) {
 			Model:   responseModel,
 			Choices: []models.Choice{},
 		}, nil
-	case "response.completed", "response.done":
+	case "response.completed", "response.done", "response.incomplete", "response.failed", "response.cancelled", "response.canceled":
 		log.Debug().
 			Str("provider", "openai").
 			Str("responses_event_type", typeName).
-			Msg("responses stream completed event")
+			Msg("responses stream terminal event")
 		var event struct {
-			Response models.ResponsesResponse `json:"response"`
+			Response json.RawMessage `json:"response"`
 		}
 		if err := json.Unmarshal(data, &event); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal responses completed event: %w", err)
+			return nil, fmt.Errorf("failed to unmarshal responses terminal event: %w", err)
+		}
+		if len(bytes.TrimSpace(event.Response)) == 0 || bytes.Equal(bytes.TrimSpace(event.Response), []byte("null")) {
+			return nil, openAIResponsesInvalidStatusError("terminal event is missing its response object")
+		}
+		terminalResponse, terminalFailure, err := decodeOpenAIResponsesResponse(event.Response)
+		if err != nil {
+			return nil, fmt.Errorf("failed to unmarshal responses terminal response: %w", err)
+		}
+		statusOverride := strings.TrimPrefix(typeName, "response.")
+		if typeName == "response.done" {
+			statusOverride = terminalResponse.Status
+			if strings.TrimSpace(statusOverride) == "" {
+				statusOverride = "completed"
+			}
+		}
+		finishReason, err := openAIResponsesTerminalFinishReason(terminalResponse, terminalFailure, statusOverride)
+		if err != nil {
+			return nil, err
 		}
 		chunk := &models.StreamChunk{
-			ID:      event.Response.ID,
+			ID:      terminalResponse.ID,
 			Object:  "chat.completion.chunk",
-			Created: event.Response.CreatedAt,
-			Model:   event.Response.Model,
-			Choices: []models.Choice{},
+			Created: terminalResponse.CreatedAt,
+			Model:   terminalResponse.Model,
+			Choices: []models.Choice{{
+				Index:        0,
+				Delta:        &models.Message{},
+				FinishReason: finishReason,
+			}},
 		}
-		if event.Response.Usage != nil {
+		if terminalResponse.Usage != nil {
 			chunk.Usage = &models.Usage{
-				PromptTokens:     event.Response.Usage.InputTokens,
-				CompletionTokens: event.Response.Usage.OutputTokens,
-				TotalTokens:      event.Response.Usage.TotalTokens,
+				PromptTokens:        terminalResponse.Usage.InputTokens,
+				CompletionTokens:    terminalResponse.Usage.OutputTokens,
+				TotalTokens:         terminalResponse.Usage.TotalTokens,
+				PromptTokensDetails: models.CloneInputTokensDetails(terminalResponse.Usage.InputTokensDetails),
 			}
 		}
 		return chunk, ErrStreamDone
@@ -1283,13 +1382,16 @@ func (t *OpenAITranslator) SupportsStreaming() bool {
 
 func (t *OpenAITranslator) Models() []models.ModelInfo {
 	return []models.ModelInfo{
-		{ID: "gpt-4-turbo", Object: "model", Created: time.Now().Unix(), OwnedBy: "openai"},
-		{ID: "gpt-4", Object: "model", Created: time.Now().Unix(), OwnedBy: "openai"},
+		{ID: openAIDefaultModel, Object: "model", Created: time.Now().Unix(), OwnedBy: "openai"},
+		{ID: "gpt-5.6-sol", Object: "model", Created: time.Now().Unix(), OwnedBy: "openai"},
+		{ID: "gpt-5.6-luna", Object: "model", Created: time.Now().Unix(), OwnedBy: "openai"},
+		{ID: "gpt-5.5", Object: "model", Created: time.Now().Unix(), OwnedBy: "openai"},
+		{ID: "gpt-5.4", Object: "model", Created: time.Now().Unix(), OwnedBy: "openai"},
+		{ID: "gpt-5.4-mini", Object: "model", Created: time.Now().Unix(), OwnedBy: "openai"},
+		{ID: "gpt-5.2", Object: "model", Created: time.Now().Unix(), OwnedBy: "openai"},
 		{ID: "gpt-4o", Object: "model", Created: time.Now().Unix(), OwnedBy: "openai"},
 		{ID: "gpt-4o-mini", Object: "model", Created: time.Now().Unix(), OwnedBy: "openai"},
-		{ID: "gpt-3.5-turbo", Object: "model", Created: time.Now().Unix(), OwnedBy: "openai"},
 		{ID: "text-embedding-3-small", Object: "model", Created: time.Now().Unix(), OwnedBy: "openai"},
 		{ID: "text-embedding-3-large", Object: "model", Created: time.Now().Unix(), OwnedBy: "openai"},
-		{ID: "text-embedding-ada-002", Object: "model", Created: time.Now().Unix(), OwnedBy: "openai"},
 	}
 }

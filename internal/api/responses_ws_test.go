@@ -360,16 +360,110 @@ func TestResponsesWebSocket_MapsUpstreamError(t *testing.T) {
 	}
 }
 
-func TestResponsesWebSocket_DoesNotCacheFailedStream(t *testing.T) {
+func TestResponsesWebSocket_ContinuesFromNonCompletedTerminal(t *testing.T) {
+	tests := []struct {
+		name              string
+		firstTerminalType string
+		firstStream       string
+		wantMessageCount  int
+	}{
+		{
+			name:              "incomplete",
+			firstTerminalType: "response.incomplete",
+			firstStream: "data: {\"id\":\"chatcmpl-incomplete\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"mock-gpt\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n" +
+				"data: {\"id\":\"chatcmpl-incomplete\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"mock-gpt\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n" +
+				"data: [DONE]\n\n",
+			wantMessageCount: 3,
+		},
+		{
+			name:              "failed",
+			firstTerminalType: "response.failed",
+			firstStream:       "data: {\"id\":\"chatcmpl-failed\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"mock-gpt\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n",
+			wantMessageCount:  2,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var upstreamCalls int32
+			var secondBody []byte
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				call := atomic.AddInt32(&upstreamCalls, 1)
+				if call == 2 {
+					var err error
+					secondBody, err = io.ReadAll(r.Body)
+					if err != nil {
+						t.Fatalf("read continuation body: %v", err)
+					}
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				if call == 1 {
+					_, _ = io.WriteString(w, test.firstStream)
+					return
+				}
+				_, _ = io.WriteString(w, "data: {\"id\":\"chatcmpl-completed\",\"object\":\"chat.completion.chunk\",\"created\":2,\"model\":\"mock-gpt\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"continued\"}}]}\n\n")
+				_, _ = io.WriteString(w, "data: [DONE]\n\n")
+			}))
+			defer upstream.Close()
+
+			h := newResponsesWebSocketTestHandler(upstream.URL)
+			server := httptest.NewServer(http.HandlerFunc(h.ResponsesWebSocket))
+			defer server.Close()
+			conn := mustDialResponsesWebSocket(t, server.URL)
+			defer conn.Close()
+
+			sendResponsesWebSocketJSON(t, conn, map[string]interface{}{
+				"type":  "response.create",
+				"model": "lunargate/auto",
+				"input": "Say hi",
+			})
+			firstEvents := readResponsesWebSocketEventsUntilTerminal(t, conn)
+			firstResponseID := extractTerminalResponseID(firstEvents, test.firstTerminalType)
+			if firstResponseID == "" {
+				t.Fatalf("expected %s response ID; events=%v", test.firstTerminalType, eventTypes(firstEvents))
+			}
+
+			sendResponsesWebSocketJSON(t, conn, map[string]interface{}{
+				"type":                 "response.create",
+				"model":                "lunargate/auto",
+				"input":                "Continue",
+				"previous_response_id": firstResponseID,
+			})
+			continued := readResponsesWebSocketEventsUntilTerminal(t, conn)
+			if !hasResponsesWebSocketEventType(continued, "response.completed") {
+				t.Fatalf("continuation events = %v, want response.completed", eventTypes(continued))
+			}
+			if got := atomic.LoadInt32(&upstreamCalls); got != 2 {
+				t.Fatalf("upstream calls = %d, want 2", got)
+			}
+
+			var body map[string]interface{}
+			if err := json.Unmarshal(secondBody, &body); err != nil {
+				t.Fatalf("decode continuation body: %v", err)
+			}
+			messages, _ := body["messages"].([]interface{})
+			if len(messages) != test.wantMessageCount {
+				t.Fatalf("continuation messages = %#v, want %d", messages, test.wantMessageCount)
+			}
+			last, _ := messages[len(messages)-1].(map[string]interface{})
+			if last["role"] != "user" || last["content"] != "Continue" {
+				t.Fatalf("last continuation message = %#v", last)
+			}
+		})
+	}
+}
+
+func TestResponsesWebSocket_NativeStreamRequiresTerminalEvent(t *testing.T) {
 	var upstreamCalls int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&upstreamCalls, 1)
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, "data: {\"id\":\"chatcmpl-partial\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"mock-gpt\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n")
+		_, _ = io.WriteString(w, "event: response.output_text.delta\r\ndata: {\"type\":\"response.output_text.delta\",\"response_id\":\"resp_partial\",\"delta\":\"partial\"}\r\n\r\n")
+		_, _ = io.WriteString(w, "data: [DONE]\r\n\r\n")
 	}))
 	defer upstream.Close()
 
-	h := newResponsesWebSocketTestHandler(upstream.URL)
+	h := newResponsesWebSocketTestHandlerWithUpstreamType(upstream.URL, "responses")
 	server := httptest.NewServer(http.HandlerFunc(h.ResponsesWebSocket))
 	defer server.Close()
 	conn := mustDialResponsesWebSocket(t, server.URL)
@@ -381,30 +475,41 @@ func TestResponsesWebSocket_DoesNotCacheFailedStream(t *testing.T) {
 		"input": "Say hi",
 	})
 	events := readResponsesWebSocketEventsUntilTerminal(t, conn)
-	if !hasResponsesWebSocketEventType(events, "response.failed") {
-		t.Fatalf("expected response.failed, got %v", eventTypes(events))
+	if !hasResponsesWebSocketEventType(events, "error") {
+		t.Fatalf("expected terminal error for truncated native stream, got %v", eventTypes(events))
 	}
-	failedResponseID := extractTerminalResponseID(events, "response.failed")
-	if failedResponseID == "" {
-		t.Fatal("expected failed response ID")
+	last := events[len(events)-1]
+	errObj, _ := last["error"].(map[string]interface{})
+	if code, _ := errObj["code"].(string); code != "upstream_stream_incomplete" {
+		t.Fatalf("error code = %q, want upstream_stream_incomplete", code)
 	}
 
 	sendResponsesWebSocketJSON(t, conn, map[string]interface{}{
 		"type":                 "response.create",
-		"model":                "lunargate/auto",
+		"previous_response_id": "resp_partial",
 		"input":                "Continue",
-		"previous_response_id": failedResponseID,
 	})
-	event := readResponsesWebSocketEvent(t, conn)
-	if got, _ := event["type"].(string); got != "error" {
-		t.Fatalf("expected continuation rejection, got %q", got)
-	}
-	errObj, _ := event["error"].(map[string]interface{})
-	if code, _ := errObj["code"].(string); code != "previous_response_not_found" {
-		t.Fatalf("error code = %q, want previous_response_not_found", code)
+	rejected := readResponsesWebSocketEvent(t, conn)
+	if got, _ := rejected["type"].(string); got != "error" {
+		t.Fatalf("expected uncached partial response to be rejected, got %q", got)
 	}
 	if got := atomic.LoadInt32(&upstreamCalls); got != 1 {
 		t.Fatalf("upstream calls = %d, want 1", got)
+	}
+}
+
+func TestResponsesWebSocket_CancelledTerminalIsNotCached(t *testing.T) {
+	proxy := &responsesWebSocketProxy{}
+	proxy.captureEventState([]byte(`{"type":"response.cancelled","response":{"id":"resp_cancelled","status":"cancelled"}}`))
+
+	if !proxy.done || !proxy.terminalSeen {
+		t.Fatal("cancelled response must be treated as terminal")
+	}
+	if proxy.terminalError == nil {
+		t.Fatal("cancelled response must not be eligible for continuation caching")
+	}
+	if proxy.completedResponse != nil {
+		t.Fatal("cancelled response must not be captured as completed")
 	}
 }
 
@@ -676,6 +781,10 @@ func TestResponsesWebSocket_EvictsPreviousResponseCacheAfterFailedContinuation(t
 }
 
 func newResponsesWebSocketTestHandler(upstreamURL string) *Handler {
+	return newResponsesWebSocketTestHandlerWithUpstreamType(upstreamURL, "")
+}
+
+func newResponsesWebSocketTestHandlerWithUpstreamType(upstreamURL, upstreamRequestType string) *Handler {
 	providerID := "openai"
 	cfgProviders := map[string]config.ProviderConfig{
 		providerID: {Type: "openai", APIKey: "dummy", BaseURL: upstreamURL},
@@ -687,7 +796,7 @@ func newResponsesWebSocketTestHandler(upstreamURL string) *Handler {
 			{
 				Name:    "responses-default",
 				Match:   config.MatchConfig{Path: "/v1/responses"},
-				Targets: []config.TargetConfig{{Provider: providerID, Model: "mock-gpt", Weight: 1}},
+				Targets: []config.TargetConfig{{Provider: providerID, Model: "mock-gpt", Weight: 1, UpstreamRequestType: upstreamRequestType}},
 			},
 		},
 	})
@@ -829,6 +938,46 @@ func TestMakeResponsesWebSocketHTTPRequest_PreservesExistingSessionID(t *testing
 
 	if got := req.Header.Get("x-lunargate-sessionid"); got != "client_session" {
 		t.Fatalf("expected client session header to win, got %q", got)
+	}
+}
+
+func TestResponsesWebSocketSSEDecoderHandlesCRLFAndMultilineData(t *testing.T) {
+	raw := []byte(": keepalive\r\nevent: response.completed\r\ndata:{\"type\":\"response.completed\",\r\ndata: \"response\":{\"id\":\"resp_native\",\"status\":\"completed\"}}\r\n\r\nnext")
+
+	frame, remaining, ok, err := nextResponsesSSEFrame(raw)
+	if err != nil {
+		t.Fatalf("decode SSE frame: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected one complete SSE frame")
+	}
+	if got, want := string(remaining), "next"; got != want {
+		t.Fatalf("remaining bytes = %q, want %q", got, want)
+	}
+	payload, ok := responsesSSEData(frame)
+	if !ok {
+		t.Fatal("expected a data payload")
+	}
+	var event map[string]interface{}
+	if err := json.Unmarshal(payload, &event); err != nil {
+		t.Fatalf("multiline SSE payload is not valid JSON: %v; payload=%q", err, payload)
+	}
+	if got, _ := event["type"].(string); got != "response.completed" {
+		t.Fatalf("event type = %q, want response.completed", got)
+	}
+	response, _ := event["response"].(map[string]interface{})
+	if got, _ := response["id"].(string); got != "resp_native" {
+		t.Fatalf("response id = %q, want resp_native", got)
+	}
+}
+
+func TestResponsesWebSocketSSEDecoderWaitsForCompleteCRLFFrame(t *testing.T) {
+	raw := []byte("event: response.completed\r\ndata: {\"type\":\"response.completed\"}\r\n")
+	if _, _, ok, err := nextResponsesSSEFrame(raw); err != nil || ok {
+		if err != nil {
+			t.Fatalf("decode incomplete SSE frame: %v", err)
+		}
+		t.Fatal("unterminated SSE event must stay buffered")
 	}
 }
 

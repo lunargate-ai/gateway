@@ -8,8 +8,64 @@ import (
 	"sync/atomic"
 	"testing"
 
+	chimw "github.com/go-chi/chi/v5/middleware"
 	"github.com/lunargate-ai/gateway/internal/config"
+	"github.com/lunargate-ai/gateway/internal/security"
 )
+
+func TestRateLimitKeyIgnoresUnverifiedCredentialHeaders(t *testing.T) {
+	first := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	first.RemoteAddr = "192.0.2.10:1234"
+	first.Header.Set("Authorization", "Bearer attacker-one")
+	first.Header.Set("X-API-Key", "attacker-one")
+	second := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	second.RemoteAddr = "192.0.2.10:5678"
+	second.Header.Set("Authorization", "Bearer attacker-two")
+	second.Header.Set("X-API-Key", "attacker-two")
+
+	if firstKey, secondKey := extractRateLimitKey(first), extractRateLimitKey(second); firstKey != secondKey {
+		t.Fatalf("unverified headers split one peer into %q and %q", firstKey, secondKey)
+	}
+}
+
+func TestRateLimitKeyUsesVerifiedSubject(t *testing.T) {
+	first := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	first.RemoteAddr = "192.0.2.10:1234"
+	first = first.WithContext(security.ContextWithAuthInfo(first.Context(), security.AuthInfo{Subject: "verified-client"}))
+	second := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	second.RemoteAddr = "198.51.100.20:5678"
+	second = second.WithContext(security.ContextWithAuthInfo(second.Context(), security.AuthInfo{Subject: "verified-client"}))
+
+	if firstKey, secondKey := extractRateLimitKey(first), extractRateLimitKey(second); firstKey != secondKey || firstKey == "ip:192.0.2.10" {
+		t.Fatalf("verified subject keys = %q and %q", firstKey, secondKey)
+	}
+}
+
+func TestRateLimiterUsesSocketPeerBeforeRealIPRewrite(t *testing.T) {
+	rl := NewRateLimiter(config.RateLimitConfig{
+		Enabled:           true,
+		RequestsPerMinute: 1,
+		BurstSize:         1,
+	})
+	handler := CapturePeerAddress(chimw.RealIP(rl.Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))))
+
+	for index, forwardedFor := range []string{"203.0.113.1", "203.0.113.2"} {
+		request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		request.RemoteAddr = "192.0.2.10:1234"
+		request.Header.Set("X-Forwarded-For", forwardedFor)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		want := http.StatusNoContent
+		if index == 1 {
+			want = http.StatusTooManyRequests
+		}
+		if response.Code != want {
+			t.Fatalf("request %d status = %d, want %d", index+1, response.Code, want)
+		}
+	}
+}
 
 func TestRateLimiterConfigSnapshotOwnsBuckets(t *testing.T) {
 	rl := NewRateLimiter(config.RateLimitConfig{

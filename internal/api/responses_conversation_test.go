@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/lunargate-ai/gateway/internal/config"
 )
 
 func TestResponsesUsesAndUpdatesLocalConversation(t *testing.T) {
@@ -211,15 +213,23 @@ func TestResponsesPassesRemoteConversationToNativeTarget(t *testing.T) {
 		}`))
 	}))
 	defer upstream.Close()
-	handler, cache := newNativeContinuationTestHandler(t, upstream.URL+"/v1", "responses")
+	router, handler, cache := newNativeLifecycleRouter(t, upstream.URL+"/v1", map[string]config.ProviderCapabilities{
+		"native": {Conversations: true, ResponsesLifecycle: true},
+	})
 	defer cache.Stop()
+	binding, err := handler.validateConversationProvider("native")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler.conversationBindings.put("conv_remote", binding)
 
 	recorder := httptest.NewRecorder()
-	handler.Responses(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewBufferString(`{
-		"model":"gpt-5.4",
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewBufferString(`{
+		"model":"native/gpt-native",
 		"conversation":{"id":"conv_remote"},
 		"input":"hello"
-	}`)))
+	}`))
+	router.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
@@ -229,7 +239,7 @@ func TestResponsesPassesRemoteConversationToNativeTarget(t *testing.T) {
 	}
 }
 
-func TestResponsesRejectsRemoteConversationForTranslatedTarget(t *testing.T) {
+func TestResponsesRejectsUnknownRemoteConversationWithoutBinding(t *testing.T) {
 	upstreamCalls := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamCalls++
@@ -245,7 +255,7 @@ func TestResponsesRejectsRemoteConversationForTranslatedTarget(t *testing.T) {
 		"conversation":"conv_remote",
 		"input":"hello"
 	}`)))
-	assertConversationError(t, recorder, http.StatusBadRequest, "conversation", "unsupported_feature")
+	assertConversationError(t, recorder, http.StatusNotFound, "conversation_id", "conversation_not_found")
 	if upstreamCalls != 0 {
 		t.Fatalf("upstream calls = %d", upstreamCalls)
 	}

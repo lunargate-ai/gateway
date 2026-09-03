@@ -230,6 +230,9 @@ func (h *Handler) handleResponsesStream(
 	conversation *responsesConversationAssociation,
 ) {
 	proxy := newResponsesStreamProxy(w)
+	if conversation != nil && !conversation.native {
+		proxy.localConversationID = strings.TrimSpace(conversation.id)
+	}
 	proxy.beforeTerminal = func(response map[string]interface{}) {
 		attachResponsesConversation(response, conversation)
 	}
@@ -251,13 +254,19 @@ func (h *Handler) handleResponsesStream(
 	if !store || h == nil || proxy.responseID == "" {
 		return
 	}
-	if proxy.native && proxy.terminalResponse != nil && h.retainNativeResponseBinding(proxy.responseID, proxy.headers) {
+	terminalResponse := proxy.terminalResponse
+	if proxy.native {
+		if terminalResponse != nil && h.retainNativeResponseBinding(proxy.responseID, proxy.headers) {
+			return
+		}
+		// A native non-completed response without lifecycle support cannot be
+		// advanced locally, so retain only completed native snapshots.
+		terminalResponse = proxy.completedResponse
+	}
+	if h.responsesState == nil || terminalResponse == nil {
 		return
 	}
-	if h.responsesState == nil || proxy.completedResponse == nil {
-		return
-	}
-	h.responsesState.putCompleted(proxy.responseID, requestPayload, proxy.completedResponse)
+	h.responsesState.putCompleted(proxy.responseID, requestPayload, terminalResponse)
 }
 
 func (h *Handler) handleResponsesNonStream(
@@ -300,7 +309,7 @@ func (h *Handler) handleResponsesNonStream(
 				h.responsesState.putCompleted(responseID, requestPayload, completedResponse)
 			}
 		}
-		if conversation != nil && strings.TrimSpace(conversation.id) != "" {
+		if conversation != nil && !conversation.native && strings.TrimSpace(conversation.id) != "" {
 			rawResponse, err = json.Marshal(completedResponse)
 			if err != nil {
 				writeError(w, http.StatusInternalServerError, "failed to prepare response", "internal_error")
@@ -346,8 +355,18 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to prepare request", "internal_error")
 		return
 	}
-	conversationPayload, conversation, err := h.resolveResponsesConversationPayload(requestPayload)
+	conversationPayload, conversation, err := h.resolveResponsesConversationPayload(r, requestPayload)
 	if err != nil {
+		var bindingErr *conversationBindingResolutionError
+		if errors.As(err, &bindingErr) {
+			writeConversationBindingResolutionError(w, bindingErr)
+			return
+		}
+		if errors.Is(err, errConversationNotFound) {
+			conversationID := rawResponsesConversationID(responsesReq.RawJSON)
+			writeConversationNotFound(w, conversationID)
+			return
+		}
 		var requestErr *responsesConversationRequestError
 		if errors.As(err, &requestErr) {
 			writeErrorDetail(w, http.StatusBadRequest, requestErr.message, "invalid_request_error", &requestErr.param, &requestErr.code)
@@ -356,15 +375,19 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to prepare conversation", "internal_error")
 		return
 	}
-	resolvedPayload, err := h.resolveResponsesHTTPPayload(conversationPayload)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
-		return
-	}
-	resolvedReq, err := responsesRawMapToRequest(resolvedPayload)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to prepare request", "internal_error")
-		return
+	resolvedPayload := conversationPayload
+	resolvedReq := responsesReq
+	if conversation == nil || !conversation.native {
+		resolvedPayload, err = h.resolveResponsesHTTPPayload(conversationPayload)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
+			return
+		}
+		resolvedReq, err = responsesRawMapToRequest(resolvedPayload)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to prepare request", "internal_error")
+			return
+		}
 	}
 	resolvedReq.Stream = responsesReq.Stream
 
@@ -384,6 +407,9 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to prepare request", "internal_error")
 		return
+	}
+	if conversation != nil && conversation.native {
+		chatReq.Header.Set("X-LunarGate-Provider", conversation.nativeBinding.Provider)
 	}
 
 	if unifiedReq.Stream {

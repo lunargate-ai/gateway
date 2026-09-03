@@ -37,32 +37,71 @@ type CollectorRequest struct {
 }
 
 type MetricEventData struct {
-	RequestID            string            `json:"request_id"`
-	Timestamp            time.Time         `json:"timestamp"`
-	RequestType          string            `json:"request_type,omitempty"`
-	UpstreamRequestType  string            `json:"upstream_request_type,omitempty"`
-	DurationMS           int64             `json:"duration_ms"`
-	GatewayPreUpstreamMS *int64            `json:"gateway_pre_upstream_ms,omitempty"`
-	TtftMS               *int64            `json:"ttft_ms,omitempty"`
-	TtltMS               *int64            `json:"ttlt_ms,omitempty"`
-	Provider             string            `json:"provider"`
-	Model                string            `json:"model"`
-	User                 *string           `json:"user,omitempty"`
-	SessionID            *string           `json:"session_id,omitempty"`
-	TokensInput          int               `json:"tokens_input"`
-	TokensOutput         int               `json:"tokens_output"`
-	CostUSD              float64           `json:"cost_usd"`
-	StatusCode           int               `json:"status_code"`
-	ErrorCode            *string           `json:"error_code,omitempty"`
-	ErrorMessage         *string           `json:"error_message,omitempty"`
-	CacheHit             bool              `json:"cache_hit"`
-	CacheKey             *string           `json:"cache_key,omitempty"`
-	RouteUsed            *string           `json:"route_used,omitempty"`
-	TargetIndex          *int              `json:"target_index,omitempty"`
-	FallbackUsed         bool              `json:"fallback_used"`
-	RetryCount           int               `json:"retry_count"`
-	CircuitBreakerState  *string           `json:"circuit_breaker_state,omitempty"`
-	Tags                 map[string]string `json:"tags,omitempty"`
+	RequestID               string            `json:"request_id"`
+	Timestamp               time.Time         `json:"timestamp"`
+	RequestType             string            `json:"request_type,omitempty"`
+	UpstreamRequestType     string            `json:"upstream_request_type,omitempty"`
+	DurationMS              int64             `json:"duration_ms"`
+	GatewayPreUpstreamMS    *int64            `json:"gateway_pre_upstream_ms,omitempty"`
+	TtftMS                  *int64            `json:"ttft_ms,omitempty"`
+	TtltMS                  *int64            `json:"ttlt_ms,omitempty"`
+	Provider                string            `json:"provider"`
+	Model                   string            `json:"model"`
+	User                    *string           `json:"user,omitempty"`
+	SessionID               *string           `json:"session_id,omitempty"`
+	TokensInput             int               `json:"tokens_input"`
+	TokensOutput            int               `json:"tokens_output"`
+	TokensInputCached       int               `json:"tokens_input_cached,omitempty"`
+	TokensInputCacheWrite   int               `json:"tokens_input_cache_write,omitempty"`
+	TokensInputCacheWrite5m int               `json:"tokens_input_cache_write_5m,omitempty"`
+	TokensInputCacheWrite1h int               `json:"tokens_input_cache_write_1h,omitempty"`
+	CostUSD                 float64           `json:"cost_usd"`
+	StatusCode              int               `json:"status_code"`
+	ErrorCode               *string           `json:"error_code,omitempty"`
+	CacheHit                bool              `json:"cache_hit"`
+	CacheKey                *string           `json:"cache_key,omitempty"`
+	RouteUsed               *string           `json:"route_used,omitempty"`
+	TargetIndex             *int              `json:"target_index,omitempty"`
+	FallbackUsed            bool              `json:"fallback_used"`
+	RetryCount              int               `json:"retry_count"`
+	CircuitBreakerState     *string           `json:"circuit_breaker_state,omitempty"`
+	Tags                    map[string]string `json:"tags,omitempty"`
+}
+
+// MetricErrorClass reduces failures to a finite, non-content-bearing label.
+// Provider error types and messages are untrusted and may contain request
+// content or credentials, so they belong only in explicitly enabled request
+// logs, never in metrics-only events.
+func MetricErrorClass(statusCode int, failed bool) *string {
+	if !failed && statusCode < http.StatusBadRequest {
+		return nil
+	}
+	class := "request_error"
+	switch statusCode {
+	case 499:
+		class = "client_cancelled"
+	case http.StatusBadRequest, http.StatusMethodNotAllowed, http.StatusUnprocessableEntity:
+		class = "invalid_request"
+	case http.StatusUnauthorized:
+		class = "authentication"
+	case http.StatusForbidden:
+		class = "permission"
+	case http.StatusNotFound:
+		class = "not_found"
+	case http.StatusConflict:
+		class = "conflict"
+	case http.StatusRequestEntityTooLarge:
+		class = "request_too_large"
+	case http.StatusRequestTimeout, http.StatusGatewayTimeout:
+		class = "timeout"
+	case http.StatusTooManyRequests:
+		class = "rate_limited"
+	default:
+		if statusCode >= http.StatusInternalServerError || statusCode < http.StatusBadRequest {
+			class = "upstream_error"
+		}
+	}
+	return &class
 }
 
 type TraceEventData struct {
@@ -152,6 +191,9 @@ func NewCollectorClient(general config.GeneralConfig, cfg config.DataSharingConf
 		gatewayVersion: gatewayVersion,
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
 		queue:           make(chan collectorItem, defaultCollectorQueueCapacity),
 		ctx:             ctx,

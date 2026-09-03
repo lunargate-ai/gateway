@@ -181,6 +181,7 @@ func validateTranslatedResponsesTools(raw json.RawMessage, providerID string) er
 		"description": {},
 		"name":        {},
 		"parameters":  {},
+		"strict":      {},
 		"type":        {},
 	}
 	for index, rawTool := range tools {
@@ -194,6 +195,17 @@ func validateTranslatedResponsesTools(raw json.RawMessage, providerID string) er
 		}
 		if field := firstUnsupportedRawKey(tool, allowed, path); field != "" {
 			return translatedResponsesFieldError(providerID, field)
+		}
+		if rawStrict, exists := tool["strict"]; exists {
+			// Responses function strictness is nullable. A null value does not
+			// request strict enforcement and is equivalent to the absent/false
+			// setting used by translated providers.
+			if !bytes.Equal(bytes.TrimSpace(rawStrict), []byte("null")) {
+				var strict bool
+				if err := json.Unmarshal(rawStrict, &strict); err != nil {
+					return translatedResponsesFieldError(providerID, path+".strict")
+				}
+			}
 		}
 	}
 	return nil

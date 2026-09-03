@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"net"
@@ -15,6 +16,19 @@ import (
 	"github.com/lunargate-ai/gateway/internal/security"
 	"github.com/rs/zerolog/log"
 )
+
+type peerAddressContextKey struct{}
+
+// CapturePeerAddress retains the socket peer before proxy-derived middleware
+// rewrites RemoteAddr. Until trusted proxies are configurable, unverified
+// forwarding headers must not create independent rate-limit identities.
+func CapturePeerAddress(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		peer := remoteHost(r.RemoteAddr)
+		ctx := context.WithValue(r.Context(), peerAddressContextKey{}, peer)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
 
 // TokenBucket implements a simple in-memory token bucket rate limiter.
 type TokenBucket struct {
@@ -196,16 +210,16 @@ func extractRateLimitKey(r *http.Request) string {
 		return "subject:" + hashKey(info.Subject)
 	}
 
-	// Prefer API key header, then IP
-	if key := strings.TrimSpace(r.Header.Get("X-API-Key")); key != "" {
-		return "key:" + hashKey(key)
+	if peer, ok := r.Context().Value(peerAddressContextKey{}).(string); ok {
+		return "ip:" + strings.TrimSpace(peer)
 	}
-	if key := strings.TrimSpace(r.Header.Get("Authorization")); key != "" {
-		return "auth:" + hashKey(key)
-	}
-	addr := strings.TrimSpace(r.RemoteAddr)
+	return "ip:" + remoteHost(r.RemoteAddr)
+}
+
+func remoteHost(remoteAddr string) string {
+	addr := strings.TrimSpace(remoteAddr)
 	if host, _, err := net.SplitHostPort(addr); err == nil && host != "" {
-		return "ip:" + host
+		return host
 	}
-	return "ip:" + addr
+	return addr
 }

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lunargate-ai/gateway/internal/config"
 )
@@ -16,6 +17,72 @@ import (
 type trackingResponseBody struct {
 	io.Reader
 	closed bool
+}
+
+func TestParseRetryAfterSupportsSecondsAndHTTPDate(t *testing.T) {
+	now := time.Date(2026, time.September, 3, 10, 0, 0, 0, time.UTC)
+	tests := []struct {
+		value string
+		want  time.Duration
+		ok    bool
+	}{
+		{value: "7", want: 7 * time.Second, ok: true},
+		{value: now.Add(9 * time.Second).Format(http.TimeFormat), want: 9 * time.Second, ok: true},
+		{value: now.Add(-time.Second).Format(http.TimeFormat), want: 0, ok: true},
+		{value: "-1"},
+		{value: "not-a-date"},
+	}
+	for _, test := range tests {
+		got, ok := parseRetryAfter(test.value, now)
+		if ok != test.ok || got != test.want {
+			t.Fatalf("parseRetryAfter(%q) = %s, %v; want %s, %v", test.value, got, ok, test.want, test.ok)
+		}
+	}
+}
+
+func TestRetrierHonorsRetryAfterBeforeNextAttempt(t *testing.T) {
+	retrier := NewRetrier(config.RetryConfig{
+		Enabled:         true,
+		MaxAttempts:     2,
+		InitialDelay:    0,
+		MaxDelay:        2 * time.Second,
+		Multiplier:      1,
+		RetryableErrors: []int{http.StatusTooManyRequests},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	attempts := 0
+
+	_, retryCount, err := retrier.Do(ctx, func(context.Context) (*http.Response, error) {
+		attempts++
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Header:     http.Header{"Retry-After": []string{"1"}},
+			Body:       http.NoBody,
+		}, nil
+	})
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context deadline", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1 before Retry-After elapsed", attempts)
+	}
+	if retryCount != 0 {
+		t.Fatalf("retryCount = %d, want 0 completed retries", retryCount)
+	}
+}
+
+func TestRetryAfterIsCappedByConfiguredMaximum(t *testing.T) {
+	cfg := config.RetryConfig{
+		InitialDelay: 10 * time.Millisecond,
+		MaxDelay:     50 * time.Millisecond,
+		Multiplier:   2,
+	}
+	err := &RetryableStatusError{Headers: http.Header{"Retry-After": []string{"30"}}}
+	if got := calculateRetryDelay(cfg, 0, err, time.Now()); got != cfg.MaxDelay {
+		t.Fatalf("delay = %s, want configured cap %s", got, cfg.MaxDelay)
+	}
 }
 
 func (b *trackingResponseBody) Close() error {
@@ -45,14 +112,14 @@ func TestRetrier_Do_WithRetryDisabledContext_UsesSingleAttempt(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected an error after the single attempt")
 	}
-	if got, want := err.Error(), "max retries (1) exceeded: provider returned status 500"; got != want {
+	if got, want := err.Error(), "max attempts (1) exhausted: provider returned status 500"; got != want {
 		t.Fatalf("expected error %q, got %q", want, got)
 	}
 	if attempts != 1 {
 		t.Fatalf("expected exactly one attempt, got %d", attempts)
 	}
-	if retryCount != 1 {
-		t.Fatalf("expected retryCount=1 after the single allowed attempt, got %d", retryCount)
+	if retryCount != 0 {
+		t.Fatalf("expected retryCount=0 after one initial attempt, got %d", retryCount)
 	}
 }
 
@@ -81,8 +148,8 @@ func TestRetrier_Do_UsesConfiguredRetriesByDefault(t *testing.T) {
 	if attempts != 3 {
 		t.Fatalf("expected three attempts, got %d", attempts)
 	}
-	if retryCount != 3 {
-		t.Fatalf("expected retryCount=3, got %d", retryCount)
+	if retryCount != 2 {
+		t.Fatalf("expected retryCount=2, got %d", retryCount)
 	}
 }
 
@@ -116,8 +183,8 @@ func TestRetrier_UpdateConfig_AppliesNewMaxAttempts(t *testing.T) {
 	if attempts != 1 {
 		t.Fatalf("expected one attempt after config update, got %d", attempts)
 	}
-	if retryCount != 1 {
-		t.Fatalf("expected retryCount=1 after config update, got %d", retryCount)
+	if retryCount != 0 {
+		t.Fatalf("expected retryCount=0 after config update, got %d", retryCount)
 	}
 }
 
@@ -232,8 +299,8 @@ func TestRetrier_RetryableStatusPreservesOnlyFinalSnapshot(t *testing.T) {
 	if resp != nil {
 		t.Fatalf("response = %#v, want nil", resp)
 	}
-	if retryCount != 2 {
-		t.Fatalf("retryCount = %d, want 2", retryCount)
+	if retryCount != 1 {
+		t.Fatalf("retryCount = %d, want 1", retryCount)
 	}
 	var statusErr *RetryableStatusError
 	if !errors.As(err, &statusErr) {

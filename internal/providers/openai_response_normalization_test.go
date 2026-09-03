@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -72,5 +73,35 @@ func TestOpenAIParseResponseKeepsCompliantEnvelopeByteForByte(t *testing.T) {
 	}
 	if !bytes.Equal(response.RawJSON, body) {
 		t.Fatalf("raw envelope changed:\n got: %s\nwant: %s", response.RawJSON, body)
+	}
+}
+
+func TestOpenAIParseResponseSaturatesAliasedUsageTotal(t *testing.T) {
+	maximum := int(^uint(0) >> 1)
+	body := []byte(`{"created":1,"model":"gpt-4o","choices":[],"usage":{"input_tokens":` +
+		strconv.Itoa(maximum) + `,"output_tokens":` + strconv.Itoa(maximum) + `}}`)
+	translator := NewOpenAITranslator(config.ProviderConfig{APIKey: "dummy"})
+
+	response, err := translator.ParseResponse(&http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(bytes.NewReader(body)),
+	})
+	if err != nil {
+		t.Fatalf("ParseResponse returned error: %v", err)
+	}
+	if response.Usage == nil || response.Usage.PromptTokens != maximum || response.Usage.CompletionTokens != maximum || response.Usage.TotalTokens != maximum {
+		t.Fatalf("usage = %#v, want component and total saturation at %d", response.Usage, maximum)
+	}
+
+	var raw struct {
+		Usage struct {
+			TotalTokens int `json:"total_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(response.RawJSON, &raw); err != nil {
+		t.Fatalf("decode raw response: %v", err)
+	}
+	if raw.Usage.TotalTokens != maximum {
+		t.Fatalf("raw total_tokens = %d, want %d", raw.Usage.TotalTokens, maximum)
 	}
 }

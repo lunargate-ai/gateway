@@ -14,6 +14,7 @@ func NewRouter(handler *Handler, authManager *security.Manager, rateLimiter *mid
 	r := chi.NewRouter()
 
 	// Global middleware
+	r.Use(middleware.CapturePeerAddress)
 	r.Use(chimw.RealIP)
 	r.Use(chimw.Recoverer)
 	r.Use(chimw.RequestID)
@@ -33,7 +34,12 @@ func NewRouter(handler *Handler, authManager *security.Manager, rateLimiter *mid
 		}
 
 		messagePolicy := newResponsesWebSocketMessagePolicy(authManager, rateLimiter)
+		r.Get("/chat/completions", handler.ListStoredChatCompletions)
 		r.Post("/chat/completions", handler.ChatCompletions)
+		r.Get("/chat/completions/{completion_id}", handler.RetrieveStoredChatCompletion)
+		r.Post("/chat/completions/{completion_id}", handler.UpdateStoredChatCompletion)
+		r.Delete("/chat/completions/{completion_id}", handler.DeleteStoredChatCompletion)
+		r.Get("/chat/completions/{completion_id}/messages", handler.ListStoredChatCompletionMessages)
 		r.Post("/responses", handler.Responses)
 		r.Get("/responses", handler.responsesWebSocketHandler(messagePolicy))
 		r.Post("/responses/compact", handler.CompactResponses)
