@@ -29,17 +29,18 @@ import (
 
 // Handler is the main API handler that orchestrates the request lifecycle.
 type Handler struct {
-	registry        *providers.Registry
-	router          *routing.Engine
-	fallback        *resilience.FallbackExecutor
-	cache           *middleware.Cache
-	streamer        *streaming.Handler
-	metrics         *observability.Metrics
-	collector       *observability.CollectorClient
-	selector        *modelselect.Engine
-	store           *modelstore.Store
-	providerClients *providerClientRegistry
-	responsesState  *responsesStateStore
+	registry           *providers.Registry
+	router             *routing.Engine
+	fallback           *resilience.FallbackExecutor
+	cache              *middleware.Cache
+	streamer           *streaming.Handler
+	metrics            *observability.Metrics
+	collector          *observability.CollectorClient
+	selector           *modelselect.Engine
+	store              *modelstore.Store
+	providerClients    *providerClientRegistry
+	responsesState     *responsesStateStore
+	conversationsState *conversationStateStore
 }
 
 type trackedResponseWriter struct {
@@ -139,6 +140,12 @@ func parseUnifiedRequest(w http.ResponseWriter, r *http.Request, captureBody boo
 		return nil, nil, false
 	}
 	req.RawJSON = append(json.RawMessage(nil), body...)
+	req.SourceRequestType = "chat_completions"
+	if preserved, ok := preservedUnifiedRequestFromContext(r.Context()); ok {
+		req.RawJSON = append(json.RawMessage(nil), preserved.rawJSON...)
+		req.SourceRequestType = preserved.sourceRequestType
+		body = append([]byte(nil), preserved.rawJSON...)
+	}
 
 	if err := models.NormalizeUnifiedRequest(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid tool/function calling payload", "invalid_request_error")
@@ -268,17 +275,18 @@ func NewHandler(
 	store *modelstore.Store,
 ) *Handler {
 	return &Handler{
-		registry:        registry,
-		router:          router,
-		fallback:        fallback,
-		cache:           cache,
-		streamer:        streamer,
-		metrics:         metrics,
-		collector:       collector,
-		selector:        selector,
-		store:           store,
-		providerClients: newProviderClientRegistry(nil),
-		responsesState:  newResponsesStateStore(30 * time.Minute),
+		registry:           registry,
+		router:             router,
+		fallback:           fallback,
+		cache:              cache,
+		streamer:           streamer,
+		metrics:            metrics,
+		collector:          collector,
+		selector:           selector,
+		store:              store,
+		providerClients:    newProviderClientRegistry(nil),
+		responsesState:     newResponsesStateStore(30 * time.Minute),
+		conversationsState: newConversationStateStore(30 * time.Minute),
 	}
 }
 
@@ -351,11 +359,14 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			delete(headers, "x-lunargate-provider")
 		}
 	}
-	requestType := strings.TrimSpace(headers["x-lunargate-request-type"])
+	requestType := canonicalAPIRequestType(req.SourceRequestType)
 	if requestType == "" {
-		requestType = "chat_completions"
-		headers["x-lunargate-request-type"] = requestType
+		requestType = canonicalAPIRequestType(headers["x-lunargate-request-type"])
 	}
+	if requestType == "" {
+		requestType = requestTypeChatCompletions
+	}
+	headers["x-lunargate-request-type"] = requestType
 	if req.Model != "" {
 		headers["x-lunargate-model"] = strings.TrimSpace(req.Model)
 		if p, _, ok := modelid.SplitCanonical(req.Model); ok {
@@ -408,7 +419,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "no route matched for this request", "routing_error")
 		return
 	}
-	if err := h.validateChatCompatibility(resolved.Target.Provider, &req); err != nil {
+	if err := h.validateChatCompatibility(resolved.Target, &req); err != nil {
 		var compatibilityErr *models.CompatibilityError
 		if errors.As(err, &compatibilityErr) {
 			writeCompatibilityError(w, compatibilityErr)
@@ -419,9 +430,6 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	resolved.Fallbacks = h.compatibleChatFallbacks(resolved.Fallbacks, &req)
 	w.Header().Set("X-LunarGate-Route", resolved.RouteName)
-	if upstreamRequestType := strings.TrimSpace(resolved.Target.UpstreamRequestType); upstreamRequestType != "" {
-		headers["x-lunargate-request-type"] = upstreamRequestType
-	}
 
 	requestedProvider := ""
 	requestedModelRaw := ""
@@ -470,6 +478,8 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	resolvedSampling := h.resolveCollectorInferenceParameters(resolved.Target.Provider, &req)
+	resolvedRequestTypes := chatAPIRequestTypes(requestType, resolved.Target)
+	resolvedCollectorHeaders := resolvedRequestTypes.tags(headers)
 
 	noCache := r.Header.Get("X-LunarGate-No-Cache") == "true" || (req.Store != nil && !*req.Store)
 	if !req.Stream && !noCache && h.cache.Enabled() {
@@ -477,11 +487,61 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		if cached := h.cache.Get(cacheKey); cached != nil {
 			h.metrics.CacheHits.WithLabelValues("hit").Inc()
 			cacheHit = true
-			durationMS := time.Since(startTime).Milliseconds()
+			cachedModelRaw := strings.TrimSpace(resolved.Target.Model)
+			if cachedModelRaw == "" {
+				cachedModelRaw = modelid.ModelName(req.Model)
+				if cachedModelRaw == "" {
+					if translator, ok := h.registry.Get(resolved.Target.Provider); ok {
+						cachedModelRaw = strings.TrimSpace(translator.DefaultModel())
+					}
+				}
+			}
+			cachedModelCanonical := modelid.BuildCanonical(resolved.Target.Provider, cachedModelRaw)
+			userPtr, sessionIDPtr := extractUserAndSession(headers)
+			var tokensIn, tokensOut int
+			switch response := cached.(type) {
+			case *models.UnifiedResponse:
+				if response != nil && response.Usage != nil {
+					tokensIn = response.Usage.PromptTokens
+					tokensOut = response.Usage.CompletionTokens
+				}
+			case models.UnifiedResponse:
+				if response.Usage != nil {
+					tokensIn = response.Usage.PromptTokens
+					tokensOut = response.Usage.CompletionTokens
+				}
+			}
+			var requestPayload interface{}
+			if h.collector != nil && h.collector.SharePrompts() {
+				requestPayload = buildCollectorRequestLogPayload(body, resolvedSampling)
+			}
+			duration := h.recordCacheHit(r.Context(), cacheHitObservation{
+				requestID:    requestID,
+				startTime:    startTime,
+				requestTypes: resolvedRequestTypes,
+				provider:     resolved.Target.Provider,
+				model:        cachedModelCanonical,
+				metricsModel: cachedModelRaw,
+				route:        resolved.RouteName,
+				targetIndex:  resolved.Index,
+				user:         userPtr,
+				sessionID:    sessionIDPtr,
+				tags: h.enrichCollectorTagsWithInference(
+					resolvedCollectorHeaders,
+					resolved.Target.Provider,
+					cachedModelCanonical,
+					false,
+					resolvedSampling,
+				),
+				tokensInput:  tokensIn,
+				tokensOutput: tokensOut,
+				request:      requestPayload,
+				response:     cached,
+			})
 			w.Header().Set("X-LunarGate-Cache-Status", "HIT")
 			w.Header().Set("X-LunarGate-Provider", resolved.Target.Provider)
-			w.Header().Set("X-LunarGate-Model", req.Model)
-			setTimingHeaders(w, durationMS, durationMS)
+			w.Header().Set("X-LunarGate-Model", cachedModelCanonical)
+			setTimingHeaders(w, duration.Milliseconds(), duration.Milliseconds())
 			writeAPIJSON(w, http.StatusOK, cached)
 			return
 		}
@@ -508,7 +568,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		Msg("routing request")
 
 	if h.collector != nil {
-		traceTags := h.enrichCollectorTagsWithInference(headers, resolved.Target.Provider, req.Model, req.Stream, resolvedSampling)
+		traceTags := h.enrichCollectorTagsWithInference(resolvedCollectorHeaders, resolved.Target.Provider, req.Model, req.Stream, resolvedSampling)
 		startEvt := []observability.Event{{
 			Type: "trace",
 			Data: observability.TraceEventData{
@@ -537,11 +597,14 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	resp, usedTarget, fallbackUsed, retryCount, cbState, err := h.fallback.Execute(requestCtx, resolved.Target, resolved.Fallbacks, executeFunc)
 	h.observeCircuitBreakerState(usedTarget.Provider, cbState)
 	usedSampling := h.resolveCollectorInferenceParameters(usedTarget.Provider, &req)
+	usedRequestTypes := chatAPIRequestTypes(requestType, usedTarget)
+	usedCollectorHeaders := usedRequestTypes.tags(headers)
 	if err != nil {
 		duration := time.Since(startTime)
 		status := http.StatusBadGateway
 		errCode := "provider_error"
 		errMsg := "all LLM providers unavailable"
+		requestFailure := false
 		if errors.Is(err, context.Canceled) {
 			status = 499
 			errCode = "client_cancelled"
@@ -550,6 +613,17 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				Str("request_id", requestID).
 				Dur("duration", duration).
 				Msg("request cancelled")
+		} else if requestStatus, requestErrCode, requestErrMsg, ok := requestFailureFromError(err); ok {
+			status = requestStatus
+			errCode = requestErrCode
+			errMsg = requestErrMsg
+			requestFailure = true
+			log.Warn().
+				Err(err).
+				Str("request_id", requestID).
+				Int("status_code", status).
+				Dur("duration", duration).
+				Msg("provider request rejected before upstream call")
 		} else if upstreamStatus, upstreamErrCode, upstreamErrMsg, ok := upstreamFailureFromError(err); ok {
 			status = upstreamStatus
 			errCode = upstreamErrCode
@@ -566,7 +640,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				Dur("duration", duration).
 				Msg("all providers failed")
 		}
-		if !errors.Is(err, context.Canceled) {
+		if !errors.Is(err, context.Canceled) && !requestFailure {
 			h.metrics.ProviderErrors.WithLabelValues(resolved.Target.Provider, "all_failed").Inc()
 		}
 		setTimingHeaders(w, duration.Milliseconds(), upstreamStartMS)
@@ -589,7 +663,8 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				Data: observability.MetricEventData{
 					RequestID:            requestID,
 					Timestamp:            startTime.UTC(),
-					RequestType:          requestType,
+					RequestType:          usedRequestTypes.client,
+					UpstreamRequestType:  usedRequestTypes.upstream,
 					DurationMS:           duration.Milliseconds(),
 					GatewayPreUpstreamMS: upstreamPtr,
 					Provider:             usedTarget.Provider,
@@ -608,7 +683,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 					FallbackUsed:         fallbackUsed,
 					RetryCount:           retryCount,
 					CircuitBreakerState:  &cbState,
-					Tags:                 h.enrichCollectorTagsWithInference(headers, usedTarget.Provider, req.Model, req.Stream, usedSampling),
+					Tags:                 h.enrichCollectorTagsWithInference(usedCollectorHeaders, usedTarget.Provider, req.Model, req.Stream, usedSampling),
 				},
 			}}
 
@@ -617,23 +692,24 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				events = append(events, observability.Event{
 					Type: "request_log",
 					Data: observability.RequestLogEventData{
-						RequestID:    requestID,
-						Timestamp:    startTime.UTC(),
-						RequestType:  requestType,
-						User:         userPtr,
-						SessionID:    sessionIDPtr,
-						Provider:     usedTarget.Provider,
-						Model:        req.Model,
-						StatusCode:   status,
-						DurationMS:   duration.Milliseconds(),
-						RouteUsed:    &routeUsed,
-						CacheHit:     cacheHit,
-						FallbackUsed: fallbackUsed,
-						RetryCount:   retryCount,
-						ErrorCode:    &errCodeForCollector,
-						ErrorMessage: &errMsgForCollector,
-						Tags:         h.enrichCollectorTagsWithInference(headers, usedTarget.Provider, req.Model, req.Stream, usedSampling),
-						Request:      reqAny,
+						RequestID:           requestID,
+						Timestamp:           startTime.UTC(),
+						RequestType:         usedRequestTypes.client,
+						UpstreamRequestType: usedRequestTypes.upstream,
+						User:                userPtr,
+						SessionID:           sessionIDPtr,
+						Provider:            usedTarget.Provider,
+						Model:               req.Model,
+						StatusCode:          status,
+						DurationMS:          duration.Milliseconds(),
+						RouteUsed:           &routeUsed,
+						CacheHit:            cacheHit,
+						FallbackUsed:        fallbackUsed,
+						RetryCount:          retryCount,
+						ErrorCode:           &errCodeForCollector,
+						ErrorMessage:        &errMsgForCollector,
+						Tags:                h.enrichCollectorTagsWithInference(usedCollectorHeaders, usedTarget.Provider, req.Model, req.Stream, usedSampling),
+						Request:             reqAny,
 					},
 				})
 			}
@@ -688,6 +764,11 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		if usedProviderType == "ollama" {
 			if o, ok := translator.(*providers.OllamaTranslator); ok {
 				translator = providers.NewOllamaStreamTranslator(o)
+			}
+		}
+		if usedProviderType == "openai" && strings.EqualFold(strings.TrimSpace(usedTarget.UpstreamRequestType), "responses") {
+			if o, ok := translator.(*providers.OpenAITranslator); ok {
+				translator = providers.NewOpenAIStreamTranslator(o)
 			}
 		}
 
@@ -913,7 +994,8 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				Data: observability.MetricEventData{
 					RequestID:            requestID,
 					Timestamp:            startTime.UTC(),
-					RequestType:          requestType,
+					RequestType:          usedRequestTypes.client,
+					UpstreamRequestType:  usedRequestTypes.upstream,
 					DurationMS:           duration.Milliseconds(),
 					GatewayPreUpstreamMS: upstreamPtr,
 					TtftMS:               ttftPtr,
@@ -934,7 +1016,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 					FallbackUsed:         fallbackUsed,
 					RetryCount:           retryCount,
 					CircuitBreakerState:  &cbState,
-					Tags:                 h.enrichCollectorTagsWithInference(headers, usedTarget.Provider, usedModelCanonical, req.Stream, usedSampling),
+					Tags:                 h.enrichCollectorTagsWithInference(usedCollectorHeaders, usedTarget.Provider, usedModelCanonical, req.Stream, usedSampling),
 				},
 			}}
 
@@ -989,24 +1071,25 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				events = append(events, observability.Event{
 					Type: "request_log",
 					Data: observability.RequestLogEventData{
-						RequestID:    requestID,
-						Timestamp:    startTime.UTC(),
-						RequestType:  requestType,
-						User:         userPtr,
-						SessionID:    sessionIDPtr,
-						Provider:     usedTarget.Provider,
-						Model:        usedModelCanonical,
-						StatusCode:   status,
-						DurationMS:   duration.Milliseconds(),
-						RouteUsed:    &routeUsed,
-						CacheHit:     cacheHit,
-						FallbackUsed: fallbackUsed,
-						RetryCount:   retryCount,
-						ErrorCode:    errCodePtr,
-						ErrorMessage: errMsgPtr,
-						Tags:         h.enrichCollectorTagsWithInference(headers, usedTarget.Provider, usedModelCanonical, req.Stream, usedSampling),
-						Request:      reqObj,
-						Response:     respObj,
+						RequestID:           requestID,
+						Timestamp:           startTime.UTC(),
+						RequestType:         usedRequestTypes.client,
+						UpstreamRequestType: usedRequestTypes.upstream,
+						User:                userPtr,
+						SessionID:           sessionIDPtr,
+						Provider:            usedTarget.Provider,
+						Model:               usedModelCanonical,
+						StatusCode:          status,
+						DurationMS:          duration.Milliseconds(),
+						RouteUsed:           &routeUsed,
+						CacheHit:            cacheHit,
+						FallbackUsed:        fallbackUsed,
+						RetryCount:          retryCount,
+						ErrorCode:           errCodePtr,
+						ErrorMessage:        errMsgPtr,
+						Tags:                h.enrichCollectorTagsWithInference(usedCollectorHeaders, usedTarget.Provider, usedModelCanonical, req.Stream, usedSampling),
+						Request:             reqObj,
+						Response:            respObj,
 					},
 				})
 			}
@@ -1082,7 +1165,8 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				Data: observability.MetricEventData{
 					RequestID:            requestID,
 					Timestamp:            startTime.UTC(),
-					RequestType:          requestType,
+					RequestType:          usedRequestTypes.client,
+					UpstreamRequestType:  usedRequestTypes.upstream,
 					DurationMS:           duration.Milliseconds(),
 					GatewayPreUpstreamMS: upstreamPtr,
 					Provider:             usedTarget.Provider,
@@ -1101,7 +1185,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 					FallbackUsed:         fallbackUsed,
 					RetryCount:           retryCount,
 					CircuitBreakerState:  &cbState,
-					Tags:                 h.enrichCollectorTagsWithInference(headers, usedTarget.Provider, usedModelCanonical, req.Stream, usedSampling),
+					Tags:                 h.enrichCollectorTagsWithInference(usedCollectorHeaders, usedTarget.Provider, usedModelCanonical, req.Stream, usedSampling),
 				},
 			}}
 
@@ -1110,23 +1194,24 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				events = append(events, observability.Event{
 					Type: "request_log",
 					Data: observability.RequestLogEventData{
-						RequestID:    requestID,
-						Timestamp:    startTime.UTC(),
-						RequestType:  requestType,
-						User:         userPtr,
-						SessionID:    sessionIDPtr,
-						Provider:     usedTarget.Provider,
-						Model:        usedModelCanonical,
-						StatusCode:   http.StatusBadGateway,
-						DurationMS:   duration.Milliseconds(),
-						RouteUsed:    &routeUsed,
-						CacheHit:     cacheHit,
-						FallbackUsed: fallbackUsed,
-						RetryCount:   retryCount,
-						ErrorCode:    &errCode,
-						ErrorMessage: &errMsg,
-						Tags:         h.enrichCollectorTagsWithInference(headers, usedTarget.Provider, usedModelCanonical, req.Stream, usedSampling),
-						Request:      reqAny,
+						RequestID:           requestID,
+						Timestamp:           startTime.UTC(),
+						RequestType:         usedRequestTypes.client,
+						UpstreamRequestType: usedRequestTypes.upstream,
+						User:                userPtr,
+						SessionID:           sessionIDPtr,
+						Provider:            usedTarget.Provider,
+						Model:               usedModelCanonical,
+						StatusCode:          http.StatusBadGateway,
+						DurationMS:          duration.Milliseconds(),
+						RouteUsed:           &routeUsed,
+						CacheHit:            cacheHit,
+						FallbackUsed:        fallbackUsed,
+						RetryCount:          retryCount,
+						ErrorCode:           &errCode,
+						ErrorMessage:        &errMsg,
+						Tags:                h.enrichCollectorTagsWithInference(usedCollectorHeaders, usedTarget.Provider, usedModelCanonical, req.Stream, usedSampling),
+						Request:             reqAny,
 					},
 				})
 			}
@@ -1183,7 +1268,8 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			Data: observability.MetricEventData{
 				RequestID:            requestID,
 				Timestamp:            startTime.UTC(),
-				RequestType:          requestType,
+				RequestType:          usedRequestTypes.client,
+				UpstreamRequestType:  usedRequestTypes.upstream,
 				DurationMS:           duration.Milliseconds(),
 				GatewayPreUpstreamMS: upstreamPtr,
 				Provider:             usedTarget.Provider,
@@ -1200,7 +1286,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				FallbackUsed:         fallbackUsed,
 				RetryCount:           retryCount,
 				CircuitBreakerState:  &cbState,
-				Tags:                 h.enrichCollectorTagsWithInference(headers, usedTarget.Provider, usedModelCanonical, req.Stream, usedSampling),
+				Tags:                 h.enrichCollectorTagsWithInference(usedCollectorHeaders, usedTarget.Provider, usedModelCanonical, req.Stream, usedSampling),
 			},
 		}}
 
@@ -1217,22 +1303,23 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			events = append(events, observability.Event{
 				Type: "request_log",
 				Data: observability.RequestLogEventData{
-					RequestID:    requestID,
-					Timestamp:    startTime.UTC(),
-					RequestType:  requestType,
-					User:         userPtr,
-					SessionID:    sessionIDPtr,
-					Provider:     usedTarget.Provider,
-					Model:        req.Model,
-					StatusCode:   status,
-					DurationMS:   duration.Milliseconds(),
-					RouteUsed:    &routeUsed,
-					CacheHit:     cacheHit,
-					FallbackUsed: fallbackUsed,
-					RetryCount:   retryCount,
-					Tags:         h.enrichCollectorTagsWithInference(headers, usedTarget.Provider, req.Model, req.Stream, usedSampling),
-					Request:      reqObj,
-					Response:     respObj,
+					RequestID:           requestID,
+					Timestamp:           startTime.UTC(),
+					RequestType:         usedRequestTypes.client,
+					UpstreamRequestType: usedRequestTypes.upstream,
+					User:                userPtr,
+					SessionID:           sessionIDPtr,
+					Provider:            usedTarget.Provider,
+					Model:               req.Model,
+					StatusCode:          status,
+					DurationMS:          duration.Milliseconds(),
+					RouteUsed:           &routeUsed,
+					CacheHit:            cacheHit,
+					FallbackUsed:        fallbackUsed,
+					RetryCount:          retryCount,
+					Tags:                h.enrichCollectorTagsWithInference(usedCollectorHeaders, usedTarget.Provider, req.Model, req.Stream, usedSampling),
+					Request:             reqObj,
+					Response:            respObj,
 				},
 			})
 		}
@@ -1288,7 +1375,7 @@ func (h *Handler) callProvider(ctx context.Context, target routing.Target, req *
 
 	httpReq, err := translator.TranslateRequest(ctx, &reqCopy)
 	if err != nil {
-		return nil, fmt.Errorf("failed to translate request for %s: %w", target.Provider, err)
+		return nil, resilience.NewRequestError(fmt.Errorf("failed to translate request for %s: %w", target.Provider, err))
 	}
 	if beforeUpstream != nil {
 		beforeUpstream()

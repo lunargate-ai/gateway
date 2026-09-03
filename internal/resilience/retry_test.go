@@ -2,6 +2,7 @@ package resilience
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"testing"
@@ -104,5 +105,82 @@ func TestRetrier_UpdateConfig_AppliesNewMaxAttempts(t *testing.T) {
 	}
 	if retryCount != 1 {
 		t.Fatalf("expected retryCount=1 after config update, got %d", retryCount)
+	}
+}
+
+func TestRetrier_RequestErrorStopsBeforeRetry(t *testing.T) {
+	retrier := NewRetrier(config.RetryConfig{
+		Enabled:         true,
+		MaxAttempts:     3,
+		RetryableErrors: []int{http.StatusInternalServerError},
+	})
+	cause := errors.New("invalid translated payload")
+	attempts := 0
+
+	resp, retryCount, err := retrier.Do(context.Background(), func(context.Context) (*http.Response, error) {
+		attempts++
+		return nil, NewRequestError(cause)
+	})
+
+	if resp != nil {
+		t.Fatalf("response = %#v, want nil", resp)
+	}
+	if !errors.Is(err, cause) || !IsRequestError(err) {
+		t.Fatalf("error = %v, want classified request error", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts)
+	}
+	if retryCount != 0 {
+		t.Fatalf("retryCount = %d, want 0", retryCount)
+	}
+}
+
+func TestRetrier_NonRetryableClientStatusReturnsResponse(t *testing.T) {
+	retrier := NewRetrier(config.RetryConfig{
+		Enabled:         true,
+		MaxAttempts:     3,
+		RetryableErrors: []int{http.StatusTooManyRequests, http.StatusServiceUnavailable},
+	})
+	attempts := 0
+
+	resp, retryCount, err := retrier.Do(context.Background(), func(context.Context) (*http.Response, error) {
+		attempts++
+		return &http.Response{StatusCode: http.StatusBadRequest, Body: http.NoBody}, nil
+	})
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp == nil || resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("response = %#v, want status 400", resp)
+	}
+	if attempts != 1 || retryCount != 0 {
+		t.Fatalf("attempts/retryCount = %d/%d, want 1/0", attempts, retryCount)
+	}
+}
+
+func TestRetrier_UnconfiguredServerStatusIsImmediateFailure(t *testing.T) {
+	retrier := NewRetrier(config.RetryConfig{
+		Enabled:         true,
+		MaxAttempts:     3,
+		RetryableErrors: []int{http.StatusTooManyRequests},
+	})
+	attempts := 0
+
+	resp, retryCount, err := retrier.Do(context.Background(), func(context.Context) (*http.Response, error) {
+		attempts++
+		return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: http.NoBody}, nil
+	})
+
+	if resp != nil {
+		t.Fatalf("response = %#v, want nil", resp)
+	}
+	var statusErr *RetryableStatusError
+	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("error = %v, want status 503 failure", err)
+	}
+	if attempts != 1 || retryCount != 0 {
+		t.Fatalf("attempts/retryCount = %d/%d, want 1/0", attempts, retryCount)
 	}
 }

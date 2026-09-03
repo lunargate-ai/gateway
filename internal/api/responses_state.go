@@ -2,7 +2,10 @@ package api
 
 import (
 	"container/list"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -23,10 +26,12 @@ type responsesStateStore struct {
 }
 
 type responsesStateEntry struct {
-	payload   map[string]json.RawMessage
-	expiresAt time.Time
-	size      int
-	element   *list.Element
+	payload    map[string]json.RawMessage
+	response   json.RawMessage
+	inputItems []json.RawMessage
+	expiresAt  time.Time
+	size       int
+	element    *list.Element
 }
 
 func newResponsesStateStore(ttl time.Duration) *responsesStateStore {
@@ -64,14 +69,50 @@ func (s *responsesStateStore) get(responseID string) (map[string]json.RawMessage
 }
 
 func (s *responsesStateStore) put(responseID string, payload map[string]json.RawMessage) {
+	s.putEntry(responseID, payload, nil, nil)
+}
+
+func (s *responsesStateStore) putCompleted(
+	responseID string,
+	requestPayload map[string]json.RawMessage,
+	completedResponse map[string]interface{},
+) {
+	if s == nil || responseID == "" || completedResponse == nil {
+		return
+	}
+
+	response, err := json.Marshal(completedResponse)
+	if err != nil {
+		return
+	}
+	inputItems, err := responsesStateInputItems(responseID, requestPayload["input"])
+	if err != nil {
+		return
+	}
+	s.putEntry(
+		responseID,
+		withCompletedResponseHistory(requestPayload, completedResponse),
+		response,
+		inputItems,
+	)
+}
+
+func (s *responsesStateStore) putEntry(
+	responseID string,
+	payload map[string]json.RawMessage,
+	response json.RawMessage,
+	inputItems []json.RawMessage,
+) {
 	if s == nil || responseID == "" || len(payload) == 0 {
 		return
 	}
 
 	now := time.Now()
 	expiresAt := now.Add(s.ttl)
-	cloned := cloneResponsesRawMap(payload)
-	size := responsesStatePayloadSize(responseID, cloned)
+	clonedPayload := cloneResponsesRawMap(payload)
+	clonedResponse := cloneResponsesRawMessage(response)
+	clonedInputItems := cloneResponsesRawMessages(inputItems)
+	size := responsesStateEntrySize(responseID, clonedPayload, clonedResponse, clonedInputItems)
 	if size > s.maxBytes {
 		return
 	}
@@ -89,23 +130,59 @@ func (s *responsesStateStore) put(responseID string, payload map[string]json.Raw
 	}
 	element := s.order.PushBack(responseID)
 	s.entries[responseID] = &responsesStateEntry{
-		payload:   cloned,
-		expiresAt: expiresAt,
-		size:      size,
-		element:   element,
+		payload:    clonedPayload,
+		response:   clonedResponse,
+		inputItems: clonedInputItems,
+		expiresAt:  expiresAt,
+		size:       size,
+		element:    element,
 	}
 	s.totalBytes += size
 }
 
-func (s *responsesStateStore) delete(responseID string) {
+func (s *responsesStateStore) getCompleted(responseID string) (json.RawMessage, []json.RawMessage, bool) {
 	if s == nil || responseID == "" {
-		return
+		return nil, nil, false
 	}
+
+	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if entry, ok := s.entries[responseID]; ok {
-		s.removeLocked(responseID, entry)
+	entry, ok := s.entries[responseID]
+	if !ok {
+		return nil, nil, false
 	}
+	if now.After(entry.expiresAt) {
+		s.removeLocked(responseID, entry)
+		return nil, nil, false
+	}
+	if len(entry.response) == 0 {
+		return nil, nil, false
+	}
+
+	return cloneResponsesRawMessage(entry.response), cloneResponsesRawMessages(entry.inputItems), true
+}
+
+func (s *responsesStateStore) delete(responseID string) bool {
+	if s == nil || responseID == "" {
+		return false
+	}
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, ok := s.entries[responseID]
+	if !ok {
+		return false
+	}
+	if now.After(entry.expiresAt) {
+		s.removeLocked(responseID, entry)
+		return false
+	}
+	if len(entry.response) == 0 {
+		return false
+	}
+	s.removeLocked(responseID, entry)
+	return true
 }
 
 func (s *responsesStateStore) cleanupExpiredLocked(now time.Time) {
@@ -156,4 +233,83 @@ func responsesStatePayloadSize(responseID string, payload map[string]json.RawMes
 		size += len(key) + len(value)
 	}
 	return size
+}
+
+func responsesStateEntrySize(
+	responseID string,
+	payload map[string]json.RawMessage,
+	response json.RawMessage,
+	inputItems []json.RawMessage,
+) int {
+	size := responsesStatePayloadSize(responseID, payload) + len(response)
+	for _, item := range inputItems {
+		size += len(item)
+	}
+	return size
+}
+
+func responsesStateInputItems(responseID string, rawInput json.RawMessage) ([]json.RawMessage, error) {
+	items, err := responsesInputRawToItems(rawInput)
+	if err != nil {
+		return nil, err
+	}
+
+	stored := make([]json.RawMessage, 0, len(items))
+	for index, rawItem := range items {
+		item, ok := rawItem.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("invalid response input item at index %d", index)
+		}
+		itemType := responsesStateString(item["type"])
+		if itemType == "" && responsesStateString(item["role"]) != "" {
+			itemType = "message"
+			item["type"] = itemType
+		}
+		if itemType == "message" {
+			if content, ok := item["content"].(string); ok {
+				item["content"] = []interface{}{
+					map[string]interface{}{"type": "input_text", "text": content},
+				}
+			}
+		}
+		if responsesStateString(item["id"]) == "" {
+			item["id"] = responsesStateInputItemID(responseID, index, itemType)
+		}
+		encoded, err := json.Marshal(item)
+		if err != nil {
+			return nil, fmt.Errorf("failed to encode response input item %d: %w", index, err)
+		}
+		stored = append(stored, json.RawMessage(encoded))
+	}
+	return stored, nil
+}
+
+func responsesStateString(value interface{}) string {
+	text, _ := value.(string)
+	return strings.TrimSpace(text)
+}
+
+func responsesStateInputItemID(responseID string, index int, itemType string) string {
+	prefix := "item"
+	switch strings.TrimSpace(itemType) {
+	case "message":
+		prefix = "msg"
+	case "function_call", "function_call_output":
+		prefix = "fc"
+	case "reasoning":
+		prefix = "rs"
+	}
+	digest := sha256.Sum256([]byte(fmt.Sprintf("%s:%d", responseID, index)))
+	return fmt.Sprintf("%s_%x", prefix, digest[:12])
+}
+
+func cloneResponsesRawMessages(src []json.RawMessage) []json.RawMessage {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make([]json.RawMessage, len(src))
+	for index, item := range src {
+		dst[index] = cloneResponsesRawMessage(item)
+	}
+	return dst
 }

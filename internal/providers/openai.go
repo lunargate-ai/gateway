@@ -89,17 +89,15 @@ func (t *OpenAITranslator) TranslateRequest(ctx context.Context, req *models.Uni
 	reqCopy.Reasoning = nil
 
 	upstreamRequestType := strings.TrimSpace(UpstreamRequestTypeFromContext(ctx))
-	bodyPayload := interface{}(&reqCopy)
 	endpoint := fmt.Sprintf("%s/chat/completions", t.cfg.BaseURL)
 	if strings.EqualFold(upstreamRequestType, "responses") {
 		endpoint = fmt.Sprintf("%s/responses", t.cfg.BaseURL)
-		bodyPayload = unifiedToResponsesPayload(&reqCopy)
 	}
 
 	var body []byte
 	var err error
 	if strings.EqualFold(upstreamRequestType, "responses") {
-		body, err = json.Marshal(bodyPayload)
+		body, err = openAIResponsesRequestBody(&reqCopy)
 	} else {
 		body, err = openAIChatRequestBody(&reqCopy, t.cfg)
 	}
@@ -126,7 +124,7 @@ func openAIChatRequestBody(req *models.UnifiedRequest, cfg config.ProviderConfig
 		return nil, fmt.Errorf("request is required")
 	}
 
-	if len(bytes.TrimSpace(req.RawJSON)) == 0 {
+	if len(bytes.TrimSpace(req.RawJSON)) == 0 || strings.EqualFold(strings.TrimSpace(req.SourceRequestType), "responses") {
 		requestCopy := *req
 		if requestCopy.Stream {
 			if requestCopy.StreamOptions == nil {
@@ -175,6 +173,35 @@ func openAIChatRequestBody(req *models.UnifiedRequest, cfg config.ProviderConfig
 			normalizeOpenAIChatContentParts(message)
 		}
 		setRawJSONValue(payload, "messages", messages)
+	}
+
+	return json.Marshal(payload)
+}
+
+func openAIResponsesRequestBody(req *models.UnifiedRequest) ([]byte, error) {
+	if req == nil {
+		return nil, fmt.Errorf("request is required")
+	}
+	if !strings.EqualFold(strings.TrimSpace(req.SourceRequestType), "responses") || len(bytes.TrimSpace(req.RawJSON)) == 0 {
+		return json.Marshal(unifiedToResponsesPayload(req))
+	}
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(req.RawJSON, &payload); err != nil {
+		return nil, fmt.Errorf("decode preserved responses request: %w", err)
+	}
+	if payload == nil {
+		return nil, fmt.Errorf("responses request must be a JSON object")
+	}
+
+	setRawJSONValue(payload, "model", req.Model)
+	setRawJSONPointerDefault(payload, "temperature", req.Temperature)
+	setRawJSONPointerDefault(payload, "top_p", req.TopP)
+	if req.Stream {
+		setRawJSONValue(payload, "stream", true)
+	}
+	if req.Store != nil {
+		setRawJSONValue(payload, "store", *req.Store)
 	}
 
 	return json.Marshal(payload)

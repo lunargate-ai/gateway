@@ -14,8 +14,16 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/lunargate-ai/gateway/internal/middleware"
+	"github.com/lunargate-ai/gateway/internal/security"
 	"github.com/lunargate-ai/gateway/pkg/models"
 	"github.com/rs/zerolog/log"
+)
+
+const (
+	responsesWebSocketWriteTimeout = 10 * time.Second
+	responsesWebSocketPongTimeout  = 60 * time.Second
+	responsesWebSocketPingInterval = 30 * time.Second
 )
 
 var responsesWebSocketUpgrader = websocket.Upgrader{
@@ -88,6 +96,8 @@ type responsesWebSocketSession struct {
 	cachedStates map[string]*responsesWebSocketCachedState
 }
 
+type responsesWebSocketMessagePolicy func(*http.Request) (*http.Request, *responsesWebSocketEventError)
+
 type responsesWebSocketProxy struct {
 	session           *responsesWebSocketSession
 	headers           http.Header
@@ -126,6 +136,16 @@ func (e *responsesWebSocketEventError) Error() string {
 }
 
 func (h *Handler) ResponsesWebSocket(w http.ResponseWriter, r *http.Request) {
+	h.responsesWebSocket(w, r, nil)
+}
+
+func (h *Handler) responsesWebSocketHandler(policy responsesWebSocketMessagePolicy) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		h.responsesWebSocket(w, r, policy)
+	}
+}
+
+func (h *Handler) responsesWebSocket(w http.ResponseWriter, r *http.Request, policy responsesWebSocketMessagePolicy) {
 	conn, err := responsesWebSocketUpgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Warn().Err(err).Msg("responses websocket upgrade failed")
@@ -134,6 +154,16 @@ func (h *Handler) ResponsesWebSocket(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close()
 
 	conn.SetReadLimit(maxRequestBodyBytes)
+	if err := conn.SetReadDeadline(time.Now().Add(responsesWebSocketPongTimeout)); err != nil {
+		log.Warn().Err(err).Msg("responses websocket read deadline setup failed")
+		return
+	}
+	conn.SetPongHandler(func(_ string) error {
+		return conn.SetReadDeadline(time.Now().Add(responsesWebSocketPongTimeout))
+	})
+	stopHeartbeat := startResponsesWebSocketHeartbeat(conn)
+	defer stopHeartbeat()
+
 	sessionID := strings.TrimSpace(r.Header.Get("x-lunargate-sessionid"))
 	if sessionID == "" {
 		sessionID = "wsresp_" + uuid.NewString()
@@ -156,11 +186,85 @@ func (h *Handler) ResponsesWebSocket(w http.ResponseWriter, r *http.Request) {
 		if msgType != websocket.TextMessage && msgType != websocket.BinaryMessage {
 			continue
 		}
+		if err := conn.SetReadDeadline(time.Now().Add(responsesWebSocketPongTimeout)); err != nil {
+			log.Warn().Err(err).Msg("responses websocket read deadline refresh failed")
+			return
+		}
 
-		if err := session.handleCreate(h, r, payload); err != nil {
+		messageReq := r
+		if policy != nil {
+			var policyErr *responsesWebSocketEventError
+			messageReq, policyErr = policy(r.Clone(r.Context()))
+			if policyErr != nil {
+				if err := session.writeErrorEvent(policyErr); err != nil {
+					log.Warn().Err(err).Msg("responses websocket policy error write failed")
+					return
+				}
+				continue
+			}
+		}
+
+		if err := session.handleCreate(h, messageReq, payload); err != nil {
 			log.Warn().Err(err).Msg("responses websocket request failed")
 			_ = session.writeErrorEvent(responsesWebSocketEventErrorFromError(err))
 		}
+	}
+}
+
+func newResponsesWebSocketMessagePolicy(
+	authManager *security.Manager,
+	rateLimiter *middleware.RateLimiter,
+) responsesWebSocketMessagePolicy {
+	return func(r *http.Request) (*http.Request, *responsesWebSocketEventError) {
+		recorder := newCapturedResponseWriter()
+		var accepted *http.Request
+		guarded := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			accepted = req
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		if rateLimiter != nil {
+			guarded = rateLimiter.Middleware(guarded)
+		}
+		if authManager != nil {
+			guarded = authManager.Middleware(guarded)
+		}
+
+		guarded.ServeHTTP(recorder, r)
+		if accepted != nil {
+			return accepted, nil
+		}
+
+		status := recorder.statusCode
+		if status == 0 {
+			status = http.StatusInternalServerError
+		}
+		return nil, parseResponsesHTTPError(status, recorder.body.Bytes())
+	}
+}
+
+func startResponsesWebSocketHeartbeat(conn *websocket.Conn) func() {
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(responsesWebSocketPingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				if err := conn.WriteControl(
+					websocket.PingMessage,
+					nil,
+					time.Now().Add(responsesWebSocketWriteTimeout),
+				); err != nil {
+					return
+				}
+			}
+		}
+	}()
+
+	return func() {
+		close(done)
 	}
 }
 
@@ -176,6 +280,10 @@ func isBenignResponsesWebSocketClose(err error) bool {
 			// Browser/CLI clients may disconnect TCP without sending a close frame.
 			// Gorilla surfaces this as 1006 + unexpected EOF, which is benign here.
 			closeErr.Code == websocket.CloseAbnormalClosure
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
 	}
 	return strings.Contains(strings.ToLower(err.Error()), "unexpected eof")
 }
@@ -427,7 +535,20 @@ func (p *responsesWebSocketProxy) processSSEFrame(frame string) (bool, error) {
 
 func (p *responsesWebSocketProxy) sendEvent(payload []byte) error {
 	p.captureEventState(payload)
-	return p.session.conn.WriteMessage(websocket.TextMessage, payload)
+	return p.session.writeMessage(websocket.TextMessage, payload)
+}
+
+func (s *responsesWebSocketSession) writeMessage(messageType int, payload []byte) error {
+	if s == nil || s.conn == nil {
+		return errors.New("websocket session is closed")
+	}
+	if err := s.conn.SetWriteDeadline(time.Now().Add(responsesWebSocketWriteTimeout)); err != nil {
+		return fmt.Errorf("failed to set websocket write deadline: %w", err)
+	}
+	if err := s.conn.WriteMessage(messageType, payload); err != nil {
+		return fmt.Errorf("failed to write websocket message: %w", err)
+	}
+	return nil
 }
 
 func (s *responsesWebSocketSession) writeErrorEvent(eventErr *responsesWebSocketEventError) error {
@@ -461,7 +582,7 @@ func (s *responsesWebSocketSession) writeErrorEvent(eventErr *responsesWebSocket
 	if err != nil {
 		return err
 	}
-	return s.conn.WriteMessage(websocket.TextMessage, b)
+	return s.writeMessage(websocket.TextMessage, b)
 }
 
 func parseResponsesHTTPError(status int, body []byte) *responsesWebSocketEventError {
@@ -596,7 +717,7 @@ func (s *responsesWebSocketSession) writeWarmupResponse(responseID string, model
 		if err != nil {
 			return err
 		}
-		if err := s.conn.WriteMessage(websocket.TextMessage, b); err != nil {
+		if err := s.writeMessage(websocket.TextMessage, b); err != nil {
 			return err
 		}
 	}

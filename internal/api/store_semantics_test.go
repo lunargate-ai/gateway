@@ -85,6 +85,32 @@ func TestMakeResponsesChatRequestDisablesReplayPolicies(t *testing.T) {
 	}
 }
 
+func TestMakeResponsesChatRequestPreservesResponsesEnvelope(t *testing.T) {
+	raw := json.RawMessage(`{"model":"gpt-5","input":"hello","metadata":{"trace":"abc"}}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	chatReq, err := makeResponsesChatRequest(req, &models.UnifiedRequest{
+		RawJSON:           raw,
+		SourceRequestType: "responses",
+		Model:             "gpt-5",
+		Messages:          []models.Message{{Role: "user", Content: "hello"}},
+	})
+	if err != nil {
+		t.Fatalf("makeResponsesChatRequest: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	_, parsed, ok := parseUnifiedRequest(recorder, chatReq, true)
+	if !ok {
+		t.Fatalf("parseUnifiedRequest failed: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if parsed.SourceRequestType != "responses" {
+		t.Fatalf("source request type = %q, want responses", parsed.SourceRequestType)
+	}
+	if string(parsed.RawJSON) != string(raw) {
+		t.Fatalf("raw envelope = %s, want %s", parsed.RawJSON, raw)
+	}
+}
+
 func newStoreSemanticsTestHandler(t *testing.T) (*Handler, *int, func()) {
 	t.Helper()
 	calls := 0

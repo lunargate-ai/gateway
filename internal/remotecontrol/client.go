@@ -50,10 +50,11 @@ type heartbeatMessage struct {
 }
 
 type sandboxExecuteMessage struct {
-	Type      string                 `json:"type"`
-	CommandID string                 `json:"command_id"`
-	Target    sandboxTarget          `json:"target"`
-	Request   map[string]interface{} `json:"request"`
+	Type        string                 `json:"type"`
+	CommandID   string                 `json:"command_id"`
+	Target      sandboxTarget          `json:"target"`
+	RequestType string                 `json:"request_type"`
+	Request     map[string]interface{} `json:"request"`
 }
 
 type sandboxTarget struct {
@@ -326,6 +327,11 @@ func (c *Client) sendSandboxError(writeJSON func(interface{}) error, commandID s
 }
 
 func (c *Client) executeSandbox(ctx context.Context, msg sandboxExecuteMessage) (int, map[string]string, interface{}, error) {
+	endpointPath, err := sandboxEndpointPath(msg.RequestType)
+	if err != nil {
+		return http.StatusBadRequest, map[string]string{}, nil, err
+	}
+
 	requestPayload := make(map[string]interface{}, len(msg.Request))
 	for key, value := range msg.Request {
 		requestPayload[key] = value
@@ -337,7 +343,7 @@ func (c *Client) executeSandbox(ctx context.Context, msg sandboxExecuteMessage) 
 	if err != nil {
 		return 0, map[string]string{}, nil, fmt.Errorf("failed to encode request body: %w", err)
 	}
-	endpoint := c.localBaseURL + "/v1/chat/completions"
+	endpoint := c.localBaseURL + endpointPath
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return 0, map[string]string{}, nil, fmt.Errorf("failed to create local sandbox request: %w", err)
@@ -363,6 +369,23 @@ func (c *Client) executeSandbox(ctx context.Context, msg sandboxExecuteMessage) 
 	}
 	parsedBody := parseBody(respBytes)
 	return resp.StatusCode, collectHeaders(resp.Header), parsedBody, nil
+}
+
+func sandboxEndpointPath(requestType string) (string, error) {
+	normalized := strings.ToLower(strings.TrimSpace(requestType))
+	switch normalized {
+	case "", "chat", "chat_completions":
+		return "/v1/chat/completions", nil
+	case "responses":
+		return "/v1/responses", nil
+	case "embeddings":
+		return "/v1/embeddings", nil
+	default:
+		return "", fmt.Errorf(
+			"unsupported sandbox request_type %q: expected chat_completions, responses, or embeddings",
+			requestType,
+		)
+	}
 }
 
 func (c *Client) buildHello(ctx context.Context) helloMessage {

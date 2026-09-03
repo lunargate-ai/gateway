@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"sync"
 	"time"
 
@@ -23,17 +24,11 @@ func NewCircuitBreakerManager() *CircuitBreakerManager {
 	return &CircuitBreakerManager{
 		breakers: make(map[string]*gobreaker.CircuitBreaker),
 		settings: gobreaker.Settings{
-			Timeout:    30 * time.Second,
-			Interval:   60 * time.Second,
+			Timeout:     30 * time.Second,
+			Interval:    60 * time.Second,
 			MaxRequests: 3,
 			IsSuccessful: func(err error) bool {
-				if err == nil {
-					return true
-				}
-				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-					return true
-				}
-				return false
+				return isCircuitBreakerSuccess(err)
 			},
 			ReadyToTrip: func(counts gobreaker.Counts) bool {
 				return counts.ConsecutiveFailures >= 5
@@ -47,6 +42,23 @@ func NewCircuitBreakerManager() *CircuitBreakerManager {
 			},
 		},
 	}
+}
+
+func isCircuitBreakerSuccess(err error) bool {
+	if err == nil || IsRequestError(err) {
+		return true
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+
+	var statusErr *RetryableStatusError
+	if errors.As(err, &statusErr) && statusErr.StatusCode >= http.StatusBadRequest && statusErr.StatusCode < http.StatusInternalServerError {
+		// Client errors, including configured 429 retry exhaustion, do not
+		// indicate a broken provider and must not trip its circuit.
+		return true
+	}
+	return false
 }
 
 // Get returns (or creates) the circuit breaker for a given provider.

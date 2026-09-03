@@ -112,23 +112,26 @@ func TestResponsesStreamProxy_ToolCallIDsStayStableAcrossCallAndFC(t *testing.T)
 	}
 }
 
-func TestResponsesStreamProxy_MergeTextDelta_DeduplicatesDoneSnapshots(t *testing.T) {
+func TestResponsesStreamProxy_MergeTextDelta_PreservesRepeatedDeltas(t *testing.T) {
 	proxy := newResponsesStreamProxy(httptest.NewRecorder())
 
-	if got := proxy.mergeTextDelta("Hello"); got != "Hello" {
+	if got := proxy.mergeTextDelta("ha"); got != "ha" {
 		t.Fatalf("expected first delta to pass through, got %q", got)
 	}
-	if got := proxy.mergeTextDelta("Hello"); got != "" {
-		t.Fatalf("expected exact duplicate to be dropped, got %q", got)
+	if got := proxy.mergeTextDelta("ha"); got != "ha" {
+		t.Fatalf("expected repeated delta to pass through, got %q", got)
 	}
-	if got := proxy.mergeTextDelta("Hello world"); got != " world" {
-		t.Fatalf("expected snapshot delta tail, got %q", got)
+	if got := proxy.mergeReasoningDelta("think"); got != "think" {
+		t.Fatalf("expected first reasoning delta to pass through, got %q", got)
 	}
-	if got := proxy.mergeTextDelta(" world"); got != "" {
-		t.Fatalf("expected overlapping suffix to be dropped, got %q", got)
+	if got := proxy.mergeReasoningDelta("think"); got != "think" {
+		t.Fatalf("expected repeated reasoning delta to pass through, got %q", got)
 	}
-	if final := proxy.text.String(); final != "Hello world" {
-		t.Fatalf("expected merged text to be %q, got %q", "Hello world", final)
+	if final := proxy.text.String(); final != "haha" {
+		t.Fatalf("expected merged text to be %q, got %q", "haha", final)
+	}
+	if final := proxy.reasoningText.String(); final != "thinkthink" {
+		t.Fatalf("expected merged reasoning to be %q, got %q", "thinkthink", final)
 	}
 }
 

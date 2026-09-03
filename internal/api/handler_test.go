@@ -1419,3 +1419,82 @@ func TestChatCompletions_UpstreamRequestTypeResponses_UsesResponsesEndpoint(t *t
 		t.Fatalf("expected responses upstream tool_choice=auto to be preserved, got %q", choice)
 	}
 }
+
+func TestResponses_NativeResponsesStreamPreservesRepeatedDeltasWithoutSnapshots(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			t.Fatalf("expected upstream path /v1/responses, got %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		events := []string{
+			`{"type":"response.created","response":{"id":"resp_native","object":"response","created_at":123,"status":"in_progress","model":"gpt-native","output":[]}}`,
+			`{"type":"response.output_text.delta","response_id":"resp_native","item_id":"msg_native","output_index":0,"content_index":0,"delta":"ha"}`,
+			`{"type":"response.output_text.delta","response_id":"resp_native","item_id":"msg_native","output_index":0,"content_index":0,"delta":"ha"}`,
+			`{"type":"response.output_text.done","response_id":"resp_native","item_id":"msg_native","output_index":0,"content_index":0,"text":"haha"}`,
+			`{"type":"response.content_part.done","response_id":"resp_native","item_id":"msg_native","output_index":0,"content_index":0,"part":{"type":"output_text","text":"haha"}}`,
+			`{"type":"response.output_item.done","response_id":"resp_native","output_index":0,"item":{"id":"msg_native","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"haha"}]}}`,
+			`{"type":"response.completed","response":{"id":"resp_native","object":"response","created_at":123,"status":"completed","model":"gpt-native","output":[{"id":"msg_native","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"haha"}]}],"output_text":"haha","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`,
+		}
+		for _, event := range events {
+			_, _ = w.Write([]byte("data: " + event + "\n\n"))
+		}
+	}))
+	defer upstream.Close()
+
+	providerID := "openai"
+	reg := providers.NewRegistry(map[string]config.ProviderConfig{
+		providerID: {Type: "openai", APIKey: "dummy", BaseURL: upstream.URL + "/v1"},
+	})
+	router := routing.NewEngine(config.RoutingConfig{
+		DefaultStrategy: "weighted",
+		Routes: []config.RouteConfig{{
+			Name:  "native-responses-stream",
+			Match: config.MatchConfig{Path: "/v1/responses"},
+			Targets: []config.TargetConfig{{
+				Provider:            providerID,
+				Model:               "gpt-native",
+				Weight:              1,
+				UpstreamRequestType: "responses",
+			}},
+		}},
+	})
+	retrier := resilience.NewRetrier(config.RetryConfig{Enabled: false})
+	cbm := resilience.NewCircuitBreakerManager()
+	fb := resilience.NewFallbackExecutor(retrier, cbm)
+	cache := middleware.NewCache(config.CacheConfig{Enabled: false})
+	streamer := streaming.NewHandler()
+	metrics := observability.NewMetricsWithRegisterer(prometheus.NewRegistry())
+	h := NewHandler(reg, router, fb, cache, streamer, metrics, nil, nil, nil)
+
+	payload := []byte(`{"model":"lunargate/auto","stream":true,"input":"laugh"}`)
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/v1/responses", bytes.NewReader(payload))
+	rec := httptest.NewRecorder()
+	h.Responses(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	events := decodeSSEEvents(t, rec.Body.String())
+	var deltas []string
+	var completed map[string]interface{}
+	for _, event := range events {
+		switch event["type"] {
+		case "response.output_text.delta":
+			if delta, _ := event["delta"].(string); delta != "" {
+				deltas = append(deltas, delta)
+			}
+		case "response.completed":
+			completed, _ = event["response"].(map[string]interface{})
+		}
+	}
+	if len(deltas) != 2 || deltas[0] != "ha" || deltas[1] != "ha" {
+		t.Fatalf("text deltas = %#v, want two repeated true deltas", deltas)
+	}
+	if completed == nil || completed["output_text"] != "haha" {
+		t.Fatalf("completed response = %#v, want output_text haha", completed)
+	}
+	usage, _ := completed["usage"].(map[string]interface{})
+	if usage == nil || usage["input_tokens"] != float64(3) || usage["output_tokens"] != float64(2) {
+		t.Fatalf("completed usage = %#v", usage)
+	}
+}

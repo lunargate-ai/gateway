@@ -17,6 +17,12 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+const (
+	defaultCollectorQueueCapacity   = 1000
+	defaultCollectorMaxPayloadBytes = 16 << 20
+	defaultCollectorMaxQueueBytes   = 64 << 20
+)
+
 type Event struct {
 	Type string      `json:"type"`
 	Data interface{} `json:"data"`
@@ -34,6 +40,7 @@ type MetricEventData struct {
 	RequestID            string            `json:"request_id"`
 	Timestamp            time.Time         `json:"timestamp"`
 	RequestType          string            `json:"request_type,omitempty"`
+	UpstreamRequestType  string            `json:"upstream_request_type,omitempty"`
 	DurationMS           int64             `json:"duration_ms"`
 	GatewayPreUpstreamMS *int64            `json:"gateway_pre_upstream_ms,omitempty"`
 	TtftMS               *int64            `json:"ttft_ms,omitempty"`
@@ -66,32 +73,44 @@ type TraceEventData struct {
 }
 
 type RequestLogEventData struct {
-	RequestID    string            `json:"request_id"`
-	Timestamp    time.Time         `json:"timestamp"`
-	GatewayID    string            `json:"gateway_id,omitempty"`
-	RequestType  string            `json:"request_type,omitempty"`
-	User         *string           `json:"user,omitempty"`
-	SessionID    *string           `json:"session_id,omitempty"`
-	Provider     string            `json:"provider"`
-	Model        string            `json:"model"`
-	StatusCode   int               `json:"status_code"`
-	DurationMS   int64             `json:"duration_ms"`
-	RouteUsed    *string           `json:"route_used,omitempty"`
-	CacheHit     bool              `json:"cache_hit"`
-	FallbackUsed bool              `json:"fallback_used"`
-	RetryCount   int               `json:"retry_count"`
-	ErrorCode    *string           `json:"error_code,omitempty"`
-	ErrorMessage *string           `json:"error_message,omitempty"`
-	Tags         map[string]string `json:"tags,omitempty"`
-	Request      interface{}       `json:"request,omitempty"`
-	Response     interface{}       `json:"response,omitempty"`
+	RequestID           string            `json:"request_id"`
+	Timestamp           time.Time         `json:"timestamp"`
+	GatewayID           string            `json:"gateway_id,omitempty"`
+	RequestType         string            `json:"request_type,omitempty"`
+	UpstreamRequestType string            `json:"upstream_request_type,omitempty"`
+	User                *string           `json:"user,omitempty"`
+	SessionID           *string           `json:"session_id,omitempty"`
+	Provider            string            `json:"provider"`
+	Model               string            `json:"model"`
+	StatusCode          int               `json:"status_code"`
+	DurationMS          int64             `json:"duration_ms"`
+	RouteUsed           *string           `json:"route_used,omitempty"`
+	CacheHit            bool              `json:"cache_hit"`
+	FallbackUsed        bool              `json:"fallback_used"`
+	RetryCount          int               `json:"retry_count"`
+	ErrorCode           *string           `json:"error_code,omitempty"`
+	ErrorMessage        *string           `json:"error_message,omitempty"`
+	Tags                map[string]string `json:"tags,omitempty"`
+	Request             interface{}       `json:"request,omitempty"`
+	Response            interface{}       `json:"response,omitempty"`
 }
 
 type collectorItem struct {
-	requestID string
-	payload   []byte
-	identity  collectorIdentity
+	requestID     string
+	payload       []byte
+	identity      collectorIdentity
+	accountedSize int64
 }
+
+type collectorEnqueueStatus uint8
+
+const (
+	collectorEnqueueAccepted collectorEnqueueStatus = iota
+	collectorEnqueueStopped
+	collectorEnqueuePayloadTooLarge
+	collectorEnqueueBudgetExceeded
+	collectorEnqueueQueueFull
+)
 
 type collectorIdentity struct {
 	backendURL string
@@ -111,16 +130,20 @@ type collectorRuntimeConfig struct {
 type CollectorClient struct {
 	gatewayVersion string
 
-	httpClient *http.Client
-	queue      chan collectorItem
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
-	stopOnce   sync.Once
-	mu         sync.RWMutex
-	cfg        collectorRuntimeConfig
-	lastLogKey string
-	lastLogAt  time.Time
+	httpClient      *http.Client
+	queue           chan collectorItem
+	ctx             context.Context
+	cancel          context.CancelFunc
+	wg              sync.WaitGroup
+	stopOnce        sync.Once
+	mu              sync.RWMutex
+	cfg             collectorRuntimeConfig
+	queueMu         sync.Mutex
+	queueBytes      int64
+	maxPayloadBytes int64
+	maxQueueBytes   int64
+	lastLogKey      string
+	lastLogAt       time.Time
 }
 
 func NewCollectorClient(general config.GeneralConfig, cfg config.DataSharingConfig, gatewayVersion string) *CollectorClient {
@@ -130,10 +153,12 @@ func NewCollectorClient(general config.GeneralConfig, cfg config.DataSharingConf
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
-		queue:  make(chan collectorItem, 1000),
-		ctx:    ctx,
-		cancel: cancel,
-		cfg:    normalizeCollectorConfig(general, cfg),
+		queue:           make(chan collectorItem, defaultCollectorQueueCapacity),
+		ctx:             ctx,
+		cancel:          cancel,
+		cfg:             normalizeCollectorConfig(general, cfg),
+		maxPayloadBytes: defaultCollectorMaxPayloadBytes,
+		maxQueueBytes:   defaultCollectorMaxQueueBytes,
 	}
 
 	c.wg.Add(1)
@@ -240,12 +265,101 @@ func (c *CollectorClient) Enqueue(ctx context.Context, requestID string, events 
 			apiKey:     cfg.apiKey,
 		},
 	}
-	select {
-	case <-c.ctx.Done():
+	status, queuedBytes := c.tryEnqueue(item)
+	switch status {
+	case collectorEnqueueAccepted, collectorEnqueueStopped:
 		return
-	case c.queue <- item:
-	default:
+	case collectorEnqueuePayloadTooLarge:
+		log.Warn().
+			Str("request_id", requestID).
+			Int("payload_bytes", len(b)).
+			Int64("max_payload_bytes", c.payloadByteLimit()).
+			Msg("collector payload too large, dropping event")
+	case collectorEnqueueBudgetExceeded:
+		log.Warn().
+			Str("request_id", requestID).
+			Int("payload_bytes", len(b)).
+			Int64("queued_bytes", queuedBytes).
+			Int64("max_queue_bytes", c.queueByteLimit()).
+			Msg("collector queue byte limit reached, dropping event")
+	case collectorEnqueueQueueFull:
 		log.Warn().Str("request_id", requestID).Msg("collector queue full, dropping event")
+	}
+}
+
+func (c *CollectorClient) tryEnqueue(item collectorItem) (collectorEnqueueStatus, int64) {
+	payloadBytes := int64(len(item.payload))
+	if payloadBytes > c.payloadByteLimit() {
+		return collectorEnqueuePayloadTooLarge, c.queuedPayloadBytes()
+	}
+
+	c.queueMu.Lock()
+	defer c.queueMu.Unlock()
+
+	if c.ctx != nil && c.ctx.Err() != nil {
+		return collectorEnqueueStopped, c.queueBytes
+	}
+	queueLimit := c.queueByteLimit()
+	if payloadBytes > queueLimit || c.queueBytes > queueLimit-payloadBytes {
+		return collectorEnqueueBudgetExceeded, c.queueBytes
+	}
+
+	item.accountedSize = payloadBytes
+	select {
+	case c.queue <- item:
+		c.queueBytes += payloadBytes
+		return collectorEnqueueAccepted, c.queueBytes
+	default:
+		return collectorEnqueueQueueFull, c.queueBytes
+	}
+}
+
+func (c *CollectorClient) payloadByteLimit() int64 {
+	if c.maxPayloadBytes > 0 {
+		return c.maxPayloadBytes
+	}
+	return defaultCollectorMaxPayloadBytes
+}
+
+func (c *CollectorClient) queueByteLimit() int64 {
+	if c.maxQueueBytes > 0 {
+		return c.maxQueueBytes
+	}
+	return defaultCollectorMaxQueueBytes
+}
+
+func (c *CollectorClient) queuedPayloadBytes() int64 {
+	c.queueMu.Lock()
+	defer c.queueMu.Unlock()
+	return c.queueBytes
+}
+
+func (c *CollectorClient) releaseQueuedPayload(item collectorItem) {
+	if item.accountedSize <= 0 {
+		return
+	}
+	c.queueMu.Lock()
+	c.queueBytes -= item.accountedSize
+	if c.queueBytes < 0 {
+		c.queueBytes = 0
+	}
+	c.queueMu.Unlock()
+}
+
+func (c *CollectorClient) drainQueue() {
+	c.queueMu.Lock()
+	defer c.queueMu.Unlock()
+
+	for {
+		select {
+		case item := <-c.queue:
+			c.queueBytes -= item.accountedSize
+		default:
+			if c.queueBytes < 0 {
+				c.queueBytes = 0
+			}
+			return
+		}
 	}
 }
 
@@ -257,6 +371,7 @@ func (c *CollectorClient) Stop() {
 	c.stopOnce.Do(func() {
 		c.cancel()
 		c.wg.Wait()
+		c.drainQueue()
 	})
 }
 
@@ -267,6 +382,7 @@ func (c *CollectorClient) worker() {
 		case <-c.ctx.Done():
 			return
 		case item := <-c.queue:
+			c.releaseQueuedPayload(item)
 			c.sendWithRetry(c.ctx, item)
 		}
 	}

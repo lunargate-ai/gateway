@@ -28,10 +28,25 @@ func NewRouter(handler *Handler, authManager *security.Manager, rateLimiter *mid
 		if authManager != nil {
 			r.Use(authManager.Middleware)
 		}
-		r.Use(rateLimiter.Middleware)
+		if rateLimiter != nil {
+			r.Use(rateLimiter.Middleware)
+		}
+
+		messagePolicy := newResponsesWebSocketMessagePolicy(authManager, rateLimiter)
 		r.Post("/chat/completions", handler.ChatCompletions)
 		r.Post("/responses", handler.Responses)
-		r.Get("/responses", handler.ResponsesWebSocket)
+		r.Get("/responses", handler.responsesWebSocketHandler(messagePolicy))
+		r.Get("/responses/{response_id}", handler.RetrieveResponse)
+		r.Delete("/responses/{response_id}", handler.DeleteResponse)
+		r.Get("/responses/{response_id}/input_items", handler.ListResponseInputItems)
+		r.Post("/conversations", handler.CreateConversation)
+		r.Get("/conversations/{conversation_id}", handler.GetConversation)
+		r.Post("/conversations/{conversation_id}", handler.UpdateConversation)
+		r.Delete("/conversations/{conversation_id}", handler.DeleteConversation)
+		r.Post("/conversations/{conversation_id}/items", handler.CreateConversationItems)
+		r.Get("/conversations/{conversation_id}/items", handler.ListConversationItems)
+		r.Get("/conversations/{conversation_id}/items/{item_id}", handler.GetConversationItem)
+		r.Delete("/conversations/{conversation_id}/items/{item_id}", handler.DeleteConversationItem)
 		r.Post("/embeddings", handler.Embeddings)
 		r.Get("/models", handler.ListModels)
 		r.Get("/models/{model}", handler.GetModel)

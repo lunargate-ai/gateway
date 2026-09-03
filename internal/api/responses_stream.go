@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/lunargate-ai/gateway/internal/streaming"
 	"github.com/lunargate-ai/gateway/pkg/models"
 	"github.com/rs/zerolog/log"
 )
@@ -38,6 +39,7 @@ type responsesStreamProxy struct {
 	reasoningStarted bool
 	completed        bool
 	streamErr        error
+	incompleteReason string
 	eventSeq         int
 
 	nextOutputIndex      int
@@ -137,7 +139,7 @@ func (p *responsesStreamProxy) finalize() error {
 	}
 
 	if !p.completed {
-		return p.emitCompleted()
+		return p.emitFailed(streaming.ErrUpstreamStreamIncomplete)
 	}
 	return nil
 }
@@ -294,7 +296,7 @@ func (p *responsesStreamProxy) processFrame(frame string) error {
 		}
 		if payload == "[DONE]" {
 			if !p.completed {
-				return p.emitCompleted()
+				return p.emitTerminal()
 			}
 			return nil
 		}
@@ -320,6 +322,7 @@ func (p *responsesStreamProxy) processFrame(frame string) error {
 		}
 
 		for _, c := range chunk.Choices {
+			p.recordFinishReason(c.FinishReason)
 			if c.Delta == nil {
 				continue
 			}
@@ -375,6 +378,19 @@ func (p *responsesStreamProxy) processFrame(frame string) error {
 	return nil
 }
 
+func (p *responsesStreamProxy) recordFinishReason(finishReason *string) {
+	if finishReason == nil {
+		return
+	}
+	mapped := models.ResponsesIncompleteReasonForFinishReason(*finishReason)
+	if mapped == "" {
+		return
+	}
+	if p.incompleteReason == "" || mapped == models.ResponsesIncompleteReasonContentFilter {
+		p.incompleteReason = mapped
+	}
+}
+
 func (p *responsesStreamProxy) mergeUsage(update *models.Usage) {
 	if update == nil {
 		return
@@ -400,27 +416,6 @@ func (p *responsesStreamProxy) mergeTextDelta(delta string) string {
 	if delta == "" {
 		return ""
 	}
-
-	current := p.text.String()
-	if current == "" {
-		p.text.WriteString(delta)
-		return delta
-	}
-
-	// Some providers emit final text snapshots in *.done events.
-	// Convert snapshot updates to true deltas and drop exact duplicates.
-	if delta == current || strings.HasSuffix(current, delta) {
-		return ""
-	}
-	if strings.HasPrefix(delta, current) {
-		tail := strings.TrimPrefix(delta, current)
-		if tail == "" {
-			return ""
-		}
-		p.text.WriteString(tail)
-		return tail
-	}
-
 	p.text.WriteString(delta)
 	return delta
 }
@@ -429,26 +424,6 @@ func (p *responsesStreamProxy) mergeReasoningDelta(delta string) string {
 	if delta == "" {
 		return ""
 	}
-
-	current := p.reasoningText.String()
-	if current == "" {
-		p.reasoningText.WriteString(delta)
-		return delta
-	}
-
-	// Some providers emit cumulative snapshots for reasoning summaries.
-	if delta == current || strings.HasSuffix(current, delta) {
-		return ""
-	}
-	if strings.HasPrefix(delta, current) {
-		tail := strings.TrimPrefix(delta, current)
-		if tail == "" {
-			return ""
-		}
-		p.reasoningText.WriteString(tail)
-		return tail
-	}
-
 	p.reasoningText.WriteString(delta)
 	return delta
 }
@@ -571,6 +546,17 @@ func (p *responsesStreamProxy) ensureMessageStarted() error {
 }
 
 func (p *responsesStreamProxy) emitCompleted() error {
+	return p.emitFinal("completed", "response.completed", "")
+}
+
+func (p *responsesStreamProxy) emitTerminal() error {
+	if p.incompleteReason != "" {
+		return p.emitFinal("incomplete", "response.incomplete", p.incompleteReason)
+	}
+	return p.emitCompleted()
+}
+
+func (p *responsesStreamProxy) emitFinal(status, eventType, incompleteReason string) error {
 	if p.completed {
 		return nil
 	}
@@ -617,7 +603,7 @@ func (p *responsesStreamProxy) emitCompleted() error {
 			"id":     p.itemID,
 			"type":   "message",
 			"role":   "assistant",
-			"status": "completed",
+			"status": status,
 			"content": []map[string]interface{}{
 				{
 					"type": "output_text",
@@ -668,7 +654,7 @@ func (p *responsesStreamProxy) emitCompleted() error {
 		reasoningItem := map[string]interface{}{
 			"id":     p.reasoningItemID,
 			"type":   "reasoning",
-			"status": "completed",
+			"status": status,
 			"summary": []map[string]interface{}{
 				{
 					"type": "summary_text",
@@ -727,7 +713,7 @@ func (p *responsesStreamProxy) emitCompleted() error {
 		fcItem := map[string]interface{}{
 			"id":        st.ItemID,
 			"type":      "function_call",
-			"status":    "completed",
+			"status":    status,
 			"call_id":   st.CallID,
 			"name":      st.Name,
 			"arguments": st.Arguments,
@@ -767,7 +753,7 @@ func (p *responsesStreamProxy) emitCompleted() error {
 		"id":          p.responseID,
 		"object":      "response",
 		"created_at":  p.created,
-		"status":      "completed",
+		"status":      status,
 		"model":       p.model,
 		"output_text": text,
 		"output":      outputItems,
@@ -790,6 +776,11 @@ func (p *responsesStreamProxy) emitCompleted() error {
 			},
 		}
 	}
+	if incompleteReason != "" {
+		resp["incomplete_details"] = map[string]interface{}{
+			"reason": incompleteReason,
+		}
+	}
 
 	if p.responseID == "" {
 		resp["id"] = responsesFallbackResponseID
@@ -797,10 +788,12 @@ func (p *responsesStreamProxy) emitCompleted() error {
 	if p.model == "" {
 		resp["model"] = responsesFallbackModel
 	}
-	p.completedResponse = resp
+	if status == "completed" {
+		p.completedResponse = resp
+	}
 
 	if err := p.writeEvent(map[string]interface{}{
-		"type":     "response.completed",
+		"type":     eventType,
 		"response": resp,
 	}); err != nil {
 		return err

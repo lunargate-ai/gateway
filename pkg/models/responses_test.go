@@ -54,6 +54,29 @@ func TestResponsesToUnifiedRequest_MapsTopLevelFunctionTool(t *testing.T) {
 	}
 }
 
+func TestResponsesToUnifiedRequest_PreservesSourceEnvelope(t *testing.T) {
+	raw := []byte(`{"model":"gpt-5","input":"hello","metadata":{"trace":"abc"},"include":["reasoning.encrypted_content"]}`)
+	unified, err := ResponsesToUnifiedRequest(&ResponsesRequest{
+		RawJSON: raw,
+		Model:   "gpt-5",
+		Input:   "hello",
+	})
+	if err != nil {
+		t.Fatalf("ResponsesToUnifiedRequest returned error: %v", err)
+	}
+	if unified.SourceRequestType != "responses" {
+		t.Fatalf("source request type = %q, want responses", unified.SourceRequestType)
+	}
+	if string(unified.RawJSON) != string(raw) {
+		t.Fatalf("raw envelope = %s, want %s", unified.RawJSON, raw)
+	}
+
+	raw[0] = '['
+	if unified.RawJSON[0] != '{' {
+		t.Fatal("raw envelope aliases caller-owned memory")
+	}
+}
+
 func TestResponsesToUnifiedRequest_RejectsFunctionToolWithoutName(t *testing.T) {
 	req := &ResponsesRequest{
 		Model: "lunargate/auto",

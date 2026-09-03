@@ -15,11 +15,13 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/lunargate-ai/gateway/internal/config"
+	"github.com/lunargate-ai/gateway/internal/health"
 	"github.com/lunargate-ai/gateway/internal/middleware"
 	"github.com/lunargate-ai/gateway/internal/observability"
 	"github.com/lunargate-ai/gateway/internal/providers"
 	"github.com/lunargate-ai/gateway/internal/resilience"
 	"github.com/lunargate-ai/gateway/internal/routing"
+	"github.com/lunargate-ai/gateway/internal/security"
 	"github.com/lunargate-ai/gateway/internal/streaming"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -144,6 +146,106 @@ func TestCheckResponsesWebSocketOrigin_NormalizesDefaultPorts(t *testing.T) {
 
 	if !checkResponsesWebSocketOrigin(req) {
 		t.Fatal("expected equivalent default port and case-insensitive host to be accepted")
+	}
+}
+
+func TestResponsesWebSocket_RechecksAuthenticationAfterConfigReload(t *testing.T) {
+	h := &Handler{}
+	authManager, err := security.NewManager(responsesWebSocketSecurityConfig("old-key"))
+	if err != nil {
+		t.Fatalf("failed to create auth manager: %v", err)
+	}
+	rateLimiter := middleware.NewRateLimiter(config.RateLimitConfig{Enabled: false})
+	router := NewRouter(h, authManager, rateLimiter, health.NewChecker("test"))
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	headers := make(http.Header)
+	headers.Set("Authorization", "Bearer old-key")
+	conn := mustDialResponsesWebSocketWithHeaders(t, server.URL, headers)
+	defer conn.Close()
+
+	sendResponsesWebSocketJSON(t, conn, responsesWebSocketWarmupPayload())
+	firstEvents := readResponsesWebSocketEventsUntilTerminal(t, conn)
+	if !hasResponsesWebSocketEventType(firstEvents, "response.completed") {
+		t.Fatalf("first request did not complete: %v", eventTypes(firstEvents))
+	}
+
+	if err := authManager.UpdateConfig(responsesWebSocketSecurityConfig("new-key")); err != nil {
+		t.Fatalf("failed to reload auth config: %v", err)
+	}
+	sendResponsesWebSocketJSON(t, conn, responsesWebSocketWarmupPayload())
+	event := readResponsesWebSocketEvent(t, conn)
+	if got, _ := event["type"].(string); got != "error" {
+		t.Fatalf("revoked credential event type = %q, want error", got)
+	}
+	if status, _ := event["status"].(float64); int(status) != http.StatusUnauthorized {
+		t.Fatalf("revoked credential status = %v, want %d", event["status"], http.StatusUnauthorized)
+	}
+	errObj, _ := event["error"].(map[string]interface{})
+	if got, _ := errObj["type"].(string); got != "invalid_api_key" {
+		t.Fatalf("revoked credential error type = %q, want invalid_api_key", got)
+	}
+}
+
+func TestResponsesWebSocket_AppliesReloadedRateLimitPerMessage(t *testing.T) {
+	h := &Handler{}
+	authManager, err := security.NewManager(config.SecurityConfig{Enabled: false})
+	if err != nil {
+		t.Fatalf("failed to create auth manager: %v", err)
+	}
+	rateLimiter := middleware.NewRateLimiter(config.RateLimitConfig{Enabled: false})
+	router := NewRouter(h, authManager, rateLimiter, health.NewChecker("test"))
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	conn := mustDialResponsesWebSocket(t, server.URL)
+	defer conn.Close()
+
+	rateLimiter.UpdateConfig(config.RateLimitConfig{
+		Enabled:           true,
+		RequestsPerMinute: 1,
+		BurstSize:         1,
+	})
+	sendResponsesWebSocketJSON(t, conn, responsesWebSocketWarmupPayload())
+	firstEvents := readResponsesWebSocketEventsUntilTerminal(t, conn)
+	if !hasResponsesWebSocketEventType(firstEvents, "response.completed") {
+		t.Fatalf("first rate-limited request did not complete: %v", eventTypes(firstEvents))
+	}
+
+	sendResponsesWebSocketJSON(t, conn, responsesWebSocketWarmupPayload())
+	event := readResponsesWebSocketEvent(t, conn)
+	if got, _ := event["type"].(string); got != "error" {
+		t.Fatalf("rate-limited event type = %q, want error", got)
+	}
+	if status, _ := event["status"].(float64); int(status) != http.StatusTooManyRequests {
+		t.Fatalf("rate-limited status = %v, want %d", event["status"], http.StatusTooManyRequests)
+	}
+	errObj, _ := event["error"].(map[string]interface{})
+	if got, _ := errObj["code"].(string); got != "rate_limit_exceeded" {
+		t.Fatalf("rate-limited error code = %q, want rate_limit_exceeded", got)
+	}
+}
+
+func responsesWebSocketSecurityConfig(key string) config.SecurityConfig {
+	return config.SecurityConfig{
+		Enabled:  true,
+		Provider: "api_key",
+		APIKey: config.APIKeyAuthConfig{
+			Header: "Authorization",
+			Prefix: "Bearer",
+			Keys: []config.APIKeyCredential{
+				{Name: "websocket-test", Value: key},
+			},
+		},
+	}
+}
+
+func responsesWebSocketWarmupPayload() map[string]interface{} {
+	return map[string]interface{}{
+		"type":     "response.create",
+		"model":    "mock-gpt",
+		"generate": false,
 	}
 }
 
@@ -599,9 +701,13 @@ func newResponsesWebSocketTestHandler(upstreamURL string) *Handler {
 }
 
 func mustDialResponsesWebSocket(t *testing.T, serverURL string) *websocket.Conn {
+	return mustDialResponsesWebSocketWithHeaders(t, serverURL, nil)
+}
+
+func mustDialResponsesWebSocketWithHeaders(t *testing.T, serverURL string, headers http.Header) *websocket.Conn {
 	t.Helper()
 	wsURL := "ws" + strings.TrimPrefix(serverURL, "http") + "/v1/responses"
-	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, headers)
 	if err != nil {
 		statusCode := 0
 		if resp != nil {

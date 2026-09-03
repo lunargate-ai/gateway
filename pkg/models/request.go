@@ -14,7 +14,11 @@ type UnifiedRequest struct {
 	// RawJSON preserves the complete client document for native-compatible
 	// forwarding and exact cache semantics. It is never serialized by the
 	// typed compatibility model itself.
-	RawJSON            json.RawMessage `json:"-"`
+	RawJSON json.RawMessage `json:"-"`
+	// SourceRequestType identifies the client API contract represented by
+	// RawJSON. Translators must only replay RawJSON when the upstream contract
+	// matches this value.
+	SourceRequestType  string          `json:"-"`
 	Model              string          `json:"model"`
 	Messages           []Message       `json:"messages"`
 	Temperature        *float64        `json:"temperature,omitempty"`

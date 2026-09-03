@@ -17,6 +17,7 @@ import (
 	"github.com/lunargate-ai/gateway/internal/modelid"
 	"github.com/lunargate-ai/gateway/internal/observability"
 	"github.com/lunargate-ai/gateway/internal/providers"
+	"github.com/lunargate-ai/gateway/internal/resilience"
 	"github.com/lunargate-ai/gateway/internal/routing"
 	"github.com/lunargate-ai/gateway/pkg/models"
 	"github.com/rs/zerolog/log"
@@ -57,15 +58,6 @@ func parseEmbeddingsRequest(w http.ResponseWriter, r *http.Request, captureBody 
 		return nil, &req, true
 	}
 	return body, &req, true
-}
-
-func cloneTagsWithRequestType(tags map[string]string, requestType string) map[string]string {
-	out := make(map[string]string, len(tags)+1)
-	for k, v := range tags {
-		out[k] = v
-	}
-	out["x-lunargate-request-type"] = requestType
-	return out
 }
 
 func extractUserAndSession(headers map[string]string) (*string, *string) {
@@ -119,6 +111,53 @@ func (h *Handler) resolveEmbeddingsRoute(ctx context.Context, path string, heade
 	}, nil
 }
 
+func (h *Handler) validateEmbeddingsCompatibility(target routing.Target, req *models.EmbeddingsRequest) error {
+	if h == nil || h.registry == nil || req == nil {
+		return nil
+	}
+	format := strings.ToLower(strings.TrimSpace(req.EncodingFormat))
+	switch format {
+	case "", "float":
+		return nil
+	case "base64":
+		capabilities, ok := h.registry.Capabilities(target.Provider)
+		providerType, typeOK := h.registry.Type(target.Provider)
+		if ok && typeOK && capabilities.EmbeddingsBase64 && strings.EqualFold(providerType, "openai") {
+			return nil
+		}
+		return &models.CompatibilityError{
+			Field:    "encoding_format",
+			Provider: target.Provider,
+			Reason:   "base64 embeddings are not enabled for this provider",
+		}
+	default:
+		return &models.CompatibilityError{
+			Field:    "encoding_format",
+			Provider: target.Provider,
+			Reason:   fmt.Sprintf("unsupported value %q", req.EncodingFormat),
+		}
+	}
+}
+
+func (h *Handler) compatibleEmbeddingsFallbacks(fallbacks []routing.Target, req *models.EmbeddingsRequest) []routing.Target {
+	if len(fallbacks) == 0 {
+		return nil
+	}
+	compatible := make([]routing.Target, 0, len(fallbacks))
+	for _, target := range fallbacks {
+		if err := h.validateEmbeddingsCompatibility(target, req); err != nil {
+			log.Warn().
+				Err(err).
+				Str("provider", target.Provider).
+				Str("model", target.Model).
+				Msg("skipping incompatible embeddings fallback target")
+			continue
+		}
+		compatible = append(compatible, target)
+	}
+	return compatible
+}
+
 func (h *Handler) callEmbeddingsProvider(ctx context.Context, target routing.Target, req *models.EmbeddingsRequest, beforeUpstream func()) (*http.Response, error) {
 	translator, ok := h.registry.Get(target.Provider)
 	if !ok {
@@ -137,7 +176,7 @@ func (h *Handler) callEmbeddingsProvider(ctx context.Context, target routing.Tar
 
 	httpReq, err := embeddingTranslator.TranslateEmbeddingsRequest(ctx, &reqCopy)
 	if err != nil {
-		return nil, fmt.Errorf("failed to translate embeddings request for %s: %w", target.Provider, err)
+		return nil, resilience.NewRequestError(fmt.Errorf("failed to translate embeddings request for %s: %w", target.Provider, err))
 	}
 	if beforeUpstream != nil {
 		beforeUpstream()
@@ -269,6 +308,16 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "no route matched for this request", "routing_error")
 		return
 	}
+	if err := h.validateEmbeddingsCompatibility(resolved.Target, &req); err != nil {
+		var compatibilityErr *models.CompatibilityError
+		if errors.As(err, &compatibilityErr) {
+			writeCompatibilityError(w, compatibilityErr)
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
+		return
+	}
+	resolved.Fallbacks = h.compatibleEmbeddingsFallbacks(resolved.Fallbacks, &req)
 	w.Header().Set("X-LunarGate-Route", resolved.RouteName)
 
 	if requestedProvider != "" && strings.TrimSpace(resolved.Target.Provider) != requestedProvider {
@@ -295,6 +344,9 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 		req.Model = modelid.BuildCanonical(resolved.Target.Provider, req.Model)
 		headers["x-lunargate-model"] = req.Model
 	}
+	requestTypes := embeddingsAPIRequestTypes()
+	collectorHeaders := requestTypes.tags(headers)
+	traceTags := h.enrichCollectorTags(collectorHeaders, resolved.Target.Provider, req.Model, false)
 
 	noCache := r.Header.Get("X-LunarGate-No-Cache") == "true"
 	if !noCache && h.cache.Enabled() {
@@ -303,11 +355,48 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 			if cachedResp, ok := cached.(*models.EmbeddingsResponse); ok {
 				h.metrics.CacheHits.WithLabelValues("hit").Inc()
 				cacheHit = true
-				durationMS := time.Since(startTime).Milliseconds()
+				cachedModelRaw := strings.TrimSpace(resolved.Target.Model)
+				if cachedModelRaw == "" {
+					cachedModelRaw = modelid.ModelName(req.Model)
+					if cachedModelRaw == "" {
+						if translator, ok := h.registry.Get(resolved.Target.Provider); ok {
+							cachedModelRaw = strings.TrimSpace(translator.DefaultModel())
+						}
+					}
+				}
+				cachedModelCanonical := modelid.BuildCanonical(resolved.Target.Provider, cachedModelRaw)
+				userPtr, sessionIDPtr := extractUserAndSession(headers)
+				tokensIn := 0
+				if cachedResp.Usage != nil {
+					tokensIn = cachedResp.Usage.PromptTokens
+					if tokensIn == 0 {
+						tokensIn = cachedResp.Usage.TotalTokens
+					}
+				}
+				var requestPayload interface{}
+				if h.collector != nil && h.collector.SharePrompts() {
+					_ = json.Unmarshal(body, &requestPayload)
+				}
+				duration := h.recordCacheHit(r.Context(), cacheHitObservation{
+					requestID:    requestID,
+					startTime:    startTime,
+					requestTypes: requestTypes,
+					provider:     resolved.Target.Provider,
+					model:        cachedModelCanonical,
+					metricsModel: cachedModelRaw,
+					route:        resolved.RouteName,
+					targetIndex:  resolved.Index,
+					user:         userPtr,
+					sessionID:    sessionIDPtr,
+					tags:         h.enrichCollectorTags(collectorHeaders, resolved.Target.Provider, cachedModelCanonical, false),
+					tokensInput:  tokensIn,
+					request:      requestPayload,
+					response:     cachedResp,
+				})
 				w.Header().Set("X-LunarGate-Cache-Status", "HIT")
 				w.Header().Set("X-LunarGate-Provider", resolved.Target.Provider)
-				w.Header().Set("X-LunarGate-Model", req.Model)
-				setTimingHeaders(w, durationMS, durationMS)
+				w.Header().Set("X-LunarGate-Model", cachedModelCanonical)
+				setTimingHeaders(w, duration.Milliseconds(), duration.Milliseconds())
 				writeJSON(w, http.StatusOK, models.CloneEmbeddingsResponse(cachedResp))
 				return
 			}
@@ -325,7 +414,6 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 		Str("model", req.Model).
 		Msg("routing embeddings request")
 
-	traceTags := cloneTagsWithRequestType(h.enrichCollectorTags(headers, resolved.Target.Provider, req.Model, false), "embeddings")
 	if h.collector != nil {
 		startEvt := []observability.Event{{
 			Type: "trace",
@@ -358,6 +446,7 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 		status := http.StatusBadGateway
 		errCode := "provider_error"
 		errMsg := "all embedding providers unavailable"
+		requestFailure := false
 		if errors.Is(err, context.Canceled) {
 			status = 499
 			errCode = "client_cancelled"
@@ -366,6 +455,27 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 				Str("request_id", requestID).
 				Dur("duration", duration).
 				Msg("embeddings request cancelled")
+		} else if requestStatus, requestErrCode, requestErrMsg, ok := requestFailureFromError(err); ok {
+			status = requestStatus
+			errCode = requestErrCode
+			errMsg = requestErrMsg
+			requestFailure = true
+			log.Warn().
+				Err(err).
+				Str("request_id", requestID).
+				Int("status_code", status).
+				Dur("duration", duration).
+				Msg("embeddings request rejected before upstream call")
+		} else if upstreamStatus, upstreamErrCode, upstreamErrMsg, ok := upstreamFailureFromError(err); ok {
+			status = upstreamStatus
+			errCode = upstreamErrCode
+			errMsg = upstreamErrMsg
+			log.Warn().
+				Err(err).
+				Str("request_id", requestID).
+				Int("status_code", status).
+				Dur("duration", duration).
+				Msg("upstream embeddings provider failure after retries")
 		} else if isUpstreamTTFTTimeout(err) {
 			errCode = "upstream_timeout"
 			errMsg = "provider timed out waiting for first byte"
@@ -386,7 +496,7 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 				Dur("duration", duration).
 				Msg("all embeddings providers failed")
 		}
-		if !errors.Is(err, context.Canceled) {
+		if !errors.Is(err, context.Canceled) && !requestFailure {
 			h.metrics.ProviderErrors.WithLabelValues(resolved.Target.Provider, "all_failed").Inc()
 		}
 		setTimingHeaders(w, duration.Milliseconds(), upstreamStartMS)
@@ -415,7 +525,8 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 				Data: observability.MetricEventData{
 					RequestID:            requestID,
 					Timestamp:            startTime.UTC(),
-					RequestType:          "embeddings",
+					RequestType:          requestTypes.client,
+					UpstreamRequestType:  requestTypes.upstream,
 					DurationMS:           duration.Milliseconds(),
 					GatewayPreUpstreamMS: upstreamPtr,
 					Provider:             usedTarget.Provider,
@@ -443,23 +554,24 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 				events = append(events, observability.Event{
 					Type: "request_log",
 					Data: observability.RequestLogEventData{
-						RequestID:    requestID,
-						Timestamp:    startTime.UTC(),
-						RequestType:  "embeddings",
-						User:         userPtr,
-						SessionID:    sessionIDPtr,
-						Provider:     usedTarget.Provider,
-						Model:        req.Model,
-						StatusCode:   status,
-						DurationMS:   duration.Milliseconds(),
-						RouteUsed:    &routeUsed,
-						CacheHit:     cacheHit,
-						FallbackUsed: fallbackUsed,
-						RetryCount:   retryCount,
-						ErrorCode:    &errCodeForCollector,
-						ErrorMessage: &errMsgForCollector,
-						Tags:         traceTags,
-						Request:      reqAny,
+						RequestID:           requestID,
+						Timestamp:           startTime.UTC(),
+						RequestType:         requestTypes.client,
+						UpstreamRequestType: requestTypes.upstream,
+						User:                userPtr,
+						SessionID:           sessionIDPtr,
+						Provider:            usedTarget.Provider,
+						Model:               req.Model,
+						StatusCode:          status,
+						DurationMS:          duration.Milliseconds(),
+						RouteUsed:           &routeUsed,
+						CacheHit:            cacheHit,
+						FallbackUsed:        fallbackUsed,
+						RetryCount:          retryCount,
+						ErrorCode:           &errCodeForCollector,
+						ErrorMessage:        &errMsgForCollector,
+						Tags:                traceTags,
+						Request:             reqAny,
 					},
 				})
 			}
@@ -566,7 +678,8 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 				Data: observability.MetricEventData{
 					RequestID:            requestID,
 					Timestamp:            startTime.UTC(),
-					RequestType:          "embeddings",
+					RequestType:          requestTypes.client,
+					UpstreamRequestType:  requestTypes.upstream,
 					DurationMS:           duration.Milliseconds(),
 					GatewayPreUpstreamMS: upstreamPtr,
 					Provider:             usedTarget.Provider,
@@ -594,23 +707,24 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 				events = append(events, observability.Event{
 					Type: "request_log",
 					Data: observability.RequestLogEventData{
-						RequestID:    requestID,
-						Timestamp:    startTime.UTC(),
-						RequestType:  "embeddings",
-						User:         userPtr,
-						SessionID:    sessionIDPtr,
-						Provider:     usedTarget.Provider,
-						Model:        usedModelCanonical,
-						StatusCode:   status,
-						DurationMS:   duration.Milliseconds(),
-						RouteUsed:    &routeUsed,
-						CacheHit:     cacheHit,
-						FallbackUsed: fallbackUsed,
-						RetryCount:   retryCount,
-						ErrorCode:    &errCode,
-						ErrorMessage: &errMsg,
-						Tags:         traceTags,
-						Request:      reqAny,
+						RequestID:           requestID,
+						Timestamp:           startTime.UTC(),
+						RequestType:         requestTypes.client,
+						UpstreamRequestType: requestTypes.upstream,
+						User:                userPtr,
+						SessionID:           sessionIDPtr,
+						Provider:            usedTarget.Provider,
+						Model:               usedModelCanonical,
+						StatusCode:          status,
+						DurationMS:          duration.Milliseconds(),
+						RouteUsed:           &routeUsed,
+						CacheHit:            cacheHit,
+						FallbackUsed:        fallbackUsed,
+						RetryCount:          retryCount,
+						ErrorCode:           &errCode,
+						ErrorMessage:        &errMsg,
+						Tags:                traceTags,
+						Request:             reqAny,
 					},
 				})
 			}
@@ -664,7 +778,8 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 			Data: observability.MetricEventData{
 				RequestID:            requestID,
 				Timestamp:            startTime.UTC(),
-				RequestType:          "embeddings",
+				RequestType:          requestTypes.client,
+				UpstreamRequestType:  requestTypes.upstream,
 				DurationMS:           duration.Milliseconds(),
 				GatewayPreUpstreamMS: upstreamPtr,
 				Provider:             usedTarget.Provider,
@@ -697,22 +812,23 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 			events = append(events, observability.Event{
 				Type: "request_log",
 				Data: observability.RequestLogEventData{
-					RequestID:    requestID,
-					Timestamp:    startTime.UTC(),
-					RequestType:  "embeddings",
-					User:         userPtr,
-					SessionID:    sessionIDPtr,
-					Provider:     usedTarget.Provider,
-					Model:        req.Model,
-					StatusCode:   http.StatusOK,
-					DurationMS:   duration.Milliseconds(),
-					RouteUsed:    &routeUsed,
-					CacheHit:     cacheHit,
-					FallbackUsed: fallbackUsed,
-					RetryCount:   retryCount,
-					Tags:         traceTags,
-					Request:      reqObj,
-					Response:     respObj,
+					RequestID:           requestID,
+					Timestamp:           startTime.UTC(),
+					RequestType:         requestTypes.client,
+					UpstreamRequestType: requestTypes.upstream,
+					User:                userPtr,
+					SessionID:           sessionIDPtr,
+					Provider:            usedTarget.Provider,
+					Model:               req.Model,
+					StatusCode:          http.StatusOK,
+					DurationMS:          duration.Milliseconds(),
+					RouteUsed:           &routeUsed,
+					CacheHit:            cacheHit,
+					FallbackUsed:        fallbackUsed,
+					RetryCount:          retryCount,
+					Tags:                traceTags,
+					Request:             reqObj,
+					Response:            respObj,
 				},
 			})
 		}

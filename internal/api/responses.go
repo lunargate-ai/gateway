@@ -2,14 +2,42 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"strings"
 
 	"github.com/lunargate-ai/gateway/pkg/models"
 )
+
+type preservedUnifiedRequestContextKey struct{}
+
+type preservedUnifiedRequest struct {
+	rawJSON           json.RawMessage
+	sourceRequestType string
+}
+
+func withPreservedUnifiedRequest(ctx context.Context, req *models.UnifiedRequest) context.Context {
+	if req == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, preservedUnifiedRequestContextKey{}, preservedUnifiedRequest{
+		rawJSON:           append(json.RawMessage(nil), req.RawJSON...),
+		sourceRequestType: strings.TrimSpace(req.SourceRequestType),
+	})
+}
+
+func preservedUnifiedRequestFromContext(ctx context.Context) (preservedUnifiedRequest, bool) {
+	if ctx == nil {
+		return preservedUnifiedRequest{}, false
+	}
+	preserved, ok := ctx.Value(preservedUnifiedRequestContextKey{}).(preservedUnifiedRequest)
+	if !ok || len(bytes.TrimSpace(preserved.rawJSON)) == 0 {
+		return preservedUnifiedRequest{}, false
+	}
+	return preserved, true
+}
 
 func responsesRequestToRawMap(req *models.ResponsesRequest) (map[string]json.RawMessage, error) {
 	body := []byte(req.RawJSON)
@@ -58,11 +86,14 @@ func (h *Handler) resolveResponsesHTTPPayload(payload map[string]json.RawMessage
 		return cloneResponsesRawMap(payload), nil
 	}
 	if h == nil || h.responsesState == nil {
-		return nil, fmt.Errorf("previous_response_id not found")
+		return cloneResponsesRawMap(payload), nil
 	}
 	basePayload, ok := h.responsesState.get(previousResponseID)
 	if !ok {
-		return nil, fmt.Errorf("previous_response_id not found")
+		// A native Responses target may own this ID even when it is not in the
+		// gateway's bounded local continuation cache. Compatibility validation
+		// rejects it later if the selected target requires local translation.
+		return cloneResponsesRawMap(payload), nil
 	}
 	return mergeResponsesWebSocketPayloads(basePayload, payload)
 }
@@ -135,7 +166,7 @@ func makeResponsesChatRequest(r *http.Request, unifiedReq *models.UnifiedRequest
 	if originalPath == "" {
 		originalPath = "/v1/responses"
 	}
-	chatReq := r.Clone(r.Context())
+	chatReq := r.Clone(withPreservedUnifiedRequest(r.Context(), unifiedReq))
 	chatReq.URL.Path = "/v1/chat/completions"
 	chatReq.RequestURI = "/v1/chat/completions"
 	chatReq.Body = io.NopCloser(bytes.NewReader(body))
@@ -161,7 +192,7 @@ func (h *Handler) handleResponsesStream(w http.ResponseWriter, chatReq *http.Req
 	if !store || h == nil || h.responsesState == nil || proxy.responseID == "" || proxy.completedResponse == nil {
 		return
 	}
-	h.responsesState.put(proxy.responseID, withCompletedResponseHistory(requestPayload, proxy.completedResponse))
+	h.responsesState.putCompleted(proxy.responseID, requestPayload, proxy.completedResponse)
 }
 
 func (h *Handler) handleResponsesNonStream(w http.ResponseWriter, chatReq *http.Request, requestPayload map[string]json.RawMessage, store bool) {
@@ -180,7 +211,7 @@ func (h *Handler) handleResponsesNonStream(w http.ResponseWriter, chatReq *http.
 	resp := models.UnifiedResponseToResponses(unifiedResp)
 	if store && h != nil && h.responsesState != nil && resp != nil {
 		if completedResponse, err := responsesResponseToMap(resp); err == nil {
-			h.responsesState.put(resp.ID, withCompletedResponseHistory(requestPayload, completedResponse))
+			h.responsesState.putCompleted(resp.ID, requestPayload, completedResponse)
 		}
 	}
 	writeJSON(w, status, resp)

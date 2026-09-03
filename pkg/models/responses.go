@@ -33,14 +33,19 @@ type ResponsesTool struct {
 }
 
 type ResponsesResponse struct {
-	ID         string            `json:"id"`
-	Object     string            `json:"object"`
-	CreatedAt  int64             `json:"created_at"`
-	Status     string            `json:"status"`
-	Model      string            `json:"model"`
-	Output     []ResponsesOutput `json:"output"`
-	OutputText string            `json:"output_text"`
-	Usage      *ResponsesUsage   `json:"usage,omitempty"`
+	ID                string                      `json:"id"`
+	Object            string                      `json:"object"`
+	CreatedAt         int64                       `json:"created_at"`
+	Status            string                      `json:"status"`
+	IncompleteDetails *ResponsesIncompleteDetails `json:"incomplete_details,omitempty"`
+	Model             string                      `json:"model"`
+	Output            []ResponsesOutput           `json:"output"`
+	OutputText        string                      `json:"output_text"`
+	Usage             *ResponsesUsage             `json:"usage,omitempty"`
+}
+
+type ResponsesIncompleteDetails struct {
+	Reason string `json:"reason"`
 }
 
 type ResponsesOutput struct {
@@ -72,6 +77,24 @@ type ResponsesUsage struct {
 	TotalTokens  int `json:"total_tokens"`
 }
 
+const (
+	ResponsesIncompleteReasonMaxOutputTokens = "max_output_tokens"
+	ResponsesIncompleteReasonContentFilter   = "content_filter"
+)
+
+// ResponsesIncompleteReasonForFinishReason maps terminal Chat Completions
+// reasons that represent partial output to their Responses API equivalent.
+func ResponsesIncompleteReasonForFinishReason(finishReason string) string {
+	switch strings.ToLower(strings.TrimSpace(finishReason)) {
+	case "length":
+		return ResponsesIncompleteReasonMaxOutputTokens
+	case "content_filter":
+		return ResponsesIncompleteReasonContentFilter
+	default:
+		return ""
+	}
+}
+
 func ResponsesToUnifiedRequest(req *ResponsesRequest) (*UnifiedRequest, error) {
 	if req == nil {
 		return nil, fmt.Errorf("request is required")
@@ -99,6 +122,8 @@ func ResponsesToUnifiedRequest(req *ResponsesRequest) (*UnifiedRequest, error) {
 	}
 
 	unified := &UnifiedRequest{
+		RawJSON:            append(json.RawMessage(nil), req.RawJSON...),
+		SourceRequestType:  "responses",
 		Model:              strings.TrimSpace(req.Model),
 		Messages:           messages,
 		Tools:              tools,
@@ -133,6 +158,12 @@ func UnifiedResponseToResponses(resp *UnifiedResponse) *ResponsesResponse {
 		return nil
 	}
 
+	status := "completed"
+	incompleteReason := responsesIncompleteReasonForChoices(resp.Choices)
+	if incompleteReason != "" {
+		status = "incomplete"
+	}
+
 	output := make([]ResponsesOutput, 0, len(resp.Choices)+1)
 	outputText := make([]string, 0, len(resp.Choices))
 
@@ -160,7 +191,7 @@ func UnifiedResponseToResponses(resp *UnifiedResponse) *ResponsesResponse {
 		output = append(output, ResponsesOutput{
 			Type:    "message",
 			ID:      msgID,
-			Status:  "completed",
+			Status:  status,
 			Role:    "assistant",
 			Content: parts,
 		})
@@ -169,7 +200,7 @@ func UnifiedResponseToResponses(resp *UnifiedResponse) *ResponsesResponse {
 			output = append(output, ResponsesOutput{
 				Type:   "reasoning",
 				ID:     fmt.Sprintf("rs_%s_%d", strings.TrimSpace(resp.ID), i),
-				Status: "completed",
+				Status: status,
 				Summary: []ResponsesSummaryPart{{
 					Type: "summary_text",
 					Text: reasoning,
@@ -184,7 +215,7 @@ func UnifiedResponseToResponses(resp *UnifiedResponse) *ResponsesResponse {
 				CallID:    tc.ID,
 				Name:      tc.Function.Name,
 				Arguments: tc.Function.Arguments,
-				Status:    "completed",
+				Status:    status,
 			})
 		}
 	}
@@ -193,10 +224,13 @@ func UnifiedResponseToResponses(resp *UnifiedResponse) *ResponsesResponse {
 		ID:         resp.ID,
 		Object:     "response",
 		CreatedAt:  resp.Created,
-		Status:     "completed",
+		Status:     status,
 		Model:      resp.Model,
 		Output:     output,
 		OutputText: strings.Join(outputText, "\n"),
+	}
+	if incompleteReason != "" {
+		out.IncompleteDetails = &ResponsesIncompleteDetails{Reason: incompleteReason}
 	}
 
 	if resp.Usage != nil {
@@ -208,6 +242,23 @@ func UnifiedResponseToResponses(resp *UnifiedResponse) *ResponsesResponse {
 	}
 
 	return out
+}
+
+func responsesIncompleteReasonForChoices(choices []Choice) string {
+	reason := ""
+	for _, choice := range choices {
+		if choice.FinishReason == nil {
+			continue
+		}
+		mapped := ResponsesIncompleteReasonForFinishReason(*choice.FinishReason)
+		if mapped == ResponsesIncompleteReasonContentFilter {
+			return mapped
+		}
+		if reason == "" {
+			reason = mapped
+		}
+	}
+	return reason
 }
 
 func responsesInputToMessages(input interface{}) ([]Message, error) {

@@ -374,7 +374,7 @@ func (t *OllamaTranslator) ParseEmbeddingsResponse(resp *http.Response) (*models
 
 	data := make([]models.EmbeddingData, 0, len(vectors))
 	for i, vector := range vectors {
-		data = append(data, models.EmbeddingData{Object: "embedding", Embedding: vector, Index: i})
+		data = append(data, models.EmbeddingData{Object: "embedding", Embedding: models.NewFloatEmbeddingValue(vector), Index: i})
 	}
 
 	var usage *models.EmbeddingUsage
