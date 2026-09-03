@@ -91,6 +91,17 @@ func main() {
 	handler := api.NewHandler(registry, routingEngine, fallbackExec, cache, streamer, metrics, collectorClient, selector, store)
 	handler.UpdateProviderConfigs(cfg.Providers)
 	remoteControlBaseURL := "http://" + localLoopbackAddress(cfg.Server)
+	modelSnapshotIDs := func() []string {
+		var ids []string
+		if store != nil {
+			for _, item := range store.AllModelsSnapshot() {
+				if item.ID != "" {
+					ids = append(ids, item.ID)
+				}
+			}
+		}
+		return ids
+	}
 	modelIDs := func(ctx context.Context) []string {
 		var ids []string
 		if store != nil {
@@ -125,6 +136,7 @@ func main() {
 			version,
 			remoteControlBaseURL,
 			routingEngine.RouteNames,
+			modelSnapshotIDs,
 			modelIDs,
 		)
 		if remoteControlClient != nil {

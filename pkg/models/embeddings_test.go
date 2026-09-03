@@ -35,3 +35,20 @@ func TestEmbeddingValueRejectsInvalidRepresentation(t *testing.T) {
 		}
 	}
 }
+
+func TestCloneEmbeddingsResponsePreservesRawEnvelopeWithoutAliasing(t *testing.T) {
+	raw := json.RawMessage(`{"object":"list","future_field":{"kept":true}}`)
+	original := &EmbeddingsResponse{RawJSON: raw, Object: "list"}
+
+	cloned := CloneEmbeddingsResponse(original)
+	if cloned == original {
+		t.Fatal("clone aliases original response")
+	}
+	if string(cloned.RawJSON) != string(raw) {
+		t.Fatalf("cloned raw envelope = %s, want %s", cloned.RawJSON, raw)
+	}
+	cloned.RawJSON[0] = '['
+	if original.RawJSON[0] != '{' {
+		t.Fatal("cloned raw envelope aliases original bytes")
+	}
+}

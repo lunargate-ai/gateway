@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,21 +21,30 @@ import (
 )
 
 type ModelListFunc func(context.Context) []string
+type ModelSnapshotFunc func() []string
+
+const (
+	defaultHeartbeatInterval   = 20 * time.Second
+	defaultModelRefreshTimeout = 8 * time.Second
+)
 
 type Client struct {
-	backendURL      string
-	apiKey          string
-	instanceID      string
-	version         string
-	localBaseURL    string
-	localAuthHeader string
-	localAuthValue  string
-	routeNames      func() []string
-	modelIDs        ModelListFunc
-	httpClient      *http.Client
-	refreshCh       chan struct{}
-	lastLogKey      string
-	lastLogAt       time.Time
+	backendURL          string
+	apiKey              string
+	instanceID          string
+	version             string
+	localBaseURL        string
+	localAuthHeader     string
+	localAuthValue      string
+	routeNames          func() []string
+	modelSnapshotIDs    ModelSnapshotFunc
+	modelIDs            ModelListFunc
+	httpClient          *http.Client
+	refreshCh           chan struct{}
+	heartbeatInterval   time.Duration
+	modelRefreshTimeout time.Duration
+	lastLogKey          string
+	lastLogAt           time.Time
 }
 
 type helloMessage struct {
@@ -84,6 +94,7 @@ func NewClient(
 	version string,
 	localBaseURL string,
 	routeNames func() []string,
+	modelSnapshotIDs ModelSnapshotFunc,
 	modelIDs ModelListFunc,
 ) *Client {
 	if !dataSharing.Enabled {
@@ -102,19 +113,27 @@ func NewClient(
 		log.Warn().Msg("remote control disabled: general.backend_url missing in config")
 		return nil
 	}
+	instanceID, err := localInstanceID()
+	if err != nil {
+		log.Error().Err(err).Msg("remote control disabled: failed to create instance identity")
+		return nil
+	}
 	localAuthHeader, localAuthValue := loopbackCredential(security)
 	return &Client{
-		backendURL:      backendURL,
-		apiKey:          apiKey,
-		instanceID:      localInstanceID(),
-		version:         version,
-		localBaseURL:    strings.TrimRight(strings.TrimSpace(localBaseURL), "/"),
-		localAuthHeader: localAuthHeader,
-		localAuthValue:  localAuthValue,
-		routeNames:      routeNames,
-		modelIDs:        modelIDs,
-		httpClient:      &http.Client{Timeout: 5 * time.Minute},
-		refreshCh:       make(chan struct{}, 1),
+		backendURL:          backendURL,
+		apiKey:              apiKey,
+		instanceID:          instanceID,
+		version:             version,
+		localBaseURL:        strings.TrimRight(strings.TrimSpace(localBaseURL), "/"),
+		localAuthHeader:     localAuthHeader,
+		localAuthValue:      localAuthValue,
+		routeNames:          routeNames,
+		modelSnapshotIDs:    modelSnapshotIDs,
+		modelIDs:            modelIDs,
+		httpClient:          &http.Client{Timeout: 5 * time.Minute},
+		refreshCh:           make(chan struct{}, 1),
+		heartbeatInterval:   defaultHeartbeatInterval,
+		modelRefreshTimeout: defaultModelRefreshTimeout,
 	}
 }
 
@@ -201,7 +220,7 @@ func (c *Client) connectAndServe(ctx context.Context) error {
 		return conn.WriteJSON(v)
 	}
 
-	if err := writeJSON(c.buildHello(ctx)); err != nil {
+	if err := writeJSON(c.buildSnapshotHello()); err != nil {
 		return err
 	}
 
@@ -220,8 +239,51 @@ func (c *Client) connectAndServe(ctx context.Context) error {
 	}()
 	defer close(closeCh)
 
-	heartbeatTicker := time.NewTicker(20 * time.Second)
+	heartbeatInterval := c.heartbeatInterval
+	if heartbeatInterval <= 0 {
+		heartbeatInterval = defaultHeartbeatInterval
+	}
+	heartbeatTicker := time.NewTicker(heartbeatInterval)
 	defer heartbeatTicker.Stop()
+
+	modelRefreshCtx, cancelModelRefresh := context.WithCancel(ctx)
+	var modelRefreshWG sync.WaitGroup
+	defer func() {
+		cancelModelRefresh()
+		modelRefreshWG.Wait()
+	}()
+
+	type modelRefreshResult struct {
+		models []string
+		ok     bool
+	}
+	modelRefreshResults := make(chan modelRefreshResult, 1)
+	modelRefreshActive := false
+	modelRefreshPending := false
+	startModelRefresh := func() {
+		if modelRefreshActive || c.modelIDs == nil {
+			return
+		}
+		modelRefreshActive = true
+		modelRefreshWG.Add(1)
+		go func() {
+			defer modelRefreshWG.Done()
+			timeout := c.modelRefreshTimeout
+			if timeout <= 0 {
+				timeout = defaultModelRefreshTimeout
+			}
+			refreshCtx, cancel := context.WithTimeout(modelRefreshCtx, timeout)
+			models := c.modelIDs(refreshCtx)
+			completed := refreshCtx.Err() == nil
+			cancel()
+			result := modelRefreshResult{models: models, ok: completed}
+			select {
+			case modelRefreshResults <- result:
+			case <-modelRefreshCtx.Done():
+			}
+		}()
+	}
+	startModelRefresh()
 
 	for {
 		select {
@@ -232,8 +294,24 @@ func (c *Client) connectAndServe(ctx context.Context) error {
 				return err
 			}
 		case <-c.refreshCh:
-			if err := writeJSON(c.buildHello(ctx)); err != nil {
+			if err := writeJSON(c.buildSnapshotHello()); err != nil {
 				return err
+			}
+			if modelRefreshActive {
+				modelRefreshPending = true
+			} else {
+				startModelRefresh()
+			}
+		case result := <-modelRefreshResults:
+			modelRefreshActive = false
+			if result.ok {
+				if err := writeJSON(c.buildHello(result.models)); err != nil {
+					return err
+				}
+			}
+			if modelRefreshPending {
+				modelRefreshPending = false
+				startModelRefresh()
 			}
 		case err := <-errCh:
 			return err
@@ -388,11 +466,15 @@ func sandboxEndpointPath(requestType string) (string, error) {
 	}
 }
 
-func (c *Client) buildHello(ctx context.Context) helloMessage {
+func (c *Client) buildSnapshotHello() helloMessage {
 	models := []string{}
-	if c.modelIDs != nil {
-		models = c.modelIDs(ctx)
+	if c.modelSnapshotIDs != nil {
+		models = c.modelSnapshotIDs()
 	}
+	return c.buildHello(models)
+}
+
+func (c *Client) buildHello(models []string) helloMessage {
 	routes := []string{}
 	if c.routeNames != nil {
 		routes = c.routeNames()
@@ -518,16 +600,16 @@ func parseBody(body []byte) interface{} {
 	return string(trimmed)
 }
 
-func localInstanceID() string {
-	const alphabet = "abcdefghijklmnopqrstuvwxyz"
-	const size = 4
-	buf := make([]byte, size)
-	if _, err := rand.Read(buf); err != nil {
-		return "zzzz"
+func localInstanceID() (string, error) {
+	return instanceIDFromReader(rand.Reader)
+}
+
+func instanceIDFromReader(reader io.Reader) (string, error) {
+	const entropyBytes = 16
+
+	buf := make([]byte, entropyBytes)
+	if _, err := io.ReadFull(reader, buf); err != nil {
+		return "", fmt.Errorf("failed to read instance identity entropy: %w", err)
 	}
-	out := make([]byte, size)
-	for i, b := range buf {
-		out[i] = alphabet[int(b)%len(alphabet)]
-	}
-	return string(out)
+	return hex.EncodeToString(buf), nil
 }

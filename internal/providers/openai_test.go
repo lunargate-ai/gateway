@@ -149,6 +149,63 @@ func TestOpenAITranslator_PreservesCompleteNativeChatResponse(t *testing.T) {
 	}
 }
 
+func TestOpenAITranslator_PreservesCompleteNativeEmbeddingsResponse(t *testing.T) {
+	translator := NewOpenAITranslator(config.ProviderConfig{})
+	body := `{"object":"list","data":[{"object":"embedding","embedding":[0.1,0.2],"index":0,"future_item":"kept"}],"model":"text-embedding-3-small","usage":{"prompt_tokens":2,"total_tokens":2,"future_usage":1},"future_top_level":{"kept":true}}`
+
+	response, err := translator.ParseEmbeddingsResponse(&http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(body)),
+	})
+	if err != nil {
+		t.Fatalf("ParseEmbeddingsResponse returned error: %v", err)
+	}
+	if string(response.RawJSON) != body {
+		t.Fatalf("raw embeddings envelope = %s, want %s", response.RawJSON, body)
+	}
+	if response.Usage == nil || response.Usage.TotalTokens != 2 {
+		t.Fatalf("typed usage was not parsed: %#v", response.Usage)
+	}
+}
+
+func TestOpenAITranslator_PreservesCompleteNativeEmbeddingsRequest(t *testing.T) {
+	translator := NewOpenAITranslator(config.ProviderConfig{
+		APIKey:  "dummy",
+		BaseURL: "https://api.openai.com/v1",
+	})
+	raw := json.RawMessage(`{"model":"client-model","input":["one","two"],"encoding_format":"float","dimensions":256,"user":"customer","future_option":{"kept":true}}`)
+	dimensions := 256
+
+	request, err := translator.TranslateEmbeddingsRequest(context.Background(), &models.EmbeddingsRequest{
+		RawJSON:        raw,
+		Model:          "routed-model",
+		Input:          []interface{}{"one", "two"},
+		EncodingFormat: "float",
+		Dimensions:     &dimensions,
+		User:           "customer",
+	})
+	if err != nil {
+		t.Fatalf("TranslateEmbeddingsRequest returned error: %v", err)
+	}
+	body, err := io.ReadAll(request.Body)
+	if err != nil {
+		t.Fatalf("read request body: %v", err)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("decode request body: %v", err)
+	}
+	if payload["model"] != "routed-model" {
+		t.Fatalf("model = %#v, want routed-model", payload["model"])
+	}
+	if _, ok := payload["future_option"]; !ok {
+		t.Fatalf("additive embeddings request field was lost: %s", body)
+	}
+	if payload["dimensions"] != float64(256) || payload["user"] != "customer" {
+		t.Fatalf("known embeddings controls changed: %s", body)
+	}
+}
+
 func TestOpenAITranslator_UsesProviderDefaultSamplingOptions(t *testing.T) {
 	defaultTemperature := 1.0
 	defaultTopP := 0.95

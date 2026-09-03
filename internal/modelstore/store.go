@@ -19,15 +19,22 @@ import (
 )
 
 type cacheEntry struct {
-	models    []string
-	expiresAt time.Time
+	generation uint64
+	models     []string
+	expiresAt  time.Time
+}
+
+type providerConfigSnapshot struct {
+	generation uint64
+	providers  map[string]config.ProviderConfig
 }
 
 type Store struct {
 	registry *providers.Registry
 	client   *http.Client
 
-	cfg atomic.Value
+	cfg            atomic.Value
+	nextGeneration atomic.Uint64
 
 	mu    sync.RWMutex
 	cache map[string]cacheEntry
@@ -36,8 +43,8 @@ type Store struct {
 func NewStore(reg *providers.Registry, providersCfg map[string]config.ProviderConfig) *Store {
 	s := &Store{
 		registry: reg,
-		client: &http.Client{Timeout: 15 * time.Second},
-		cache: make(map[string]cacheEntry),
+		client:   &http.Client{Timeout: 15 * time.Second},
+		cache:    make(map[string]cacheEntry),
 	}
 	s.UpdateProvidersConfig(providersCfg)
 	return s
@@ -48,16 +55,45 @@ func (s *Store) UpdateProvidersConfig(cfg map[string]config.ProviderConfig) {
 	for k, v := range cfg {
 		copyMap[k] = v
 	}
-	s.cfg.Store(copyMap)
-
 	s.mu.Lock()
+	s.cfg.Store(providerConfigSnapshot{
+		generation: s.nextGeneration.Add(1),
+		providers:  copyMap,
+	})
 	s.cache = make(map[string]cacheEntry)
 	s.mu.Unlock()
 }
 
 func (s *Store) AllModels(ctx context.Context) []models.ModelInfo {
-	cfgAny := s.cfg.Load()
-	providersCfg, _ := cfgAny.(map[string]config.ProviderConfig)
+	snapshot := s.providerConfigSnapshot()
+	modelsList := s.collectModels(snapshot.providers, func(providerID string, pcfg config.ProviderConfig) []string {
+		return s.modelsForProvider(ctx, snapshot.generation, providerID, pcfg)
+	})
+	if s.providerConfigSnapshot().generation != snapshot.generation {
+		return s.AllModelsSnapshot()
+	}
+	return modelsList
+}
+
+// AllModelsSnapshot returns the model inventory that is already available in
+// memory. It never performs provider I/O: fetch-mode providers use a valid
+// cached result or their local translator/default-model fallback.
+func (s *Store) AllModelsSnapshot() []models.ModelInfo {
+	snapshot := s.providerConfigSnapshot()
+	return s.collectModels(snapshot.providers, func(providerID string, pcfg config.ProviderConfig) []string {
+		return s.modelsForProviderSnapshot(snapshot.generation, providerID, pcfg)
+	})
+}
+
+func (s *Store) providerConfigSnapshot() providerConfigSnapshot {
+	snapshot, _ := s.cfg.Load().(providerConfigSnapshot)
+	return snapshot
+}
+
+func (s *Store) collectModels(
+	providersCfg map[string]config.ProviderConfig,
+	resolve func(string, config.ProviderConfig) []string,
+) []models.ModelInfo {
 
 	seen := make(map[string]struct{}, 128)
 	out := make([]models.ModelInfo, 0, 128)
@@ -67,7 +103,7 @@ func (s *Store) AllModels(ctx context.Context) []models.ModelInfo {
 
 	for _, providerID := range providerIDs {
 		pcfg := providersCfg[providerID]
-		ids := s.modelsForProvider(ctx, providerID, pcfg)
+		ids := resolve(providerID, pcfg)
 		for _, raw := range ids {
 			m := strings.TrimSpace(raw)
 			if m == "" {
@@ -86,12 +122,73 @@ func (s *Store) AllModels(ctx context.Context) []models.ModelInfo {
 	return out
 }
 
-func (s *Store) modelsForProvider(ctx context.Context, providerID string, pcfg config.ProviderConfig) []string {
-	mode := strings.ToLower(strings.TrimSpace(pcfg.Models.Mode))
-	if mode == "" {
-		mode = "translator"
+func (s *Store) modelsForProviderSnapshot(generation uint64, providerID string, pcfg config.ProviderConfig) []string {
+	mode := providerModelMode(pcfg)
+	if mode != "fetch" {
+		return s.localModelsForProvider(providerID, pcfg, mode)
 	}
 
+	s.mu.RLock()
+	ce, ok := s.cache[providerID]
+	s.mu.RUnlock()
+	if ok && ce.generation == generation && time.Now().Before(ce.expiresAt) {
+		return append([]string(nil), ce.models...)
+	}
+
+	return s.localModelsForProvider(providerID, pcfg, mode)
+}
+
+func (s *Store) modelsForProvider(ctx context.Context, generation uint64, providerID string, pcfg config.ProviderConfig) []string {
+	mode := providerModelMode(pcfg)
+	if mode != "fetch" {
+		return s.localModelsForProvider(providerID, pcfg, mode)
+	}
+
+	ttl := pcfg.Models.Fetch.TTL
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
+	}
+
+	s.mu.RLock()
+	ce, ok := s.cache[providerID]
+	s.mu.RUnlock()
+	if ok && ce.generation == generation && time.Now().Before(ce.expiresAt) {
+		return append([]string(nil), ce.models...)
+	}
+
+	modelsList, err := s.fetchModels(ctx, providerID, pcfg)
+	cacheResult := ctx.Err() == nil
+	if err != nil {
+		log.Warn().Err(err).Str("provider", providerID).Msg("failed to fetch models")
+		modelsList = s.localModelsForProvider(providerID, pcfg, mode)
+		cacheResult = ctx.Err() == nil
+	}
+	modelsList = uniqueStrings(modelsList)
+
+	if cacheResult {
+		s.mu.Lock()
+		current := s.providerConfigSnapshot()
+		if current.generation == generation {
+			s.cache[providerID] = cacheEntry{
+				generation: generation,
+				models:     append([]string(nil), modelsList...),
+				expiresAt:  time.Now().Add(ttl),
+			}
+		}
+		s.mu.Unlock()
+	}
+	return modelsList
+}
+
+func providerModelMode(pcfg config.ProviderConfig) string {
+	mode := strings.ToLower(strings.TrimSpace(pcfg.Models.Mode))
+	if mode == "" {
+		return "translator"
+	}
+	return mode
+}
+
+func (s *Store) localModelsForProvider(providerID string, pcfg config.ProviderConfig, mode string) []string {
 	switch mode {
 	case "static":
 		modelsList := make([]string, 0, len(pcfg.Models.Static)+1)
@@ -107,35 +204,7 @@ func (s *Store) modelsForProvider(ctx context.Context, providerID string, pcfg c
 		return uniqueStrings(modelsList)
 
 	case "fetch":
-		ttl := pcfg.Models.Fetch.TTL
-		if ttl <= 0 {
-			ttl = 10 * time.Minute
-		}
-
-		s.mu.RLock()
-		ce, ok := s.cache[providerID]
-		s.mu.RUnlock()
-		if ok && time.Now().Before(ce.expiresAt) {
-			return ce.models
-		}
-
-		modelsList, err := s.fetchModels(ctx, providerID, pcfg)
-		if err != nil {
-			log.Warn().Err(err).Str("provider", providerID).Msg("failed to fetch models")
-			modelsList = s.modelsFromTranslator(providerID)
-			if len(modelsList) == 0 {
-				if dm := strings.TrimSpace(pcfg.DefaultModel); dm != "" {
-					modelsList = append(modelsList, dm)
-				}
-			}
-		}
-		modelsList = uniqueStrings(modelsList)
-
-		s.mu.Lock()
-		s.cache[providerID] = cacheEntry{models: modelsList, expiresAt: time.Now().Add(ttl)}
-		s.mu.Unlock()
-		return modelsList
-
+		fallthrough
 	case "translator":
 		fallthrough
 	default:

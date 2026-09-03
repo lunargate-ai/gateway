@@ -16,10 +16,11 @@ type EmbeddingsRequest struct {
 }
 
 type EmbeddingsResponse struct {
-	Object string          `json:"object"`
-	Data   []EmbeddingData `json:"data"`
-	Model  string          `json:"model"`
-	Usage  *EmbeddingUsage `json:"usage,omitempty"`
+	RawJSON json.RawMessage `json:"-"`
+	Object  string          `json:"object"`
+	Data    []EmbeddingData `json:"data"`
+	Model   string          `json:"model"`
+	Usage   *EmbeddingUsage `json:"usage,omitempty"`
 }
 
 type EmbeddingData struct {
@@ -90,5 +91,6 @@ func CloneEmbeddingsResponse(resp *EmbeddingsResponse) *EmbeddingsResponse {
 	if err := json.Unmarshal(data, &out); err != nil {
 		return resp
 	}
+	out.RawJSON = append(json.RawMessage(nil), resp.RawJSON...)
 	return &out
 }

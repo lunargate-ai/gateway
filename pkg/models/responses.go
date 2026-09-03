@@ -12,8 +12,9 @@ type ResponsesRequest struct {
 	Model              string          `json:"model"`
 	Input              interface{}     `json:"input"`
 	PreviousResponseID string          `json:"previous_response_id,omitempty"`
-	Instructions       string          `json:"instructions,omitempty"`
+	Instructions       interface{}     `json:"instructions,omitempty"`
 	Reasoning          *Reasoning      `json:"reasoning,omitempty"`
+	Text               *ResponsesText  `json:"text,omitempty"`
 	Temperature        *float64        `json:"temperature,omitempty"`
 	TopP               *float64        `json:"top_p,omitempty"`
 	MaxOutputTokens    *int            `json:"max_output_tokens,omitempty"`
@@ -22,6 +23,19 @@ type ResponsesRequest struct {
 	Stream             bool            `json:"stream,omitempty"`
 	Store              *bool           `json:"store,omitempty"`
 	User               string          `json:"user,omitempty"`
+}
+
+type ResponsesText struct {
+	Format    *ResponsesTextFormat `json:"format,omitempty"`
+	Verbosity string               `json:"verbosity,omitempty"`
+}
+
+type ResponsesTextFormat struct {
+	Type        string      `json:"type"`
+	Name        string      `json:"name,omitempty"`
+	Description string      `json:"description,omitempty"`
+	Schema      interface{} `json:"schema,omitempty"`
+	Strict      *bool       `json:"strict,omitempty"`
 }
 
 type ResponsesTool struct {
@@ -107,8 +121,12 @@ func ResponsesToUnifiedRequest(req *ResponsesRequest) (*UnifiedRequest, error) {
 	if err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(req.Instructions) != "" {
-		messages = append([]Message{{Role: "system", Content: strings.TrimSpace(req.Instructions)}}, messages...)
+	instructions, err := responsesInstructionsToMessages(req.Instructions)
+	if err != nil {
+		return nil, err
+	}
+	if len(instructions) > 0 {
+		messages = append(instructions, messages...)
 	}
 
 	tools, err := responsesToolsToUnified(req.Tools)
@@ -136,6 +154,18 @@ func ResponsesToUnifiedRequest(req *ResponsesRequest) (*UnifiedRequest, error) {
 	if req.Reasoning != nil {
 		unified.ReasoningEffort = strings.TrimSpace(req.Reasoning.Effort)
 	}
+	if req.Text != nil && req.Text.Format != nil {
+		format := req.Text.Format
+		unified.ResponseFormat = &ResponseFormat{Type: strings.TrimSpace(format.Type)}
+		if strings.EqualFold(strings.TrimSpace(format.Type), "json_schema") {
+			unified.ResponseFormat.JSONSchema = &JSONSchemaResponseFormat{
+				Name:        format.Name,
+				Description: format.Description,
+				Schema:      format.Schema,
+				Strict:      format.Strict,
+			}
+		}
+	}
 
 	if req.Temperature != nil {
 		unified.Temperature = req.Temperature
@@ -148,6 +178,25 @@ func ResponsesToUnifiedRequest(req *ResponsesRequest) (*UnifiedRequest, error) {
 	}
 
 	return unified, nil
+}
+
+func responsesInstructionsToMessages(instructions interface{}) ([]Message, error) {
+	switch value := instructions.(type) {
+	case nil:
+		return nil, nil
+	case string:
+		if strings.TrimSpace(value) == "" {
+			return nil, nil
+		}
+		return []Message{{Role: "developer", Content: value}}, nil
+	case []interface{}:
+		if len(value) == 0 {
+			return nil, nil
+		}
+		return responsesInputToMessages(value)
+	default:
+		return nil, fmt.Errorf("unsupported instructions format")
+	}
 }
 
 // UnifiedResponseToResponses maps unified chat-completions responses into
@@ -372,6 +421,12 @@ func responsesInputItemToMessage(item interface{}) (*Message, error) {
 			}},
 		}, nil
 	}
+	if itemType != "" && itemType != "message" {
+		// Preserve a non-empty typed representation until the resolved target can
+		// decide whether the original Responses item is natively supported. A
+		// translated target rejects this item from RawJSON before upstream use.
+		return &Message{Role: "user", Content: stringifyAny(obj)}, nil
+	}
 
 	role := strings.TrimSpace(toString(obj["role"]))
 	if role == "" {
@@ -394,7 +449,7 @@ func responsesInputItemToMessage(item interface{}) (*Message, error) {
 		}
 		return &Message{Role: role, Content: c, ToolCallID: toolCallID}, nil
 	case []interface{}:
-		parts := make([]map[string]interface{}, 0, len(c))
+		parts := make([]interface{}, 0, len(c))
 		for _, part := range c {
 			partObj, ok := part.(map[string]interface{})
 			if !ok {
@@ -412,6 +467,17 @@ func responsesInputItemToMessage(item interface{}) (*Message, error) {
 				parts = append(parts, map[string]interface{}{"type": "text", "text": text})
 				continue
 			}
+			if partType == "input_image" {
+				imageURL := strings.TrimSpace(toString(partObj["image_url"]))
+				if imageURL != "" {
+					image := map[string]interface{}{"url": imageURL}
+					if detail := strings.TrimSpace(toString(partObj["detail"])); detail != "" {
+						image["detail"] = detail
+					}
+					parts = append(parts, map[string]interface{}{"type": "image_url", "image_url": image})
+					continue
+				}
+			}
 			parts = append(parts, partObj)
 		}
 
@@ -421,7 +487,12 @@ func responsesInputItemToMessage(item interface{}) (*Message, error) {
 
 		allText := true
 		var b strings.Builder
-		for _, p := range parts {
+		for _, rawPart := range parts {
+			p, ok := rawPart.(map[string]interface{})
+			if !ok {
+				allText = false
+				break
+			}
 			t, ok := p["type"].(string)
 			if !ok || t != "text" {
 				allText = false

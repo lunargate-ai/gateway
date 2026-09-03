@@ -115,13 +115,12 @@ func (h *Handler) validateEmbeddingsCompatibility(target routing.Target, req *mo
 	if h == nil || h.registry == nil || req == nil {
 		return nil
 	}
+	providerType, typeOK := h.registry.Type(target.Provider)
 	format := strings.ToLower(strings.TrimSpace(req.EncodingFormat))
 	switch format {
 	case "", "float":
-		return nil
 	case "base64":
 		capabilities, ok := h.registry.Capabilities(target.Provider)
-		providerType, typeOK := h.registry.Type(target.Provider)
 		if ok && typeOK && capabilities.EmbeddingsBase64 && strings.EqualFold(providerType, "openai") {
 			return nil
 		}
@@ -136,6 +135,48 @@ func (h *Handler) validateEmbeddingsCompatibility(target routing.Target, req *mo
 			Provider: target.Provider,
 			Reason:   fmt.Sprintf("unsupported value %q", req.EncodingFormat),
 		}
+	}
+	if typeOK && strings.EqualFold(providerType, "ollama") {
+		if req.Dimensions != nil {
+			return &models.CompatibilityError{
+				Field:    "dimensions",
+				Provider: target.Provider,
+				Reason:   "Ollama's embed API does not expose output dimension selection",
+			}
+		}
+		if strings.TrimSpace(req.User) != "" {
+			return &models.CompatibilityError{
+				Field:    "user",
+				Provider: target.Provider,
+				Reason:   "Ollama's embed API has no equivalent end-user identifier field",
+			}
+		}
+		if !ollamaEmbeddingInputCompatible(req.Input) {
+			return &models.CompatibilityError{
+				Field:    "input",
+				Provider: target.Provider,
+				Reason:   "Ollama's embed API accepts only a string or an array of strings",
+			}
+		}
+	}
+	return nil
+}
+
+func ollamaEmbeddingInputCompatible(input interface{}) bool {
+	switch value := input.(type) {
+	case string:
+		return true
+	case []string:
+		return true
+	case []interface{}:
+		for _, item := range value {
+			if _, ok := item.(string); !ok {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
 	}
 }
 
@@ -159,14 +200,15 @@ func (h *Handler) compatibleEmbeddingsFallbacks(fallbacks []routing.Target, req 
 }
 
 func (h *Handler) callEmbeddingsProvider(ctx context.Context, target routing.Target, req *models.EmbeddingsRequest, beforeUpstream func()) (*http.Response, error) {
-	translator, ok := h.registry.Get(target.Provider)
+	providerSnapshot, ok := h.registry.Snapshot(target.Provider)
 	if !ok {
 		return nil, fmt.Errorf("unknown provider: %s", target.Provider)
 	}
-	embeddingTranslator, ok := translator.(embeddingsTranslator)
+	embeddingTranslator, ok := providerSnapshot.Translator.(embeddingsTranslator)
 	if !ok {
 		return nil, fmt.Errorf("provider %s does not support embeddings", target.Provider)
 	}
+	ctx = withProviderRequestSnapshot(ctx, target.Provider, providerSnapshot)
 
 	reqCopy := *req
 	if strings.TrimSpace(target.Model) != "" {
@@ -203,6 +245,9 @@ func (h *Handler) callEmbeddingsProvider(ctx context.Context, target routing.Tar
 			return nil, fmt.Errorf("%w: provider %s", errUpstreamTTFTTimeout, target.Provider)
 		}
 		return nil, fmt.Errorf("failed to call provider %s: %w", target.Provider, err)
+	}
+	if resp.Request == nil {
+		resp.Request = httpReq
 	}
 
 	remaining := clientCfg.timeout - time.Since(startedAt)
@@ -391,13 +436,13 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 					tags:         h.enrichCollectorTags(collectorHeaders, resolved.Target.Provider, cachedModelCanonical, false),
 					tokensInput:  tokensIn,
 					request:      requestPayload,
-					response:     cachedResp,
+					response:     embeddingsResponseForCollector(cachedResp),
 				})
 				w.Header().Set("X-LunarGate-Cache-Status", "HIT")
 				w.Header().Set("X-LunarGate-Provider", resolved.Target.Provider)
 				w.Header().Set("X-LunarGate-Model", cachedModelCanonical)
 				setTimingHeaders(w, duration.Milliseconds(), duration.Milliseconds())
-				writeJSON(w, http.StatusOK, models.CloneEmbeddingsResponse(cachedResp))
+				writeEmbeddingsJSON(w, http.StatusOK, models.CloneEmbeddingsResponse(cachedResp))
 				return
 			}
 		}
@@ -585,41 +630,36 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("X-LunarGate-Provider", usedTarget.Provider)
+	providerSnapshot, ok := providerRequestSnapshotFromResponse(resp, usedTarget.Provider)
+	if !ok {
+		resp.Body.Close()
+		writeError(w, http.StatusInternalServerError, "provider request snapshot not found", "internal_error")
+		return
+	}
 	usedModelRaw := strings.TrimSpace(usedTarget.Model)
 	if usedModelRaw == "" {
 		usedModelRaw = modelid.ModelName(req.Model)
 		if usedModelRaw == "" {
-			if tr, ok := h.registry.Get(usedTarget.Provider); ok {
-				usedModelRaw = strings.TrimSpace(tr.DefaultModel())
-			}
+			usedModelRaw = strings.TrimSpace(providerSnapshot.Translator.DefaultModel())
 		}
 	}
 	usedModelCanonical := modelid.BuildCanonical(usedTarget.Provider, usedModelRaw)
 	req.Model = usedModelCanonical
 	w.Header().Set("X-LunarGate-Model", usedModelCanonical)
 
-	usedProviderType, ok := h.registry.Type(usedTarget.Provider)
-	if !ok {
-		resp.Body.Close()
-		writeError(w, http.StatusInternalServerError, "provider type not found", "internal_error")
-		return
-	}
+	usedProviderType := providerSnapshot.ProviderType
 	setTimingHeaders(w, -1, upstreamStartMS)
 
-	translator, ok := h.registry.Get(usedTarget.Provider)
-	if !ok {
-		resp.Body.Close()
-		writeError(w, http.StatusInternalServerError, "provider translator not found", "internal_error")
-		return
-	}
-	embeddingsTranslator, ok := translator.(embeddingsTranslator)
+	embeddingsTranslator, ok := providerSnapshot.Translator.(embeddingsTranslator)
 	if !ok {
 		resp.Body.Close()
 		writeError(w, http.StatusBadGateway, "provider does not support embeddings", "provider_error")
 		return
 	}
+	responseHeaders := resp.Header.Clone()
 
 	embeddingsResp, err := embeddingsTranslator.ParseEmbeddingsResponse(resp)
+	copyHeaders(w.Header(), responseHeaders)
 	if err != nil {
 		duration := time.Since(startTime)
 		status := http.StatusBadGateway
@@ -806,8 +846,7 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 				_ = json.Unmarshal(body, &reqObj)
 			}
 			if h.collector.ShareResponses() {
-				respBytes, _ := json.Marshal(embeddingsResp)
-				_ = json.Unmarshal(respBytes, &respObj)
+				respObj = embeddingsResponseForCollector(embeddingsResp)
 			}
 			events = append(events, observability.Event{
 				Type: "request_log",
@@ -835,5 +874,34 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 		h.collector.Enqueue(r.Context(), requestID, events)
 	}
 
-	writeJSON(w, http.StatusOK, embeddingsResp)
+	writeEmbeddingsJSON(w, http.StatusOK, embeddingsResp)
+}
+
+func embeddingsResponseJSON(resp *models.EmbeddingsResponse) []byte {
+	if resp != nil && json.Valid(bytes.TrimSpace(resp.RawJSON)) {
+		return append([]byte(nil), resp.RawJSON...)
+	}
+	body, _ := json.Marshal(resp)
+	return body
+}
+
+func embeddingsResponseForCollector(resp *models.EmbeddingsResponse) interface{} {
+	var payload interface{}
+	if err := json.Unmarshal(embeddingsResponseJSON(resp), &payload); err != nil {
+		return resp
+	}
+	return payload
+}
+
+func writeEmbeddingsJSON(w http.ResponseWriter, status int, resp *models.EmbeddingsResponse) {
+	raw := embeddingsResponseJSON(resp)
+	if len(bytes.TrimSpace(raw)) == 0 || !json.Valid(raw) {
+		writeJSON(w, status, resp)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if _, err := w.Write(raw); err != nil {
+		log.Error().Err(err).Msg("failed to write embeddings JSON response")
+	}
 }

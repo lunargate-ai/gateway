@@ -1,14 +1,27 @@
 package resilience
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/lunargate-ai/gateway/internal/config"
 )
+
+type trackingResponseBody struct {
+	io.Reader
+	closed bool
+}
+
+func (b *trackingResponseBody) Close() error {
+	b.closed = true
+	return nil
+}
 
 func TestRetrier_Do_WithRetryDisabledContext_UsesSingleAttempt(t *testing.T) {
 	retrier := NewRetrier(config.RetryConfig{
@@ -182,5 +195,114 @@ func TestRetrier_UnconfiguredServerStatusIsImmediateFailure(t *testing.T) {
 	}
 	if attempts != 1 || retryCount != 0 {
 		t.Fatalf("attempts/retryCount = %d/%d, want 1/0", attempts, retryCount)
+	}
+}
+
+func TestRetrier_RetryableStatusPreservesOnlyFinalSnapshot(t *testing.T) {
+	retrier := NewRetrier(config.RetryConfig{
+		Enabled:         true,
+		MaxAttempts:     2,
+		InitialDelay:    0,
+		MaxDelay:        0,
+		Multiplier:      1,
+		RetryableErrors: []int{http.StatusTooManyRequests},
+	})
+	bodyValues := []string{`{"error":"first-attempt-secret"}`, `{"error":"final-rate-limit"}`}
+	headerValues := []string{"first-header-secret", "final-header"}
+	bodies := make([]*trackingResponseBody, 0, len(bodyValues))
+	headers := make([]http.Header, 0, len(bodyValues))
+	attempt := 0
+
+	resp, retryCount, err := retrier.Do(context.Background(), func(context.Context) (*http.Response, error) {
+		body := &trackingResponseBody{Reader: strings.NewReader(bodyValues[attempt])}
+		header := http.Header{
+			"Content-Type":       []string{"application/json"},
+			"X-Upstream-Attempt": []string{headerValues[attempt]},
+		}
+		bodies = append(bodies, body)
+		headers = append(headers, header)
+		attempt++
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Header:     header,
+			Body:       body,
+		}, nil
+	})
+
+	if resp != nil {
+		t.Fatalf("response = %#v, want nil", resp)
+	}
+	if retryCount != 2 {
+		t.Fatalf("retryCount = %d, want 2", retryCount)
+	}
+	var statusErr *RetryableStatusError
+	if !errors.As(err, &statusErr) {
+		t.Fatalf("error = %v, want RetryableStatusError", err)
+	}
+	if statusErr.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", statusErr.StatusCode)
+	}
+	if got, want := string(statusErr.Body), bodyValues[1]; got != want {
+		t.Fatalf("body = %q, want %q", got, want)
+	}
+	if statusErr.Truncated {
+		t.Fatal("final bounded response unexpectedly marked truncated")
+	}
+	if got, want := statusErr.Headers.Get("X-Upstream-Attempt"), headerValues[1]; got != want {
+		t.Fatalf("header = %q, want %q", got, want)
+	}
+	for i, body := range bodies {
+		if !body.closed {
+			t.Fatalf("attempt %d response body was not closed", i+1)
+		}
+	}
+	headers[1].Set("X-Upstream-Attempt", "mutated-after-snapshot")
+	if got := statusErr.Headers.Get("X-Upstream-Attempt"); got != headerValues[1] {
+		t.Fatalf("snapshot header aliased original response: %q", got)
+	}
+	if strings.Contains(err.Error(), "final-rate-limit") || strings.Contains(err.Error(), "final-header") || strings.Contains(err.Error(), "first-attempt-secret") {
+		t.Fatalf("error string leaked upstream response data: %q", err.Error())
+	}
+}
+
+func TestRetrier_RetryableStatusBoundsSnapshotBody(t *testing.T) {
+	retrier := NewRetrier(config.RetryConfig{
+		Enabled:         true,
+		MaxAttempts:     1,
+		RetryableErrors: []int{http.StatusBadGateway},
+	})
+	wantPrefix := bytes.Repeat([]byte("x"), retryableStatusBodyLimit)
+	upstreamBody := append(append([]byte(nil), wantPrefix...), bytes.Repeat([]byte("y"), 128)...)
+	body := &trackingResponseBody{Reader: bytes.NewReader(upstreamBody)}
+
+	_, _, err := retrier.Do(context.Background(), func(context.Context) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusBadGateway,
+			Header:     http.Header{"X-Upstream-Trace": []string{"sensitive-trace"}},
+			Body:       body,
+		}, nil
+	})
+
+	var statusErr *RetryableStatusError
+	if !errors.As(err, &statusErr) {
+		t.Fatalf("error = %v, want RetryableStatusError", err)
+	}
+	if !body.closed {
+		t.Fatal("upstream response body was not closed")
+	}
+	if !statusErr.Truncated {
+		t.Fatal("oversized response was not marked truncated")
+	}
+	if got := len(statusErr.Body); got != retryableStatusBodyLimit {
+		t.Fatalf("snapshot body length = %d, want %d", got, retryableStatusBodyLimit)
+	}
+	if !bytes.Equal(statusErr.Body, wantPrefix) {
+		t.Fatal("snapshot body does not contain the bounded upstream prefix")
+	}
+	if got := cap(statusErr.Body); got != retryableStatusBodyLimit {
+		t.Fatalf("snapshot body capacity = %d, want bounded capacity %d", got, retryableStatusBodyLimit)
+	}
+	if strings.Contains(err.Error(), "sensitive-trace") {
+		t.Fatalf("error string leaked upstream header: %q", err.Error())
 	}
 }

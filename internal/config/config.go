@@ -92,6 +92,8 @@ type ProviderCapabilities struct {
 	ResponseCompaction   bool     `mapstructure:"response_compaction"`
 	ResponseInputTokens  bool     `mapstructure:"response_input_tokens"`
 	EmbeddingsBase64     bool     `mapstructure:"embeddings_base64"`
+	StructuredOutputs    bool     `mapstructure:"structured_outputs"`
+	ReasoningEffort      bool     `mapstructure:"reasoning_effort"`
 	HostedTools          []string `mapstructure:"hosted_tools"`
 }
 

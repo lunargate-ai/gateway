@@ -17,6 +17,16 @@ type registryEntry struct {
 	capabilities config.ProviderCapabilities
 }
 
+// ProviderSnapshot is an immutable view of one provider registry entry. It is
+// intended to be retained for the whole upstream request lifecycle so a
+// concurrent configuration reload cannot mix translators, provider types, or
+// capabilities from different registry generations.
+type ProviderSnapshot struct {
+	Translator   models.ProviderTranslator
+	ProviderType string
+	Capabilities config.ProviderCapabilities
+}
+
 // Registry manages all registered provider translators.
 type Registry struct {
 	mu        sync.RWMutex
@@ -113,36 +123,47 @@ func createTranslator(providerType string, cfg config.ProviderConfig) (models.Pr
 
 // Get returns a provider translator by name.
 func (r *Registry) Get(name string) (models.ProviderTranslator, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	entry, ok := r.providers[name]
+	snapshot, ok := r.Snapshot(name)
 	if !ok {
 		return nil, false
 	}
-	return entry.translator, true
+	return snapshot.Translator, true
 }
 
 // Type returns the resolved provider type for a configured provider ID.
 func (r *Registry) Type(name string) (string, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	entry, ok := r.providers[name]
+	snapshot, ok := r.Snapshot(name)
 	if !ok {
 		return "", false
 	}
-	return entry.providerType, true
+	return snapshot.ProviderType, true
 }
 
 // Capabilities returns the explicitly configured optional API contracts for a
 // provider. The returned value does not alias registry-owned slices.
 func (r *Registry) Capabilities(name string) (config.ProviderCapabilities, bool) {
+	snapshot, ok := r.Snapshot(name)
+	if !ok {
+		return config.ProviderCapabilities{}, false
+	}
+	return snapshot.Capabilities, true
+}
+
+// Snapshot returns a translator, provider type, and capabilities from one
+// registry generation. The returned capabilities do not alias registry-owned
+// slices.
+func (r *Registry) Snapshot(name string) (ProviderSnapshot, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	entry, ok := r.providers[name]
 	if !ok {
-		return config.ProviderCapabilities{}, false
+		return ProviderSnapshot{}, false
 	}
-	return cloneProviderCapabilities(entry.capabilities), true
+	return ProviderSnapshot{
+		Translator:   entry.translator,
+		ProviderType: entry.providerType,
+		Capabilities: cloneProviderCapabilities(entry.capabilities),
+	}, true
 }
 
 // List returns all registered provider names.

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -41,22 +42,21 @@ func (h *Handler) streamNDJSONResponse(
 		return upstreamProviderError(providerResp.StatusCode, translator.Name(), b)
 	}
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		return fmt.Errorf("response writer does not support flushing")
-	}
+	defer providerResp.Body.Close()
+	controller := http.NewResponseController(w)
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Transfer-Encoding", "chunked")
 	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
-
-	defer providerResp.Body.Close()
+	if err := controller.Flush(); err != nil {
+		return fmt.Errorf("failed to flush stream headers: %w", err)
+	}
 
 	scanner := bufio.NewScanner(providerResp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	envelope := newChatStreamEnvelopeNormalizer(translator.DefaultModel())
 
 	for scanner.Scan() {
 		select {
@@ -71,7 +71,7 @@ func (h *Handler) streamNDJSONResponse(
 		}
 
 		chunk, err := translator.ParseStreamChunk(line)
-		streamDone := err == providers.ErrStreamDone
+		streamDone := errors.Is(err, providers.ErrStreamDone)
 		if err != nil && !streamDone {
 			return fmt.Errorf("failed to parse ndjson stream chunk: %w", err)
 		}
@@ -80,6 +80,7 @@ func (h *Handler) streamNDJSONResponse(
 		}
 
 		if chunk != nil {
+			chunk = envelope.normalize(chunk)
 			if observer != nil {
 				observer(chunk)
 			}
@@ -88,14 +89,16 @@ func (h *Handler) streamNDJSONResponse(
 			if err != nil {
 				log.Error().Err(err).Msg("failed to marshal stream chunk")
 			} else {
-				fmt.Fprintf(w, "data: %s\n\n", chunkJSON)
-				flusher.Flush()
+				if err := writeSSEFrame(w, controller, chunkJSON, "stream chunk"); err != nil {
+					return err
+				}
 			}
 		}
 
 		if streamDone {
-			fmt.Fprintf(w, "data: [DONE]\n\n")
-			flusher.Flush()
+			if err := writeSSEFrame(w, controller, []byte("[DONE]"), "done frame"); err != nil {
+				return err
+			}
 			return nil
 		}
 
@@ -107,8 +110,9 @@ func (h *Handler) streamNDJSONResponse(
 			}
 		}
 		if isDone {
-			fmt.Fprintf(w, "data: [DONE]\n\n")
-			flusher.Flush()
+			if err := writeSSEFrame(w, controller, []byte("[DONE]"), "done frame"); err != nil {
+				return err
+			}
 			return nil
 		}
 	}

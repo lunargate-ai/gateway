@@ -106,18 +106,25 @@ func (t *ollamaStreamTranslator) ParseStreamChunk(data []byte) (*models.StreamCh
 		needChunk = true
 		msg.ToolCalls = make([]models.ToolCall, 0, len(ev.Message.ToolCalls))
 		for i := range ev.Message.ToolCalls {
+			call := ev.Message.ToolCalls[i]
 			idx := i
-			id := fmt.Sprintf("call_%s_%d", t.id, i)
+			if call.Function.Index != nil {
+				idx = *call.Function.Index
+			}
+			id := call.ID
+			if strings.TrimSpace(id) == "" {
+				id = fmt.Sprintf("call_%s_%d", t.id, idx)
+			}
 			args := "{}"
-			if len(ev.Message.ToolCalls[i].Function.Arguments) > 0 {
-				args = string(ev.Message.ToolCalls[i].Function.Arguments)
+			if len(call.Function.Arguments) > 0 {
+				args = string(call.Function.Arguments)
 			}
 			msg.ToolCalls = append(msg.ToolCalls, models.ToolCall{
 				Index: &idx,
 				ID:    id,
 				Type:  "function",
 				Function: models.ToolCallFunction{
-					Name:      ev.Message.ToolCalls[i].Function.Name,
+					Name:      call.Function.Name,
 					Arguments: args,
 				},
 			})

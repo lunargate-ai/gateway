@@ -51,6 +51,9 @@ type anthropicRequest struct {
 	MaxTokens     int                     `json:"max_tokens"`
 	Messages      []anthropicMessage      `json:"messages"`
 	System        []anthropicContentBlock `json:"system,omitempty"`
+	Metadata      *anthropicMetadata      `json:"metadata,omitempty"`
+	OutputConfig  *anthropicOutputConfig  `json:"output_config,omitempty"`
+	Thinking      *anthropicThinking      `json:"thinking,omitempty"`
 	Temperature   *float64                `json:"temperature,omitempty"`
 	TopP          *float64                `json:"top_p,omitempty"`
 	TopK          *int                    `json:"top_k,omitempty"`
@@ -58,6 +61,24 @@ type anthropicRequest struct {
 	StopSequences []string                `json:"stop_sequences,omitempty"`
 	Tools         []anthropicTool         `json:"tools,omitempty"`
 	ToolChoice    interface{}             `json:"tool_choice,omitempty"`
+}
+
+type anthropicMetadata struct {
+	UserID string `json:"user_id,omitempty"`
+}
+
+type anthropicOutputConfig struct {
+	Effort string                     `json:"effort,omitempty"`
+	Format *anthropicJSONOutputFormat `json:"format,omitempty"`
+}
+
+type anthropicThinking struct {
+	Type string `json:"type"`
+}
+
+type anthropicJSONOutputFormat struct {
+	Type   string      `json:"type"`
+	Schema interface{} `json:"schema"`
 }
 
 type anthropicMessage struct {
@@ -108,7 +129,87 @@ type anthropicErrorResponse struct {
 
 // --- Interface implementation ---
 
+// ValidateRequestCompatibility verifies that an OpenAI-compatible request can
+// be represented by this exact Anthropic target without silently dropping a
+// client control.
+func (t *AnthropicTranslator) ValidateRequestCompatibility(providerID string, req *models.UnifiedRequest) error {
+	if req == nil {
+		return nil
+	}
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" {
+		providerID = "anthropic"
+	}
+
+	unsupported := func(field, reason string) error {
+		return &models.CompatibilityError{Field: field, Provider: providerID, Reason: reason}
+	}
+	if req.N != nil && *req.N != 1 {
+		return unsupported("n", "Anthropic Messages returns one completion per request")
+	}
+	if req.PresencePenalty != nil {
+		return unsupported("presence_penalty", "Anthropic Messages has no equivalent presence penalty")
+	}
+	if req.FrequencyPenalty != nil {
+		return unsupported("frequency_penalty", "Anthropic Messages has no equivalent frequency penalty")
+	}
+	if req.LogitBias != nil {
+		return unsupported("logit_bias", "Anthropic Messages has no equivalent token bias control")
+	}
+	if req.Seed != nil {
+		return unsupported("seed", "Anthropic Messages has no deterministic seed control")
+	}
+	if req.Store != nil && *req.Store && !strings.EqualFold(strings.TrimSpace(req.SourceRequestType), "responses") {
+		return unsupported("store", "Anthropic Messages has no per-request storage control")
+	}
+	if strings.TrimSpace(req.PreviousResponseID) != "" {
+		return unsupported("previous_response_id", "Anthropic Messages has no native Responses continuation")
+	}
+
+	if req.Stop != nil {
+		if _, ok := mapAnthropicStopSequences(req.Stop); !ok {
+			return unsupported("stop", "expected a string or an array of strings")
+		}
+	}
+	if req.ToolChoice != nil {
+		if _, ok := mapOpenAIToolChoiceToAnthropic(req.ToolChoice); !ok {
+			return unsupported("tool_choice", "the requested tool selection mode has no Anthropic equivalent")
+		}
+	}
+
+	if effort := strings.ToLower(strings.TrimSpace(req.ReasoningEffort)); effort != "" {
+		if !t.cfg.Capabilities.ReasoningEffort {
+			return unsupported("reasoning_effort", "enable provider capability reasoning_effort for a model with output_config.effort support")
+		}
+		if !isAnthropicEffort(effort) {
+			return unsupported("reasoning_effort", fmt.Sprintf("unsupported Anthropic effort level %q", req.ReasoningEffort))
+		}
+	}
+
+	if req.ResponseFormat != nil {
+		switch formatType := strings.ToLower(strings.TrimSpace(req.ResponseFormat.Type)); formatType {
+		case "text":
+			// Anthropic's default text response is equivalent.
+		case "json_schema":
+			if !t.cfg.Capabilities.StructuredOutputs {
+				return unsupported("response_format", "enable provider capability structured_outputs for a compatible Anthropic model")
+			}
+			if req.ResponseFormat.JSONSchema == nil || req.ResponseFormat.JSONSchema.Schema == nil {
+				return unsupported("response_format.json_schema.schema", "a JSON schema is required for Anthropic structured output")
+			}
+		default:
+			return unsupported("response_format", fmt.Sprintf("Anthropic Messages has no equivalent for response format %q", req.ResponseFormat.Type))
+		}
+	}
+
+	return nil
+}
+
 func (t *AnthropicTranslator) TranslateRequest(ctx context.Context, req *models.UnifiedRequest) (*http.Request, error) {
+	if err := t.ValidateRequestCompatibility("anthropic", req); err != nil {
+		return nil, err
+	}
+
 	var systemPrompt []anthropicContentBlock
 	var messages []anthropicMessage
 
@@ -161,32 +262,43 @@ func (t *AnthropicTranslator) TranslateRequest(ctx context.Context, req *models.
 		v := *t.cfg.TopK
 		topK = &v
 	}
+	var metadata *anthropicMetadata
+	if userID := strings.TrimSpace(req.User); userID != "" {
+		metadata = &anthropicMetadata{UserID: userID}
+	}
+	var outputConfig *anthropicOutputConfig
+	var thinking *anthropicThinking
+	if effort := strings.ToLower(strings.TrimSpace(req.ReasoningEffort)); effort != "" {
+		outputConfig = &anthropicOutputConfig{Effort: effort}
+		thinking = &anthropicThinking{Type: "adaptive"}
+	}
+	if req.ResponseFormat != nil && strings.EqualFold(strings.TrimSpace(req.ResponseFormat.Type), "json_schema") {
+		if outputConfig == nil {
+			outputConfig = &anthropicOutputConfig{}
+		}
+		outputConfig.Format = &anthropicJSONOutputFormat{
+			Type:   "json_schema",
+			Schema: req.ResponseFormat.JSONSchema.Schema,
+		}
+	}
+	toolChoice, _ := mapOpenAIToolChoiceToAnthropic(req.ToolChoice)
+	stopSequences, _ := mapAnthropicStopSequences(req.Stop)
 
 	anthropicReq := anthropicRequest{
-		Model:       req.Model,
-		MaxTokens:   maxTokens,
-		Messages:    messages,
-		System:      systemPrompt,
-		Temperature: temperature,
-		TopP:        topP,
-		TopK:        topK,
-		Stream:      req.Stream,
-		Tools:       mapOpenAIToolsToAnthropic(req.Tools),
-		ToolChoice:  mapOpenAIToolChoiceToAnthropic(req.ToolChoice),
-	}
-
-	// Handle stop sequences
-	if req.Stop != nil {
-		switch v := req.Stop.(type) {
-		case string:
-			anthropicReq.StopSequences = []string{v}
-		case []interface{}:
-			for _, s := range v {
-				if str, ok := s.(string); ok {
-					anthropicReq.StopSequences = append(anthropicReq.StopSequences, str)
-				}
-			}
-		}
+		Model:         req.Model,
+		MaxTokens:     maxTokens,
+		Messages:      messages,
+		System:        systemPrompt,
+		Metadata:      metadata,
+		OutputConfig:  outputConfig,
+		Thinking:      thinking,
+		Temperature:   temperature,
+		TopP:          topP,
+		TopK:          topK,
+		Stream:        req.Stream,
+		StopSequences: stopSequences,
+		Tools:         mapOpenAIToolsToAnthropic(req.Tools),
+		ToolChoice:    toolChoice,
 	}
 
 	body, err := json.Marshal(anthropicReq)
@@ -536,28 +648,28 @@ func mapOpenAIToolsToAnthropic(tools []models.Tool) []anthropicTool {
 	return out
 }
 
-func mapOpenAIToolChoiceToAnthropic(choice interface{}) interface{} {
+func mapOpenAIToolChoiceToAnthropic(choice interface{}) (interface{}, bool) {
 	if choice == nil {
-		return nil
+		return nil, true
 	}
 	if s, ok := choice.(string); ok {
-		switch s {
+		switch strings.ToLower(strings.TrimSpace(s)) {
 		case "auto":
-			return map[string]interface{}{"type": "auto"}
+			return map[string]interface{}{"type": "auto"}, true
 		case "none":
-			return map[string]interface{}{"type": "none"}
+			return map[string]interface{}{"type": "none"}, true
 		case "any":
-			return map[string]interface{}{"type": "any"}
+			return map[string]interface{}{"type": "any"}, true
 		case "required":
-			return map[string]interface{}{"type": "any"}
+			return map[string]interface{}{"type": "any"}, true
 		default:
-			return nil
+			return nil, false
 		}
 	}
 
 	b, err := json.Marshal(choice)
 	if err != nil {
-		return nil
+		return nil, false
 	}
 	var obj struct {
 		Type     string `json:"type"`
@@ -566,16 +678,56 @@ func mapOpenAIToolChoiceToAnthropic(choice interface{}) interface{} {
 		} `json:"function"`
 	}
 	if err := json.Unmarshal(b, &obj); err != nil {
-		return nil
+		return nil, false
 	}
-	if obj.Type == "function" && obj.Function != nil && obj.Function.Name != "" {
+	switch strings.ToLower(strings.TrimSpace(obj.Type)) {
+	case "function":
+		if obj.Function == nil || strings.TrimSpace(obj.Function.Name) == "" {
+			return nil, false
+		}
 		return map[string]interface{}{
 			"type": "tool",
-			"name": obj.Function.Name,
+			"name": strings.TrimSpace(obj.Function.Name),
+		}, true
+	case "required", "any":
+		return map[string]interface{}{"type": "any"}, true
+	case "auto":
+		return map[string]interface{}{"type": "auto"}, true
+	case "none":
+		return map[string]interface{}{"type": "none"}, true
+	default:
+		return nil, false
+	}
+}
+
+func mapAnthropicStopSequences(stop interface{}) ([]string, bool) {
+	switch value := stop.(type) {
+	case nil:
+		return nil, true
+	case string:
+		return []string{value}, true
+	case []string:
+		return append([]string(nil), value...), true
+	case []interface{}:
+		sequences := make([]string, 0, len(value))
+		for _, item := range value {
+			sequence, ok := item.(string)
+			if !ok {
+				return nil, false
+			}
+			sequences = append(sequences, sequence)
 		}
+		return sequences, true
+	default:
+		return nil, false
 	}
-	if obj.Type == "required" {
-		return map[string]interface{}{"type": "any"}
+}
+
+func isAnthropicEffort(effort string) bool {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "low", "medium", "high", "xhigh", "max":
+		return true
+	default:
+		return false
 	}
-	return nil
 }

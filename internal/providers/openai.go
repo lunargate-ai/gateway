@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/lunargate-ai/gateway/internal/config"
 	"github.com/lunargate-ai/gateway/pkg/models"
 	"github.com/rs/zerolog/log"
@@ -244,7 +245,7 @@ func normalizeOpenAIChatContentParts(message map[string]interface{}) {
 }
 
 func (t *OpenAITranslator) TranslateEmbeddingsRequest(ctx context.Context, req *models.EmbeddingsRequest) (*http.Request, error) {
-	body, err := json.Marshal(req)
+	body, err := openAIEmbeddingsRequestBody(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal openai embeddings request: %w", err)
 	}
@@ -264,6 +265,25 @@ func (t *OpenAITranslator) TranslateEmbeddingsRequest(ctx context.Context, req *
 	return httpReq, nil
 }
 
+func openAIEmbeddingsRequestBody(req *models.EmbeddingsRequest) ([]byte, error) {
+	if req == nil {
+		return nil, fmt.Errorf("request is required")
+	}
+	if len(bytes.TrimSpace(req.RawJSON)) == 0 {
+		return json.Marshal(req)
+	}
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(req.RawJSON, &payload); err != nil {
+		return nil, fmt.Errorf("decode preserved embeddings request: %w", err)
+	}
+	if payload == nil {
+		return nil, fmt.Errorf("embeddings request must be a JSON object")
+	}
+	setRawJSONValue(payload, "model", req.Model)
+	return json.Marshal(payload)
+}
+
 func (t *OpenAITranslator) ParseResponse(resp *http.Response) (*models.UnifiedResponse, error) {
 	defer resp.Body.Close()
 
@@ -272,7 +292,12 @@ func (t *OpenAITranslator) ParseResponse(resp *http.Response) (*models.UnifiedRe
 		return nil, fmt.Errorf("failed to read openai response body: %w", err)
 	}
 
-	if resp.StatusCode != http.StatusOK {
+	nativeResponsesRequest := resp.Request != nil &&
+		strings.EqualFold(strings.TrimSpace(UpstreamRequestTypeFromContext(resp.Request.Context())), "responses") &&
+		strings.EqualFold(strings.TrimSpace(SourceRequestTypeFromContext(resp.Request.Context())), "responses")
+	nativeResponsesSuccess := nativeResponsesRequest &&
+		resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices
+	if resp.StatusCode != http.StatusOK && !nativeResponsesSuccess {
 		var errResp models.ErrorResponse
 		if jsonErr := json.Unmarshal(body, &errResp); jsonErr == nil {
 			return nil, &ProviderError{
@@ -298,7 +323,16 @@ func (t *OpenAITranslator) ParseResponse(resp *http.Response) (*models.UnifiedRe
 		if err := json.Unmarshal(body, &responsesResp); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal openai responses object: %w", err)
 		}
-		return responsesResponseToUnified(&responsesResp), nil
+		result := responsesResponseToUnified(&responsesResp)
+		if nativeResponsesRequest {
+			result.RawJSON = append(json.RawMessage(nil), body...)
+		}
+		return result, nil
+	}
+
+	normalizedBody, normalizedEnvelope := normalizeOpenAIChatResponseEnvelope(body, t.DefaultModel())
+	if normalizedEnvelope {
+		body = normalizedBody
 	}
 
 	var result models.UnifiedResponse
@@ -337,6 +371,88 @@ func (t *OpenAITranslator) ParseResponse(resp *http.Response) (*models.UnifiedRe
 	return &result, nil
 }
 
+func normalizeOpenAIChatResponseEnvelope(body []byte, defaultModel string) ([]byte, bool) {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(body, &payload); err != nil || payload == nil {
+		return body, false
+	}
+
+	changed := false
+	if parseOpenAIResponseString(payload["id"]) == "" {
+		setRawJSONValue(payload, "id", "chatcmpl-"+strings.ReplaceAll(uuid.NewString(), "-", ""))
+		changed = true
+	}
+	if parseOpenAIResponseString(payload["object"]) == "" {
+		setRawJSONValue(payload, "object", "chat.completion")
+		changed = true
+	}
+	if _, ok := payload["created"]; !ok {
+		setRawJSONValue(payload, "created", time.Now().Unix())
+		changed = true
+	}
+	if parseOpenAIResponseString(payload["model"]) == "" && strings.TrimSpace(defaultModel) != "" {
+		setRawJSONValue(payload, "model", strings.TrimSpace(defaultModel))
+		changed = true
+	}
+
+	if rawUsage := bytes.TrimSpace(payload["usage"]); len(rawUsage) > 0 && string(rawUsage) != "null" {
+		var usage map[string]json.RawMessage
+		if err := json.Unmarshal(rawUsage, &usage); err == nil && usage != nil {
+			usageChanged := copyOpenAIUsageAlias(usage, "prompt_tokens", "input_tokens")
+			usageChanged = copyOpenAIUsageAlias(usage, "completion_tokens", "output_tokens") || usageChanged
+			if _, ok := usage["total_tokens"]; !ok {
+				promptTokens, promptOK := parseOpenAIResponseInteger(usage["prompt_tokens"])
+				completionTokens, completionOK := parseOpenAIResponseInteger(usage["completion_tokens"])
+				if promptOK && completionOK {
+					setRawJSONValue(usage, "total_tokens", promptTokens+completionTokens)
+					usageChanged = true
+				}
+			}
+			if usageChanged {
+				setRawJSONValue(payload, "usage", usage)
+				changed = true
+			}
+		}
+	}
+
+	if !changed {
+		return body, false
+	}
+	normalized, err := json.Marshal(payload)
+	if err != nil {
+		return body, false
+	}
+	return normalized, true
+}
+
+func copyOpenAIUsageAlias(usage map[string]json.RawMessage, target string, source string) bool {
+	if _, ok := usage[target]; ok {
+		return false
+	}
+	value, ok := usage[source]
+	if !ok || len(bytes.TrimSpace(value)) == 0 {
+		return false
+	}
+	usage[target] = append(json.RawMessage(nil), value...)
+	return true
+}
+
+func parseOpenAIResponseString(raw json.RawMessage) string {
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(value)
+}
+
+func parseOpenAIResponseInteger(raw json.RawMessage) (int, bool) {
+	var value int
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return 0, false
+	}
+	return value, true
+}
+
 func (t *OpenAITranslator) ParseEmbeddingsResponse(resp *http.Response) (*models.EmbeddingsResponse, error) {
 	defer resp.Body.Close()
 
@@ -366,6 +482,7 @@ func (t *OpenAITranslator) ParseEmbeddingsResponse(resp *http.Response) (*models
 	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal openai embeddings response: %w", err)
 	}
+	result.RawJSON = append(json.RawMessage(nil), body...)
 
 	return &result, nil
 }

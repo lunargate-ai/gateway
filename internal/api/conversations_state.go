@@ -128,6 +128,23 @@ func (s *conversationStateStore) get(conversationID string) (conversationObject,
 	return cloneConversationObject(entry.conversation), true
 }
 
+func (s *conversationStateStore) getItems(conversationID string) ([]map[string]json.RawMessage, bool) {
+	if s == nil || conversationID == "" {
+		return nil, false
+	}
+
+	now := s.currentTime()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanupExpiredLocked(now)
+	entry, ok := s.entries[conversationID]
+	if !ok {
+		return nil, false
+	}
+	s.touchLocked(entry)
+	return cloneConversationItems(entry.items), true
+}
+
 func (s *conversationStateStore) updateMetadata(conversationID string, metadata map[string]string) (conversationObject, error) {
 	if s == nil || conversationID == "" {
 		return conversationObject{}, errConversationNotFound

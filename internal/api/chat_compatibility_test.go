@@ -51,6 +51,163 @@ func TestCompatibleChatFallbacksDropsTargetsThatWouldChangeSemantics(t *testing.
 	}
 }
 
+func TestValidateChatCompatibilityRejectsUnsupportedOllamaFieldsWithTargetID(t *testing.T) {
+	handler := &Handler{registry: providers.NewRegistry(map[string]config.ProviderConfig{
+		"local-ollama": {Type: "ollama"},
+	})}
+	two := 2
+	store := true
+	tests := []struct {
+		name      string
+		request   models.UnifiedRequest
+		wantField string
+	}{
+		{name: "multiple choices", request: models.UnifiedRequest{N: &two}, wantField: "n"},
+		{name: "logit bias", request: models.UnifiedRequest{LogitBias: map[string]int{"7": -10}}, wantField: "logit_bias"},
+		{name: "user", request: models.UnifiedRequest{User: "customer-123"}, wantField: "user"},
+		{name: "store", request: models.UnifiedRequest{Store: &store}, wantField: "store"},
+		{
+			name: "response format",
+			request: models.UnifiedRequest{
+				ResponseFormat: &models.ResponseFormat{Type: "xml"},
+			},
+			wantField: "response_format.type",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := handler.validateChatCompatibility(routing.Target{Provider: "local-ollama"}, &tt.request)
+			var compatibilityErr *models.CompatibilityError
+			if !errors.As(err, &compatibilityErr) {
+				t.Fatalf("error = %v, want CompatibilityError", err)
+			}
+			if compatibilityErr.Field != tt.wantField || compatibilityErr.Provider != "local-ollama" {
+				t.Fatalf("compatibility error = %#v, want field=%q provider=local-ollama", compatibilityErr, tt.wantField)
+			}
+		})
+	}
+}
+
+func TestCompatibleChatFallbacksDropsOllamaForUnsupportedRequestSemantics(t *testing.T) {
+	handler := &Handler{registry: providers.NewRegistry(map[string]config.ProviderConfig{
+		"ollama-backup": {Type: "ollama"},
+		"openai-backup": {Type: "openai"},
+	})}
+	two := 2
+	fallbacks := []routing.Target{
+		{Provider: "ollama-backup", Model: "qwen3.5"},
+		{Provider: "openai-backup", Model: "gpt-5.4"},
+	}
+
+	got := handler.compatibleChatFallbacks(fallbacks, &models.UnifiedRequest{N: &two})
+	if len(got) != 1 || got[0].Provider != "openai-backup" {
+		t.Fatalf("compatible fallbacks = %#v, want only openai-backup", got)
+	}
+}
+
+func TestCompatibleChatFallbacksKeepsOllamaForMappedGenerationControls(t *testing.T) {
+	handler := &Handler{registry: providers.NewRegistry(map[string]config.ProviderConfig{
+		"ollama-backup": {Type: "ollama"},
+	})}
+	presencePenalty := 0.25
+	frequencyPenalty := -0.5
+	seed := 42
+	store := false
+	one := 1
+	req := &models.UnifiedRequest{
+		N:                &one,
+		Stop:             []interface{}{"END"},
+		PresencePenalty:  &presencePenalty,
+		FrequencyPenalty: &frequencyPenalty,
+		Seed:             &seed,
+		Store:            &store,
+		ResponseFormat: &models.ResponseFormat{
+			Type:       "json_schema",
+			JSONSchema: &models.JSONSchemaResponseFormat{Schema: map[string]interface{}{"type": "object"}},
+		},
+	}
+	fallbacks := []routing.Target{{Provider: "ollama-backup", Model: "qwen3.5"}}
+
+	got := handler.compatibleChatFallbacks(fallbacks, req)
+	if len(got) != 1 || got[0].Provider != "ollama-backup" {
+		t.Fatalf("compatible fallbacks = %#v, want ollama-backup", got)
+	}
+}
+
+func TestCompatibleChatFallbacksDropsOllamaForLossyMessageTranslation(t *testing.T) {
+	handler := &Handler{registry: providers.NewRegistry(map[string]config.ProviderConfig{
+		"ollama-backup": {Type: "ollama"},
+		"openai-backup": {Type: "openai"},
+	})}
+	req := &models.UnifiedRequest{Messages: []models.Message{{
+		Role: "user",
+		Content: []interface{}{map[string]interface{}{
+			"type": "image_url",
+			"image_url": map[string]interface{}{
+				"url": "https://example.com/private-image.png",
+			},
+		}},
+	}}}
+	fallbacks := []routing.Target{
+		{Provider: "ollama-backup", Model: "gemma3"},
+		{Provider: "openai-backup", Model: "gpt-5.4"},
+	}
+
+	got := handler.compatibleChatFallbacks(fallbacks, req)
+	if len(got) != 1 || got[0].Provider != "openai-backup" {
+		t.Fatalf("compatible fallbacks = %#v, want only openai-backup", got)
+	}
+}
+
+func TestCompatibleChatFallbacksKeepsOllamaForNativeMessageHistory(t *testing.T) {
+	const image = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+	handler := &Handler{registry: providers.NewRegistry(map[string]config.ProviderConfig{
+		"ollama-backup": {Type: "ollama"},
+	})}
+	index := 0
+	req := &models.UnifiedRequest{Messages: []models.Message{
+		{
+			Role: "user",
+			Content: []interface{}{
+				map[string]interface{}{"type": "text", "text": "inspect"},
+				map[string]interface{}{"type": "input_image", "image_url": "data:image/png;base64," + image},
+			},
+		},
+		{
+			Role:             "assistant",
+			ReasoningContent: "Need a tool.",
+			ToolCalls: []models.ToolCall{{
+				Index: &index,
+				ID:    "call_1",
+				Type:  "function",
+				Function: models.ToolCallFunction{
+					Name:      "inspect",
+					Arguments: `{}`,
+				},
+			}},
+		},
+		{Role: "tool", Content: "done", Name: "inspect", ToolCallID: "call_1"},
+	}}
+
+	got := handler.compatibleChatFallbacks([]routing.Target{{Provider: "ollama-backup", Model: "gemma3"}}, req)
+	if len(got) != 1 || got[0].Provider != "ollama-backup" {
+		t.Fatalf("compatible fallbacks = %#v, want ollama-backup", got)
+	}
+}
+
+func TestValidateChatCompatibilityAllowsResponsesStoreHandledLocallyForOllama(t *testing.T) {
+	handler := &Handler{registry: providers.NewRegistry(map[string]config.ProviderConfig{
+		"local-ollama": {Type: "ollama"},
+	})}
+	store := true
+	req := &models.UnifiedRequest{SourceRequestType: "responses", Store: &store}
+
+	if err := handler.validateChatCompatibility(routing.Target{Provider: "local-ollama"}, req); err != nil {
+		t.Fatalf("Responses store handled locally was rejected: %v", err)
+	}
+}
+
 func TestValidateChatCompatibilityAllowsTopKForTranslatedProviders(t *testing.T) {
 	handler := &Handler{registry: providers.NewRegistry(map[string]config.ProviderConfig{
 		"anthropic-primary": {Type: "anthropic"},

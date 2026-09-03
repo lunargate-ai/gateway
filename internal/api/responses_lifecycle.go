@@ -3,7 +3,9 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -29,67 +31,263 @@ type responseInputItemList struct {
 	HasMore bool              `json:"has_more"`
 }
 
-// RetrieveResponse returns a response retained by LunarGate's bounded local
-// Responses state. Native provider lifecycle proxying is intentionally not
-// implied by this endpoint.
+// RetrieveResponse returns a locally emulated response or proxies the request
+// to the native provider that owns the response ID.
 func (h *Handler) RetrieveResponse(w http.ResponseWriter, r *http.Request) {
 	responseID := strings.TrimSpace(chi.URLParam(r, "response_id"))
-	if h == nil || h.responsesState == nil {
-		writeResponseNotFound(w, responseID)
+	if binding, ok, err := h.boundResponseBinding(r, responseID, responseNativeLifecycle); err != nil {
+		writeResponseBindingResolutionError(w, err)
+		return
+	} else if ok {
+		h.proxyResponseLifecycleRequest(w, r, binding, http.MethodGet, "responses/"+url.PathEscape(responseID), nil)
 		return
 	}
 
-	response, _, ok := h.responsesState.getCompleted(responseID)
-	if !ok {
-		writeResponseNotFound(w, responseID)
+	if h != nil && h.responsesState != nil {
+		if response, _, ok := h.responsesState.getCompleted(responseID); ok {
+			if param := unsupportedLocalResponseRetrieveParam(r); param != "" {
+				code := "unsupported_feature"
+				writeErrorDetail(
+					w,
+					http.StatusBadRequest,
+					fmt.Sprintf("%s is not supported for locally stored responses", param),
+					"invalid_request_error",
+					&param,
+					&code,
+				)
+				return
+			}
+			writeJSON(w, http.StatusOK, response)
+			return
+		}
+	}
+
+	if binding, ok, err := h.explicitResponseBinding(r, responseNativeLifecycle); err != nil {
+		writeResponseBindingResolutionError(w, err)
+		return
+	} else if ok {
+		h.proxyResponseLifecycleRequest(w, r, binding, http.MethodGet, "responses/"+url.PathEscape(responseID), nil)
 		return
 	}
-	writeJSON(w, http.StatusOK, response)
+	writeResponseNotFound(w, responseID)
 }
 
-// DeleteResponse deletes a response retained by the local bounded state.
+func unsupportedLocalResponseRetrieveParam(r *http.Request) string {
+	if r == nil || r.URL == nil {
+		return ""
+	}
+	query := r.URL.Query()
+	for _, param := range []string{"include", "include_obfuscation", "starting_after"} {
+		for key := range query {
+			if strings.TrimSuffix(strings.TrimSpace(key), "[]") == param {
+				return param
+			}
+		}
+	}
+	return ""
+}
+
+// DeleteResponse deletes either locally emulated state or the bound native
+// resource. Native deletion is attempted exactly once and the owner binding is
+// released only after the upstream confirms success.
 func (h *Handler) DeleteResponse(w http.ResponseWriter, r *http.Request) {
 	responseID := strings.TrimSpace(chi.URLParam(r, "response_id"))
-	if h == nil || h.responsesState == nil || !h.responsesState.delete(responseID) {
-		writeResponseNotFound(w, responseID)
+	if binding, ok, err := h.boundResponseBinding(r, responseID, responseNativeLifecycle); err != nil {
+		writeResponseBindingResolutionError(w, err)
+		return
+	} else if ok {
+		response, requestErr := h.makeResponseLifecycleRequest(r, binding, http.MethodDelete, "responses/"+url.PathEscape(responseID), nil)
+		if requestErr != nil {
+			writeError(w, http.StatusBadGateway, requestErr.Error(), "provider_error")
+			return
+		}
+		if response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
+			h.responseBindings.delete(responseID)
+		}
+		h.proxyNativeResponse(w, r, binding, response)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, responseDeleted{
-		ID:      responseID,
-		Object:  "response",
-		Deleted: true,
-	})
+	if h != nil && h.responsesState != nil && h.responsesState.delete(responseID) {
+		writeJSON(w, http.StatusOK, responseDeleted{
+			ID:      responseID,
+			Object:  "response",
+			Deleted: true,
+		})
+		return
+	}
+
+	if binding, ok, err := h.explicitResponseBinding(r, responseNativeLifecycle); err != nil {
+		writeResponseBindingResolutionError(w, err)
+		return
+	} else if ok {
+		response, requestErr := h.makeResponseLifecycleRequest(r, binding, http.MethodDelete, "responses/"+url.PathEscape(responseID), nil)
+		if requestErr != nil {
+			writeError(w, http.StatusBadGateway, requestErr.Error(), "provider_error")
+			return
+		}
+		h.proxyNativeResponse(w, r, binding, response)
+		return
+	}
+	writeResponseNotFound(w, responseID)
+}
+
+// CancelResponse proxies native cancellation exactly once. Locally emulated
+// responses cannot be cancelled because they are already terminal snapshots.
+func (h *Handler) CancelResponse(w http.ResponseWriter, r *http.Request) {
+	responseID := strings.TrimSpace(chi.URLParam(r, "response_id"))
+	body, ok := readResponseOperationBody(w, r)
+	if !ok {
+		return
+	}
+	if binding, bound, err := h.boundResponseBinding(r, responseID, responseNativeCancellation); err != nil {
+		writeResponseBindingResolutionError(w, err)
+		return
+	} else if bound {
+		h.proxyResponseLifecycleRequest(w, r, binding, http.MethodPost, "responses/"+url.PathEscape(responseID)+"/cancel", body)
+		return
+	}
+
+	if h != nil && h.responsesState != nil {
+		if _, _, local := h.responsesState.getCompleted(responseID); local {
+			param := "response_id"
+			code := "unsupported_feature"
+			writeErrorDetail(w, http.StatusBadRequest, "cancellation is not supported for locally stored responses", "invalid_request_error", &param, &code)
+			return
+		}
+	}
+
+	if binding, explicit, err := h.explicitResponseBinding(r, responseNativeCancellation); err != nil {
+		writeResponseBindingResolutionError(w, err)
+		return
+	} else if explicit {
+		h.proxyResponseLifecycleRequest(w, r, binding, http.MethodPost, "responses/"+url.PathEscape(responseID)+"/cancel", body)
+		return
+	}
+	writeResponseNotFound(w, responseID)
 }
 
 // ListResponseInputItems lists the locally retained input items used to create
 // a stored response. Results follow the Responses API cursor envelope.
 func (h *Handler) ListResponseInputItems(w http.ResponseWriter, r *http.Request) {
 	responseID := strings.TrimSpace(chi.URLParam(r, "response_id"))
-	if h == nil || h.responsesState == nil {
-		writeResponseNotFound(w, responseID)
+	if binding, ok, err := h.boundResponseBinding(r, responseID, responseNativeLifecycle); err != nil {
+		writeResponseBindingResolutionError(w, err)
+		return
+	} else if ok {
+		h.proxyResponseLifecycleRequest(w, r, binding, http.MethodGet, "responses/"+url.PathEscape(responseID)+"/input_items", nil)
 		return
 	}
 
-	_, inputItems, ok := h.responsesState.getCompleted(responseID)
-	if !ok {
-		writeResponseNotFound(w, responseID)
-		return
+	if h != nil && h.responsesState != nil {
+		if _, inputItems, ok := h.responsesState.getCompleted(responseID); ok {
+			if responseInputItemsIncludeRequested(r) {
+				param := "include"
+				code := "unsupported_feature"
+				writeErrorDetail(
+					w,
+					http.StatusBadRequest,
+					"include is not supported for locally stored response input items",
+					"invalid_request_error",
+					&param,
+					&code,
+				)
+				return
+			}
+
+			page, param, err := paginateResponseInputItems(
+				inputItems,
+				strings.TrimSpace(r.URL.Query().Get("after")),
+				strings.TrimSpace(r.URL.Query().Get("order")),
+				strings.TrimSpace(r.URL.Query().Get("limit")),
+			)
+			if err != nil {
+				code := "invalid_value"
+				writeErrorDetail(w, http.StatusBadRequest, err.Error(), "invalid_request_error", &param, &code)
+				return
+			}
+
+			writeJSON(w, http.StatusOK, page)
+			return
+		}
 	}
 
-	page, param, err := paginateResponseInputItems(
-		inputItems,
-		strings.TrimSpace(r.URL.Query().Get("after")),
-		strings.TrimSpace(r.URL.Query().Get("order")),
-		strings.TrimSpace(r.URL.Query().Get("limit")),
-	)
+	if binding, ok, err := h.explicitResponseBinding(r, responseNativeLifecycle); err != nil {
+		writeResponseBindingResolutionError(w, err)
+		return
+	} else if ok {
+		h.proxyResponseLifecycleRequest(w, r, binding, http.MethodGet, "responses/"+url.PathEscape(responseID)+"/input_items", nil)
+		return
+	}
+	writeResponseNotFound(w, responseID)
+}
+
+func (h *Handler) proxyResponseLifecycleRequest(
+	w http.ResponseWriter,
+	r *http.Request,
+	binding responseBinding,
+	method string,
+	path string,
+	body []byte,
+) {
+	response, err := h.makeResponseLifecycleRequest(r, binding, method, path, body)
 	if err != nil {
-		code := "invalid_value"
-		writeErrorDetail(w, http.StatusBadRequest, err.Error(), "invalid_request_error", &param, &code)
+		writeError(w, http.StatusBadGateway, err.Error(), "provider_error")
 		return
 	}
+	h.proxyNativeResponse(w, r, binding, response)
+}
 
-	writeJSON(w, http.StatusOK, page)
+func (h *Handler) makeResponseLifecycleRequest(
+	r *http.Request,
+	binding responseBinding,
+	method string,
+	path string,
+	body []byte,
+) (*http.Response, error) {
+	rawQuery := ""
+	if r != nil && r.URL != nil {
+		rawQuery = r.URL.RawQuery
+	}
+	return h.nativeResponseRequest(r.Context(), method, binding, path, rawQuery, body, r.Header)
+}
+
+func readResponseOperationBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	if r == nil || r.Body == nil {
+		return nil, true
+	}
+	limitRequestBody(w, r)
+	defer r.Body.Close()
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeRequestReadError(w, err)
+		return nil, false
+	}
+	return body, true
+}
+
+func writeResponseBindingResolutionError(w http.ResponseWriter, err error) {
+	resolutionErr, ok := err.(*responseBindingResolutionError)
+	if !ok || resolutionErr == nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
+		return
+	}
+	param := resolutionErr.param
+	code := resolutionErr.code
+	writeErrorDetail(w, http.StatusBadRequest, resolutionErr.message, "invalid_request_error", &param, &code)
+}
+
+func responseInputItemsIncludeRequested(r *http.Request) bool {
+	if r == nil || r.URL == nil {
+		return false
+	}
+	for key := range r.URL.Query() {
+		normalized := strings.TrimSuffix(strings.TrimSpace(key), "[]")
+		if normalized == "include" {
+			return true
+		}
+	}
+	return false
 }
 
 func paginateResponseInputItems(

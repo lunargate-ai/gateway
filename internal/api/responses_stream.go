@@ -24,6 +24,7 @@ type responsesStreamProxy struct {
 	headers     http.Header
 	statusCode  int
 	headersSent bool
+	native      bool
 	buffer      bytes.Buffer
 
 	responseID       string
@@ -47,6 +48,8 @@ type responsesStreamProxy struct {
 	toolCalls            map[string]*responsesToolCallState
 	toolCallOrder        []string
 	completedResponse    map[string]interface{}
+	terminalResponse     map[string]interface{}
+	beforeTerminal       func(map[string]interface{})
 }
 
 type responsesToolCallState struct {
@@ -57,6 +60,23 @@ type responsesToolCallState struct {
 	OutputIndex int
 	Added       bool
 	Done        bool
+}
+
+type nativeResponsesStreamTerminal struct {
+	eventType    string
+	status       string
+	responseID   string
+	model        string
+	createdAt    int64
+	tokensInput  int
+	tokensOutput int
+	tokensTotal  int
+	response     map[string]interface{}
+}
+
+type nativeResponsesStreamSink interface {
+	enableNativePassthrough()
+	recordNativeTerminal(*nativeResponsesStreamTerminal)
 }
 
 func newResponsesStreamProxy(target http.ResponseWriter) *responsesStreamProxy {
@@ -83,16 +103,54 @@ func (p *responsesStreamProxy) RecordStreamError(err error) {
 	p.streamErr = err
 }
 
-func (p *responsesStreamProxy) Flush() {
-	if !p.headersSent {
+func (p *responsesStreamProxy) enableNativePassthrough() {
+	p.native = true
+}
+
+func (p *responsesStreamProxy) recordNativeTerminal(terminal *nativeResponsesStreamTerminal) {
+	if terminal == nil {
 		return
 	}
-	if f, ok := p.target.(http.Flusher); ok {
-		f.Flush()
+	p.completed = true
+	p.responseID = terminal.responseID
+	p.model = terminal.model
+	p.created = terminal.createdAt
+	if terminal.tokensInput != 0 || terminal.tokensOutput != 0 || terminal.tokensTotal != 0 {
+		p.usage = &models.Usage{
+			PromptTokens:     terminal.tokensInput,
+			CompletionTokens: terminal.tokensOutput,
+			TotalTokens:      terminal.tokensTotal,
+		}
+	}
+	if p.beforeTerminal != nil {
+		p.beforeTerminal(terminal.response)
+	}
+	p.terminalResponse = terminal.response
+	p.completedResponse = nil
+	if terminal.eventType == "response.completed" && terminal.status == "completed" {
+		p.completedResponse = terminal.response
 	}
 }
 
+func (p *responsesStreamProxy) Flush() {
+	_ = p.FlushError()
+}
+
+func (p *responsesStreamProxy) FlushError() error {
+	if p.native && !p.headersSent {
+		p.sendHeadersIfNeeded()
+	}
+	if !p.headersSent {
+		return nil
+	}
+	return http.NewResponseController(p.target).Flush()
+}
+
 func (p *responsesStreamProxy) Write(b []byte) (int, error) {
+	if p.native {
+		p.sendHeadersIfNeeded()
+		return p.target.Write(b)
+	}
 	if p.statusCode >= 400 {
 		p.sendHeadersIfNeeded()
 		return p.target.Write(b)
@@ -117,6 +175,15 @@ func (p *responsesStreamProxy) Write(b []byte) (int, error) {
 }
 
 func (p *responsesStreamProxy) finalize() error {
+	if p.native {
+		if p.streamErr != nil {
+			return p.streamErr
+		}
+		if !p.completed {
+			return fmt.Errorf("%w: native responses sse", streaming.ErrUpstreamStreamIncomplete)
+		}
+		return nil
+	}
 	if p.statusCode >= 400 {
 		if p.buffer.Len() > 0 {
 			p.sendHeadersIfNeeded()
@@ -142,6 +209,91 @@ func (p *responsesStreamProxy) finalize() error {
 		return p.emitFailed(streaming.ErrUpstreamStreamIncomplete)
 	}
 	return nil
+}
+
+func parseNativeResponsesStreamTerminal(event streaming.SSEEvent) (*nativeResponsesStreamTerminal, bool) {
+	if len(bytes.TrimSpace(event.Data)) == 0 {
+		return nil, false
+	}
+	var envelope struct {
+		Type     string          `json:"type"`
+		Response json.RawMessage `json:"response"`
+	}
+	if err := json.Unmarshal(event.Data, &envelope); err != nil {
+		return nil, false
+	}
+	eventType := strings.ToLower(strings.TrimSpace(envelope.Type))
+	if eventType == "" {
+		eventType = strings.ToLower(strings.TrimSpace(event.Event))
+	}
+	switch eventType {
+	case "response.completed", "response.incomplete", "response.failed", "response.cancelled", "response.canceled":
+	default:
+		return nil, false
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(envelope.Response))
+	decoder.UseNumber()
+	var response map[string]interface{}
+	if err := decoder.Decode(&response); err != nil || response == nil {
+		return nil, false
+	}
+	status, _ := response["status"].(string)
+	status = strings.ToLower(strings.TrimSpace(status))
+	eventStatus := strings.TrimPrefix(eventType, "response.")
+	if eventStatus == "canceled" {
+		eventStatus = "cancelled"
+	}
+	if status == "" {
+		status = eventStatus
+	} else if eventStatus != "completed" && status == "completed" {
+		// The terminal event type is authoritative. A failed/incomplete/cancelled
+		// event must never be promoted to a completed local response by a
+		// contradictory payload field.
+		status = eventStatus
+	}
+	switch status {
+	case "completed", "incomplete", "failed", "cancelled":
+	case "canceled":
+		status = "cancelled"
+	default:
+		status = "unknown"
+	}
+	terminal := &nativeResponsesStreamTerminal{
+		eventType:  eventType,
+		status:     status,
+		responseID: nativeResponsesString(response["id"]),
+		model:      nativeResponsesString(response["model"]),
+		createdAt:  nativeResponsesInteger(response["created_at"]),
+		response:   response,
+	}
+	if usage, ok := response["usage"].(map[string]interface{}); ok {
+		terminal.tokensInput = int(nativeResponsesInteger(usage["input_tokens"]))
+		terminal.tokensOutput = int(nativeResponsesInteger(usage["output_tokens"]))
+		terminal.tokensTotal = int(nativeResponsesInteger(usage["total_tokens"]))
+	}
+	return terminal, true
+}
+
+func nativeResponsesString(value interface{}) string {
+	text, _ := value.(string)
+	return strings.TrimSpace(text)
+}
+
+func nativeResponsesInteger(value interface{}) int64 {
+	switch typed := value.(type) {
+	case json.Number:
+		parsed, _ := typed.Int64()
+		return parsed
+	case float64:
+		return int64(typed)
+	case int64:
+		return typed
+	case int:
+		return int64(typed)
+	default:
+		return 0
+	}
 }
 
 func (p *responsesStreamProxy) emitFailed(streamErr error) error {
@@ -788,6 +940,10 @@ func (p *responsesStreamProxy) emitFinal(status, eventType, incompleteReason str
 	if p.model == "" {
 		resp["model"] = responsesFallbackModel
 	}
+	if p.beforeTerminal != nil {
+		p.beforeTerminal(resp)
+	}
+	p.terminalResponse = resp
 	if status == "completed" {
 		p.completedResponse = resp
 	}
@@ -814,7 +970,9 @@ func (p *responsesStreamProxy) writeEvent(event map[string]interface{}) error {
 	if _, err := fmt.Fprintf(p.target, "data: %s\n\n", string(b)); err != nil {
 		return err
 	}
-	p.Flush()
+	if err := p.FlushError(); err != nil {
+		return fmt.Errorf("failed to flush responses stream event: %w", err)
+	}
 	return nil
 }
 
@@ -832,7 +990,7 @@ func (p *responsesStreamProxy) sendHeadersIfNeeded() {
 			p.target.Header().Add(key, value)
 		}
 	}
-	if p.statusCode < 400 {
+	if p.statusCode < 400 && (!p.native || strings.TrimSpace(p.target.Header().Get("Content-Type")) == "") {
 		p.target.Header().Set("Content-Type", "text/event-stream")
 	}
 	p.target.WriteHeader(p.statusCode)

@@ -485,6 +485,13 @@ func (p *responsesWebSocketProxy) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
+// FlushError satisfies http.ResponseController. Each complete SSE frame is
+// forwarded immediately by Write, so the WebSocket adapter has no buffered
+// transport state to flush.
+func (p *responsesWebSocketProxy) FlushError() error {
+	return nil
+}
+
 func (p *responsesWebSocketProxy) finalize() error {
 	if p.statusCode >= 400 {
 		p.terminalError = parseResponsesHTTPError(p.statusCode, p.buffer.Bytes())

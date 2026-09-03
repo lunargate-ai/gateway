@@ -3,10 +3,12 @@ package providers
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -52,20 +54,25 @@ type ollamaChatRequest struct {
 }
 
 type ollamaMessage struct {
-	Role      string           `json:"role"`
-	Content   string           `json:"content"`
-	Thinking  string           `json:"thinking,omitempty"`
-	Reasoning string           `json:"reasoning,omitempty"`
-	ToolCalls []ollamaToolCall `json:"tool_calls,omitempty"`
+	Role       string           `json:"role"`
+	Content    string           `json:"content"`
+	Thinking   string           `json:"thinking,omitempty"`
+	Reasoning  string           `json:"reasoning,omitempty"`
+	Images     [][]byte         `json:"images,omitempty"`
+	ToolCalls  []ollamaToolCall `json:"tool_calls,omitempty"`
+	ToolName   string           `json:"tool_name,omitempty"`
+	ToolCallID string           `json:"tool_call_id,omitempty"`
 }
 
 type ollamaToolCall struct {
+	ID       string             `json:"id,omitempty"`
 	Function ollamaToolFunction `json:"function"`
 }
 
 type ollamaToolFunction struct {
 	Name      string          `json:"name"`
-	Arguments json.RawMessage `json:"arguments,omitempty"`
+	Arguments json.RawMessage `json:"arguments"`
+	Index     *int            `json:"index"`
 }
 
 type ollamaChatResponse struct {
@@ -93,10 +100,13 @@ type ollamaEmbedResponse struct {
 }
 
 func (t *OllamaTranslator) TranslateRequest(ctx context.Context, req *models.UnifiedRequest) (*http.Request, error) {
-	msgs := make([]ollamaMessage, 0, len(req.Messages))
-	for i := range req.Messages {
-		m := req.Messages[i]
-		msgs = append(msgs, ollamaMessage{Role: m.Role, Content: messageContentToString(m.Content)})
+	if err := t.validateRequestFields("ollama", req); err != nil {
+		return nil, err
+	}
+
+	msgs, err := translateOllamaMessages(req.Messages, "ollama")
+	if err != nil {
+		return nil, err
 	}
 
 	selectedTools, toolChoiceInstruction, toolChoiceMode, err := resolveOllamaToolChoice(req.Tools, req.ToolChoice)
@@ -104,8 +114,16 @@ func (t *OllamaTranslator) TranslateRequest(ctx context.Context, req *models.Uni
 		return nil, err
 	}
 	msgs = applyOllamaToolChoiceInstruction(msgs, toolChoiceInstruction)
+	stop, err := resolveOllamaStop(req.Stop, "ollama")
+	if err != nil {
+		return nil, err
+	}
+	format, err := resolveOllamaResponseFormat(req, "ollama")
+	if err != nil {
+		return nil, err
+	}
 
-	options := make(map[string]interface{}, 5)
+	options := make(map[string]interface{}, 9)
 	if req.Temperature != nil {
 		options["temperature"] = *req.Temperature
 	} else if t.cfg.Temperature != nil {
@@ -124,15 +142,20 @@ func (t *OllamaTranslator) TranslateRequest(ctx context.Context, req *models.Uni
 	if req.MaxTokens != nil {
 		options["num_predict"] = *req.MaxTokens
 	}
+	if req.PresencePenalty != nil {
+		options["presence_penalty"] = *req.PresencePenalty
+	}
+	if req.FrequencyPenalty != nil {
+		options["frequency_penalty"] = *req.FrequencyPenalty
+	}
+	if req.Seed != nil {
+		options["seed"] = *req.Seed
+	}
+	if req.Stop != nil {
+		options["stop"] = stop
+	}
 	if len(options) == 0 {
 		options = nil
-	}
-
-	var format interface{}
-	if req.ResponseFormat != nil {
-		if strings.TrimSpace(req.ResponseFormat.Type) == "json" || strings.TrimSpace(req.ResponseFormat.Type) == "json_object" {
-			format = "json"
-		}
 	}
 
 	ollamaReq := ollamaChatRequest{
@@ -171,6 +194,116 @@ func (t *OllamaTranslator) TranslateRequest(ctx context.Context, req *models.Uni
 
 	httpReq.Header.Set("Content-Type", "application/json")
 	return httpReq, nil
+}
+
+// ValidateRequestCompatibility reports client-visible fields that cannot be
+// represented faithfully by Ollama's native chat API.
+func (t *OllamaTranslator) ValidateRequestCompatibility(providerID string, req *models.UnifiedRequest) error {
+	if err := t.validateRequestFields(providerID, req); err != nil {
+		return err
+	}
+	if req == nil {
+		return nil
+	}
+	_, err := translateOllamaMessages(req.Messages, providerID)
+	return err
+}
+
+func (t *OllamaTranslator) validateRequestFields(providerID string, req *models.UnifiedRequest) error {
+	if req == nil {
+		return nil
+	}
+	if req.N != nil && *req.N != 1 {
+		return ollamaCompatibilityError(providerID, "n", "Ollama returns exactly one choice")
+	}
+	if len(req.LogitBias) > 0 {
+		return ollamaCompatibilityError(providerID, "logit_bias", "Ollama does not expose token-level logit bias")
+	}
+	if strings.TrimSpace(req.User) != "" {
+		return ollamaCompatibilityError(providerID, "user", "Ollama has no equivalent end-user identifier field")
+	}
+	if req.Store != nil && *req.Store && !strings.EqualFold(strings.TrimSpace(req.SourceRequestType), "responses") {
+		return ollamaCompatibilityError(providerID, "store", "Ollama cannot create a stored response")
+	}
+	if effort := requestedOllamaReasoningEffort(req); effort != "" {
+		if _, ok := normalizeOllamaThinkValue(effort); !ok {
+			return ollamaCompatibilityError(providerID, "reasoning_effort", "Ollama supports none, minimal, low, medium, high, and max reasoning effort")
+		}
+	}
+	if _, err := resolveOllamaStop(req.Stop, providerID); err != nil {
+		return err
+	}
+	if _, err := resolveOllamaResponseFormat(req, providerID); err != nil {
+		return err
+	}
+	return nil
+}
+
+func resolveOllamaStop(value interface{}, providerID string) ([]string, error) {
+	switch stop := value.(type) {
+	case nil:
+		return nil, nil
+	case string:
+		return []string{stop}, nil
+	case []string:
+		return append([]string(nil), stop...), nil
+	case []interface{}:
+		out := make([]string, 0, len(stop))
+		for _, value := range stop {
+			sequence, ok := value.(string)
+			if !ok {
+				return nil, ollamaCompatibilityError(providerID, "stop", "Ollama requires a string or an array of strings")
+			}
+			out = append(out, sequence)
+		}
+		return out, nil
+	default:
+		return nil, ollamaCompatibilityError(providerID, "stop", "Ollama requires a string or an array of strings")
+	}
+}
+
+func resolveOllamaResponseFormat(req *models.UnifiedRequest, providerID string) (interface{}, error) {
+	if req == nil || req.ResponseFormat == nil {
+		return nil, nil
+	}
+
+	switch strings.ToLower(strings.TrimSpace(req.ResponseFormat.Type)) {
+	case "text":
+		return nil, nil
+	case "json", "json_object":
+		return "json", nil
+	case "json_schema":
+		if req.ResponseFormat.JSONSchema == nil || req.ResponseFormat.JSONSchema.Schema == nil {
+			return nil, ollamaCompatibilityError(providerID, "response_format.json_schema.schema", "Ollama requires a JSON schema object")
+		}
+		schema, ok := ollamaJSONObject(req.ResponseFormat.JSONSchema.Schema)
+		if !ok {
+			return nil, ollamaCompatibilityError(providerID, "response_format.json_schema.schema", "Ollama requires a JSON schema object")
+		}
+		return schema, nil
+	default:
+		return nil, ollamaCompatibilityError(providerID, "response_format.type", "supported values are text, json_object, and json_schema")
+	}
+}
+
+func ollamaJSONObject(value interface{}) (interface{}, bool) {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return nil, false
+	}
+	var object map[string]interface{}
+	if err := json.Unmarshal(encoded, &object); err != nil || object == nil {
+		return nil, false
+	}
+	return value, true
+}
+
+func ollamaCompatibilityError(providerID string, field string, reason string) *models.CompatibilityError {
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" {
+		providerID = "ollama"
+	}
+	return &models.CompatibilityError{Field: field, Provider: providerID, Reason: reason}
 }
 
 func (t *OllamaTranslator) TranslateEmbeddingsRequest(ctx context.Context, req *models.EmbeddingsRequest) (*http.Request, error) {
@@ -245,18 +378,25 @@ func (t *OllamaTranslator) ParseResponse(resp *http.Response) (*models.UnifiedRe
 
 	toolCalls := make([]models.ToolCall, 0, len(result.Message.ToolCalls))
 	for i := range result.Message.ToolCalls {
+		call := result.Message.ToolCalls[i]
 		idx := i
-		callID := fmt.Sprintf("call_%s_%d", id, i)
+		if call.Function.Index != nil {
+			idx = *call.Function.Index
+		}
+		callID := call.ID
+		if strings.TrimSpace(callID) == "" {
+			callID = fmt.Sprintf("call_%s_%d", id, idx)
+		}
 		args := "{}"
-		if len(result.Message.ToolCalls[i].Function.Arguments) > 0 {
-			args = string(result.Message.ToolCalls[i].Function.Arguments)
+		if len(call.Function.Arguments) > 0 {
+			args = string(call.Function.Arguments)
 		}
 		toolCalls = append(toolCalls, models.ToolCall{
 			Index: &idx,
 			ID:    callID,
 			Type:  "function",
 			Function: models.ToolCallFunction{
-				Name:      result.Message.ToolCalls[i].Function.Name,
+				Name:      call.Function.Name,
 				Arguments: args,
 			},
 		})
@@ -290,7 +430,7 @@ func (t *OllamaTranslator) ParseResponse(resp *http.Response) (*models.UnifiedRe
 
 func resolveOllamaThink(req *models.UnifiedRequest, cfg config.ProviderConfig) interface{} {
 	if req != nil {
-		if val, ok := normalizeOllamaThinkValue(req.ReasoningEffort); ok {
+		if val, ok := normalizeOllamaThinkValue(requestedOllamaReasoningEffort(req)); ok {
 			return val
 		}
 	}
@@ -304,6 +444,19 @@ func resolveOllamaThink(req *models.UnifiedRequest, cfg config.ProviderConfig) i
 	return nil
 }
 
+func requestedOllamaReasoningEffort(req *models.UnifiedRequest) string {
+	if req == nil {
+		return ""
+	}
+	if effort := strings.TrimSpace(req.ReasoningEffort); effort != "" {
+		return effort
+	}
+	if req.Reasoning != nil {
+		return strings.TrimSpace(req.Reasoning.Effort)
+	}
+	return ""
+}
+
 func normalizeOllamaThinkValue(raw string) (interface{}, bool) {
 	v := strings.ToLower(strings.TrimSpace(raw))
 	switch v {
@@ -314,9 +467,9 @@ func normalizeOllamaThinkValue(raw string) (interface{}, bool) {
 	case "false", "0", "no", "off", "none":
 		return false, true
 	case "minimal":
-		// Ollama supports low/medium/high effort values.
+		// Ollama has no separate minimal level; low is the closest supported value.
 		return "low", true
-	case "low", "medium", "high":
+	case "low", "medium", "high", "max":
 		return v, true
 	default:
 		return nil, false
@@ -406,33 +559,244 @@ func (t *OllamaTranslator) Models() []models.ModelInfo {
 	return []models.ModelInfo{{ID: id, Object: "model", Created: time.Now().Unix(), OwnedBy: "ollama"}}
 }
 
-func messageContentToString(content interface{}) string {
-	switch v := content.(type) {
-	case string:
-		return v
-	case nil:
-		return ""
-	case []interface{}:
-		var b strings.Builder
-		for i := range v {
-			m, ok := v[i].(map[string]interface{})
-			if !ok {
-				continue
-			}
-			pt, _ := m["type"].(string)
-			if pt != "text" {
-				continue
-			}
-			txt, _ := m["text"].(string)
-			if txt == "" {
-				continue
-			}
-			b.WriteString(txt)
+func translateOllamaMessages(messages []models.Message, providerID string) ([]ollamaMessage, error) {
+	out := make([]ollamaMessage, 0, len(messages))
+	for i := range messages {
+		messagePath := fmt.Sprintf("messages[%d]", i)
+		message := messages[i]
+		role := strings.ToLower(strings.TrimSpace(message.Role))
+		switch role {
+		case "system", "user", "assistant", "tool":
+		default:
+			return nil, ollamaCompatibilityError(providerID, messagePath+".role", "Ollama /api/chat supports system, user, assistant, and tool messages")
 		}
-		return b.String()
+
+		if message.FunctionCall != nil {
+			return nil, ollamaCompatibilityError(providerID, messagePath+".function_call", "normalize legacy function_call into assistant.tool_calls before using Ollama")
+		}
+		if message.Name != "" && role != "tool" {
+			return nil, ollamaCompatibilityError(providerID, messagePath+".name", "Ollama only represents a name as tool_name on tool-result messages")
+		}
+		if message.ToolCallID != "" && role != "tool" {
+			return nil, ollamaCompatibilityError(providerID, messagePath+".tool_call_id", "Ollama only uses tool_call_id on tool-result messages")
+		}
+		if message.ReasoningContent != "" && role != "assistant" {
+			return nil, ollamaCompatibilityError(providerID, messagePath+".reasoning_content", "Ollama thinking history belongs to assistant messages")
+		}
+		if len(message.ToolCalls) > 0 && role != "assistant" {
+			return nil, ollamaCompatibilityError(providerID, messagePath+".tool_calls", "Ollama tool calls belong to assistant messages")
+		}
+
+		content, images, err := translateOllamaMessageContent(message.Content, messagePath+".content", providerID)
+		if err != nil {
+			return nil, err
+		}
+		toolCalls, err := translateOllamaToolCalls(message.ToolCalls, messagePath+".tool_calls", providerID)
+		if err != nil {
+			return nil, err
+		}
+
+		translated := ollamaMessage{
+			Role:       role,
+			Content:    content,
+			Thinking:   message.ReasoningContent,
+			Images:     images,
+			ToolCalls:  toolCalls,
+			ToolCallID: message.ToolCallID,
+		}
+		if role == "tool" {
+			translated.ToolName = message.Name
+		}
+		out = append(out, translated)
+	}
+	return out, nil
+}
+
+func translateOllamaMessageContent(content interface{}, field, providerID string) (string, [][]byte, error) {
+	switch value := content.(type) {
+	case nil:
+		return "", nil, nil
+	case string:
+		return value, nil, nil
+	case []interface{}:
+		return translateOllamaContentParts(value, field, providerID)
+	case []map[string]interface{}:
+		parts := make([]interface{}, len(value))
+		for i := range value {
+			parts[i] = value[i]
+		}
+		return translateOllamaContentParts(parts, field, providerID)
 	default:
+		return "", nil, ollamaCompatibilityError(providerID, field, "Ollama message content must be a string or an array of text and inline-image parts")
+	}
+}
+
+func translateOllamaContentParts(parts []interface{}, field, providerID string) (string, [][]byte, error) {
+	var text strings.Builder
+	images := make([][]byte, 0)
+	for i := range parts {
+		partPath := fmt.Sprintf("%s[%d]", field, i)
+		part, ok := parts[i].(map[string]interface{})
+		if !ok {
+			return "", nil, ollamaCompatibilityError(providerID, partPath, "Ollama content parts must be JSON objects")
+		}
+		partType, ok := part["type"].(string)
+		if !ok || strings.TrimSpace(partType) == "" {
+			return "", nil, ollamaCompatibilityError(providerID, partPath+".type", "content part type is required")
+		}
+
+		switch strings.ToLower(strings.TrimSpace(partType)) {
+		case "text", "input_text", "output_text":
+			if unsupported := firstUnsupportedOllamaField(part, "text", "type"); unsupported != "" {
+				return "", nil, ollamaCompatibilityError(providerID, partPath+"."+unsupported, "Ollama text parts cannot represent this field")
+			}
+			value, ok := part["text"].(string)
+			if !ok {
+				return "", nil, ollamaCompatibilityError(providerID, partPath+".text", "Ollama text parts require string text")
+			}
+			text.WriteString(value)
+		case "image_url", "input_image":
+			if unsupported := firstUnsupportedOllamaField(part, "detail", "image_url", "type"); unsupported != "" {
+				return "", nil, ollamaCompatibilityError(providerID, partPath+"."+unsupported, "Ollama images cannot represent this field")
+			}
+			if detail, exists := part["detail"]; exists {
+				value, ok := detail.(string)
+				if !ok || (strings.TrimSpace(value) != "" && !strings.EqualFold(strings.TrimSpace(value), "auto")) {
+					return "", nil, ollamaCompatibilityError(providerID, partPath+".detail", "Ollama cannot enforce image detail settings other than the automatic default")
+				}
+			}
+			image, err := translateOllamaImageReference(part["image_url"], partPath+".image_url", providerID)
+			if err != nil {
+				return "", nil, err
+			}
+			images = append(images, image)
+		default:
+			return "", nil, ollamaCompatibilityError(providerID, partPath+".type", "Ollama /api/chat cannot represent this content part type")
+		}
+	}
+	return text.String(), images, nil
+}
+
+func translateOllamaImageReference(value interface{}, field, providerID string) ([]byte, error) {
+	imageURL := ""
+	valueField := field
+	switch reference := value.(type) {
+	case string:
+		imageURL = reference
+	case map[string]interface{}:
+		if unsupported := firstUnsupportedOllamaField(reference, "detail", "url"); unsupported != "" {
+			return nil, ollamaCompatibilityError(providerID, field+"."+unsupported, "Ollama images cannot represent this image URL option")
+		}
+		if detail, exists := reference["detail"]; exists {
+			value, ok := detail.(string)
+			if !ok || (strings.TrimSpace(value) != "" && !strings.EqualFold(strings.TrimSpace(value), "auto")) {
+				return nil, ollamaCompatibilityError(providerID, field+".detail", "Ollama cannot enforce image detail settings other than the automatic default")
+			}
+		}
+		url, ok := reference["url"].(string)
+		if !ok {
+			return nil, ollamaCompatibilityError(providerID, field+".url", "image URL must be a string")
+		}
+		imageURL = url
+		valueField = field + ".url"
+	default:
+		return nil, ollamaCompatibilityError(providerID, field, "image_url must be a data URL string or an object containing one")
+	}
+
+	imageURL = strings.TrimSpace(imageURL)
+	if !strings.HasPrefix(strings.ToLower(imageURL), "data:") {
+		return nil, ollamaCompatibilityError(providerID, valueField, "Ollama requires inline base64 image data and LunarGate does not fetch remote image URLs")
+	}
+	comma := strings.IndexByte(imageURL, ',')
+	if comma < 0 {
+		return nil, ollamaCompatibilityError(providerID, valueField, "image data URL is missing its payload")
+	}
+	metadata := strings.Split(imageURL[len("data:"):comma], ";")
+	if len(metadata) == 0 || !strings.HasPrefix(strings.ToLower(strings.TrimSpace(metadata[0])), "image/") {
+		return nil, ollamaCompatibilityError(providerID, valueField, "data URL must contain an image media type")
+	}
+	base64Encoded := false
+	for _, item := range metadata[1:] {
+		if strings.EqualFold(strings.TrimSpace(item), "base64") {
+			base64Encoded = true
+			break
+		}
+	}
+	if !base64Encoded {
+		return nil, ollamaCompatibilityError(providerID, valueField, "Ollama requires base64-encoded image data")
+	}
+
+	payload := imageURL[comma+1:]
+	decoded, err := base64.StdEncoding.DecodeString(payload)
+	if err != nil {
+		decoded, err = base64.RawStdEncoding.DecodeString(payload)
+	}
+	if err != nil || len(decoded) == 0 {
+		return nil, ollamaCompatibilityError(providerID, valueField, "image data URL contains invalid or empty base64 data")
+	}
+	return decoded, nil
+}
+
+func translateOllamaToolCalls(toolCalls []models.ToolCall, field, providerID string) ([]ollamaToolCall, error) {
+	if len(toolCalls) == 0 {
+		return nil, nil
+	}
+	out := make([]ollamaToolCall, 0, len(toolCalls))
+	for i := range toolCalls {
+		callPath := fmt.Sprintf("%s[%d]", field, i)
+		call := toolCalls[i]
+		callType := strings.ToLower(strings.TrimSpace(call.Type))
+		if callType != "" && callType != "function" {
+			return nil, ollamaCompatibilityError(providerID, callPath+".type", "Ollama only supports function tool calls")
+		}
+		if strings.TrimSpace(call.Function.Name) == "" {
+			return nil, ollamaCompatibilityError(providerID, callPath+".function.name", "Ollama requires a function name")
+		}
+
+		arguments := strings.TrimSpace(call.Function.Arguments)
+		if arguments == "" {
+			arguments = "{}"
+		}
+		var object map[string]interface{}
+		if err := json.Unmarshal([]byte(arguments), &object); err != nil || object == nil {
+			return nil, ollamaCompatibilityError(providerID, callPath+".function.arguments", "Ollama requires tool arguments to be a JSON object")
+		}
+
+		index := i
+		if call.Index != nil {
+			index = *call.Index
+		}
+		if index < 0 {
+			return nil, ollamaCompatibilityError(providerID, callPath+".index", "Ollama requires a non-negative tool-call index")
+		}
+		out = append(out, ollamaToolCall{
+			ID: call.ID,
+			Function: ollamaToolFunction{
+				Name:      call.Function.Name,
+				Arguments: json.RawMessage(arguments),
+				Index:     &index,
+			},
+		})
+	}
+	return out, nil
+}
+
+func firstUnsupportedOllamaField(object map[string]interface{}, allowed ...string) string {
+	allowedSet := make(map[string]struct{}, len(allowed))
+	for _, field := range allowed {
+		allowedSet[field] = struct{}{}
+	}
+	unsupported := make([]string, 0)
+	for field := range object {
+		if _, ok := allowedSet[field]; !ok {
+			unsupported = append(unsupported, field)
+		}
+	}
+	if len(unsupported) == 0 {
 		return ""
 	}
+	sort.Strings(unsupported)
+	return unsupported[0]
 }
 
 func normalizeOllamaEmbeddingInput(input interface{}) (interface{}, error) {

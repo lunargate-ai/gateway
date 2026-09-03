@@ -137,8 +137,14 @@ func TestEmbeddings_TranslationErrorStopsRetryAndFallback(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if response.Error.Type != "invalid_request_error" || !strings.Contains(response.Error.Message, "only supports string or array of strings") {
+	if response.Error.Type != "invalid_request_error" || !strings.Contains(response.Error.Message, "accepts only a string or an array of strings") {
 		t.Fatalf("error = %#v, want invalid embeddings input", response.Error)
+	}
+	if response.Error.Param == nil || *response.Error.Param != "input" {
+		t.Fatalf("error param = %#v, want input", response.Error.Param)
+	}
+	if response.Error.Code == nil || *response.Error.Code != "unsupported_feature" {
+		t.Fatalf("error code = %#v, want unsupported_feature", response.Error.Code)
 	}
 	if calls := fallbackCalls.Load(); calls != 0 {
 		t.Fatalf("fallback calls = %d, want 0", calls)

@@ -496,11 +496,11 @@ func TestResponsesWebSocket_GenerateFalseWarmupCachesStateForFollowUp(t *testing
 	}
 	messages, _ := body["messages"].([]interface{})
 	if len(messages) != 2 {
-		t.Fatalf("expected system+user messages, got %d", len(messages))
+		t.Fatalf("expected developer+user messages, got %d", len(messages))
 	}
-	systemMsg, _ := messages[0].(map[string]interface{})
-	if role, _ := systemMsg["role"].(string); role != "system" {
-		t.Fatalf("expected first message role system, got %q", role)
+	developerMsg, _ := messages[0].(map[string]interface{})
+	if role, _ := developerMsg["role"].(string); role != "developer" {
+		t.Fatalf("expected first message role developer, got %q", role)
 	}
 	userMsg, _ := messages[1].(map[string]interface{})
 	if role, _ := userMsg["role"].(string); role != "user" {

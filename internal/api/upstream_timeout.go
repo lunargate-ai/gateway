@@ -183,6 +183,17 @@ func (r *providerClientRegistry) Config(providerID string) (config.ProviderConfi
 	return cfg, ok
 }
 
+func (r *providerClientRegistry) Snapshot(providerID string) (providerClientConfig, config.ProviderConfig, bool) {
+	if r == nil {
+		return providerClientConfig{}, config.ProviderConfig{}, false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	clientCfg, clientOK := r.clients[providerID]
+	providerCfg, configOK := r.configs[providerID]
+	return clientCfg, providerCfg, clientOK && configOK
+}
+
 func (r *providerClientRegistry) Update(providerConfigs map[string]config.ProviderConfig) {
 	clients := buildProviderClients(providerConfigs)
 	r.mu.Lock()

@@ -44,6 +44,26 @@ func TestLocalResponsesLifecycleNonStream(t *testing.T) {
 	if !reflect.DeepEqual(retrieved, created) {
 		t.Fatalf("retrieved response = %#v, want created response %#v", retrieved, created)
 	}
+	for _, testCase := range []struct {
+		query string
+		param string
+	}{
+		{query: "include%5B%5D=reasoning.encrypted_content", param: "include"},
+		{query: "include_obfuscation=false", param: "include_obfuscation"},
+		{query: "starting_after=7", param: "starting_after"},
+	} {
+		unsupported := performLifecycleRequest(
+			t,
+			router,
+			http.MethodGet,
+			"/v1/responses/"+responseID+"?"+testCase.query,
+			nil,
+		)
+		if unsupported.Code != http.StatusBadRequest {
+			t.Fatalf("retrieve query %q status = %d, want 400; body=%s", testCase.query, unsupported.Code, unsupported.Body.String())
+		}
+		assertLifecycleError(t, unsupported.Body.Bytes(), testCase.param, "unsupported_feature")
+	}
 
 	inputItems := performLifecycleRequest(
 		t,
@@ -131,6 +151,23 @@ func TestLocalResponsesLifecycleNonStream(t *testing.T) {
 		t.Fatalf("invalid limit status = %d, want 400", invalidLimit.Code)
 	}
 	assertLifecycleError(t, invalidLimit.Body.Bytes(), "limit", "invalid_value")
+
+	for _, includeQuery := range []string{
+		"include=message.input_image.image_url",
+		"include%5B%5D=message.output_text.logprobs",
+	} {
+		included := performLifecycleRequest(
+			t,
+			router,
+			http.MethodGet,
+			"/v1/responses/"+responseID+"/input_items?"+includeQuery,
+			nil,
+		)
+		if included.Code != http.StatusBadRequest {
+			t.Fatalf("include query %q status = %d, want 400; body=%s", includeQuery, included.Code, included.Body.String())
+		}
+		assertLifecycleError(t, included.Body.Bytes(), "include", "unsupported_feature")
+	}
 
 	deleted := performLifecycleRequest(t, router, http.MethodDelete, "/v1/responses/"+responseID, nil)
 	if deleted.Code != http.StatusOK {

@@ -268,6 +268,8 @@ func TestNewManager_ParsesAndNormalizesProviderCapabilities(t *testing.T) {
       response_compaction: true
       response_input_tokens: true
       embeddings_base64: true
+      structured_outputs: true
+      reasoning_effort: true
       hosted_tools: [" Web_Search ", "file_search", "web_search", ""]
 routing:
   routes:
@@ -288,7 +290,8 @@ routing:
 	if !capabilities.ResponsesLifecycle || !capabilities.Conversations ||
 		!capabilities.BackgroundResponses || !capabilities.ResponseCancellation ||
 		!capabilities.ResponseCompaction || !capabilities.ResponseInputTokens ||
-		!capabilities.EmbeddingsBase64 {
+		!capabilities.EmbeddingsBase64 || !capabilities.StructuredOutputs ||
+		!capabilities.ReasoningEffort {
 		t.Fatalf("capability flags were not preserved: %#v", capabilities)
 	}
 	wantTools := []string{"web_search", "file_search"}

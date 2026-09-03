@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
 
 	"github.com/lunargate-ai/gateway/pkg/models"
+	"github.com/rs/zerolog/log"
 )
 
 type preservedUnifiedRequestContextKey struct{}
@@ -80,6 +82,38 @@ func responsesResponseToMap(resp *models.ResponsesResponse) (map[string]interfac
 	return payload, nil
 }
 
+func nativeResponsesEnvelope(resp *models.UnifiedResponse) (map[string]interface{}, json.RawMessage, bool, error) {
+	if resp == nil {
+		return nil, nil, false, nil
+	}
+	raw := append(json.RawMessage(nil), resp.RawJSON...)
+	document := bytes.TrimSpace(raw)
+	if len(document) == 0 {
+		return nil, nil, false, nil
+	}
+	var envelope struct {
+		Object string `json:"object"`
+	}
+	if err := json.Unmarshal(document, &envelope); err != nil {
+		return nil, nil, false, err
+	}
+	if !strings.EqualFold(strings.TrimSpace(envelope.Object), "response") {
+		return nil, nil, false, nil
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(document))
+	decoder.UseNumber()
+	var payload map[string]interface{}
+	if err := decoder.Decode(&payload); err != nil {
+		return nil, nil, false, err
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return nil, nil, false, err
+	}
+	return payload, raw, true, nil
+}
+
 func (h *Handler) resolveResponsesHTTPPayload(payload map[string]json.RawMessage) (map[string]json.RawMessage, error) {
 	previousResponseID := parseJSONStringRaw(payload["previous_response_id"])
 	if previousResponseID == "" {
@@ -126,9 +160,11 @@ func copyHeaders(dst http.Header, src http.Header) {
 		"etag":                {},
 		"keep-alive":          {},
 		"last-modified":       {},
+		"proxy-connection":    {},
 		"proxy-authenticate":  {},
 		"proxy-authorization": {},
 		"set-cookie":          {},
+		"set-cookie2":         {},
 		"te":                  {},
 		"trailer":             {},
 		"transfer-encoding":   {},
@@ -142,17 +178,21 @@ func copyHeaders(dst http.Header, src http.Header) {
 		}
 	}
 	for key, values := range src {
-		if _, unsafe := blocked[strings.ToLower(strings.TrimSpace(key))]; unsafe {
+		canonicalKey := http.CanonicalHeaderKey(strings.TrimSpace(key))
+		if canonicalKey == "" {
 			continue
 		}
-		if _, exists := dst[key]; exists {
+		if _, unsafe := blocked[strings.ToLower(canonicalKey)]; unsafe {
+			continue
+		}
+		if _, exists := dst[canonicalKey]; exists {
 			continue
 		}
 		copied := make([]string, 0, len(values))
 		for _, value := range values {
 			copied = append(copied, value)
 		}
-		dst[key] = copied
+		dst[canonicalKey] = copied
 	}
 }
 
@@ -182,20 +222,51 @@ func makeResponsesChatRequest(r *http.Request, unifiedReq *models.UnifiedRequest
 	return chatReq, nil
 }
 
-func (h *Handler) handleResponsesStream(w http.ResponseWriter, chatReq *http.Request, requestPayload map[string]json.RawMessage, store bool) {
+func (h *Handler) handleResponsesStream(
+	w http.ResponseWriter,
+	chatReq *http.Request,
+	requestPayload map[string]json.RawMessage,
+	store bool,
+	conversation *responsesConversationAssociation,
+) {
 	proxy := newResponsesStreamProxy(w)
+	proxy.beforeTerminal = func(response map[string]interface{}) {
+		attachResponsesConversation(response, conversation)
+	}
 	h.ChatCompletions(proxy, chatReq)
 	if err := proxy.finalize(); err != nil {
-		writeError(w, http.StatusBadGateway, "failed to stream responses event payload", "provider_error")
+		if !proxy.headersSent {
+			writeError(w, http.StatusBadGateway, "failed to stream responses event payload", "provider_error")
+		} else {
+			log.Warn().Err(err).Str("response_id", proxy.responseID).Msg("responses stream terminated after headers were sent")
+		}
 		return
 	}
-	if !store || h == nil || h.responsesState == nil || proxy.responseID == "" || proxy.completedResponse == nil {
+	if proxy.terminalResponse != nil {
+		if err := h.appendResponsesConversation(conversation, proxy.terminalResponse); err != nil {
+			log.Error().Err(err).Str("response_id", proxy.responseID).Msg("failed to append streamed response to conversation")
+			return
+		}
+	}
+	if !store || h == nil || proxy.responseID == "" {
+		return
+	}
+	if proxy.native && proxy.terminalResponse != nil && h.retainNativeResponseBinding(proxy.responseID, proxy.headers) {
+		return
+	}
+	if h.responsesState == nil || proxy.completedResponse == nil {
 		return
 	}
 	h.responsesState.putCompleted(proxy.responseID, requestPayload, proxy.completedResponse)
 }
 
-func (h *Handler) handleResponsesNonStream(w http.ResponseWriter, chatReq *http.Request, requestPayload map[string]json.RawMessage, store bool) {
+func (h *Handler) handleResponsesNonStream(
+	w http.ResponseWriter,
+	chatReq *http.Request,
+	requestPayload map[string]json.RawMessage,
+	store bool,
+	conversation *responsesConversationAssociation,
+) {
 	status, headers, unifiedResp, errorBody, err := h.executeChatCompletionsUnified(chatReq)
 	copyHeaders(w.Header(), headers)
 	if err != nil {
@@ -208,13 +279,58 @@ func (h *Handler) handleResponsesNonStream(w http.ResponseWriter, chatReq *http.
 		return
 	}
 
-	resp := models.UnifiedResponseToResponses(unifiedResp)
-	if store && h != nil && h.responsesState != nil && resp != nil {
-		if completedResponse, err := responsesResponseToMap(resp); err == nil {
-			h.responsesState.putCompleted(resp.ID, requestPayload, completedResponse)
-		}
+	completedResponse, rawResponse, native, err := nativeResponsesEnvelope(unifiedResp)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "failed to parse provider response", "provider_error")
+		return
 	}
-	writeJSON(w, status, resp)
+	if native {
+		attachResponsesConversation(completedResponse, conversation)
+		if err := h.appendResponsesConversation(conversation, completedResponse); err != nil {
+			conversationID := ""
+			if conversation != nil {
+				conversationID = conversation.id
+			}
+			writeConversationStateErrorForID(w, err, conversationID, "")
+			return
+		}
+		responseID, _ := completedResponse["id"].(string)
+		if store && h != nil && strings.TrimSpace(responseID) != "" {
+			if !h.retainNativeResponseBinding(responseID, headers) && h.responsesState != nil {
+				h.responsesState.putCompleted(responseID, requestPayload, completedResponse)
+			}
+		}
+		if conversation != nil && strings.TrimSpace(conversation.id) != "" {
+			rawResponse, err = json.Marshal(completedResponse)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "failed to prepare response", "internal_error")
+				return
+			}
+		}
+		unifiedResp.RawJSON = rawResponse
+		writeAPIJSON(w, status, unifiedResp)
+		return
+	}
+
+	resp := models.UnifiedResponseToResponses(unifiedResp)
+	completedResponse, err = responsesResponseToMap(resp)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to prepare response", "internal_error")
+		return
+	}
+	attachResponsesConversation(completedResponse, conversation)
+	if err := h.appendResponsesConversation(conversation, completedResponse); err != nil {
+		conversationID := ""
+		if conversation != nil {
+			conversationID = conversation.id
+		}
+		writeConversationStateErrorForID(w, err, conversationID, "")
+		return
+	}
+	if store && h != nil && h.responsesState != nil && resp != nil {
+		h.responsesState.putCompleted(resp.ID, requestPayload, completedResponse)
+	}
+	writeJSON(w, status, completedResponse)
 }
 
 func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
@@ -228,7 +344,17 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to prepare request", "internal_error")
 		return
 	}
-	resolvedPayload, err := h.resolveResponsesHTTPPayload(requestPayload)
+	conversationPayload, conversation, err := h.resolveResponsesConversationPayload(requestPayload)
+	if err != nil {
+		var requestErr *responsesConversationRequestError
+		if errors.As(err, &requestErr) {
+			writeErrorDetail(w, http.StatusBadRequest, requestErr.message, "invalid_request_error", &requestErr.param, &requestErr.code)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to prepare conversation", "internal_error")
+		return
+	}
+	resolvedPayload, err := h.resolveResponsesHTTPPayload(conversationPayload)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
@@ -259,8 +385,8 @@ func (h *Handler) Responses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if unifiedReq.Stream {
-		h.handleResponsesStream(w, chatReq, resolvedPayload, responsesReq.Store == nil || *responsesReq.Store)
+		h.handleResponsesStream(w, chatReq, resolvedPayload, responsesReq.Store == nil || *responsesReq.Store, conversation)
 		return
 	}
-	h.handleResponsesNonStream(w, chatReq, resolvedPayload, responsesReq.Store == nil || *responsesReq.Store)
+	h.handleResponsesNonStream(w, chatReq, resolvedPayload, responsesReq.Store == nil || *responsesReq.Store, conversation)
 }

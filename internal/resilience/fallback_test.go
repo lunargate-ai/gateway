@@ -221,3 +221,76 @@ func TestFallbackExecutor_Unconfigured5xxFallsBackAndCountsFailure(t *testing.T)
 		t.Fatalf("503 provider failures = %d, want 1", counts.TotalFailures)
 	}
 }
+
+func TestFallbackExecutor_PreservesOnlyFinalTargetSnapshot(t *testing.T) {
+	tests := []struct {
+		name        string
+		finalStatus int
+	}{
+		{name: "rate limit", finalStatus: http.StatusTooManyRequests},
+		{name: "server error", finalStatus: http.StatusBadGateway},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fallback := NewFallbackExecutor(NewRetrier(config.RetryConfig{
+				Enabled:         true,
+				MaxAttempts:     1,
+				RetryableErrors: []int{http.StatusTooManyRequests, http.StatusBadGateway},
+			}), NewCircuitBreakerManager())
+			primary := routing.Target{Provider: "primary", Model: "model-a"}
+			backup := routing.Target{Provider: "backup", Model: "model-b"}
+			primaryBody := &trackingResponseBody{Reader: strings.NewReader(`{"error":"primary-503"}`)}
+			finalBody := &trackingResponseBody{Reader: strings.NewReader(`{"error":"final-target"}`)}
+
+			resp, usedTarget, fallbackUsed, _, _, err := fallback.Execute(
+				context.Background(),
+				primary,
+				[]routing.Target{backup},
+				func(_ context.Context, target routing.Target) (*http.Response, error) {
+					if target.Provider == primary.Provider {
+						return &http.Response{
+							StatusCode: http.StatusServiceUnavailable,
+							Header:     http.Header{"X-Upstream-Target": []string{"primary"}},
+							Body:       primaryBody,
+						}, nil
+					}
+					return &http.Response{
+						StatusCode: tt.finalStatus,
+						Header:     http.Header{"X-Upstream-Target": []string{"backup"}},
+						Body:       finalBody,
+					}, nil
+				},
+			)
+
+			if resp != nil {
+				t.Fatalf("response = %#v, want nil", resp)
+			}
+			if usedTarget != backup || !fallbackUsed {
+				t.Fatalf("target/fallback = %#v/%v, want backup/true", usedTarget, fallbackUsed)
+			}
+			if err == nil {
+				t.Fatal("expected final fallback error")
+			}
+			var statusErr *RetryableStatusError
+			if !errors.As(err, &statusErr) {
+				t.Fatalf("error = %v, want wrapped RetryableStatusError", err)
+			}
+			if statusErr.StatusCode != tt.finalStatus {
+				t.Fatalf("snapshot status = %d, want %d", statusErr.StatusCode, tt.finalStatus)
+			}
+			if got, want := string(statusErr.Body), `{"error":"final-target"}`; got != want {
+				t.Fatalf("snapshot body = %q, want %q", got, want)
+			}
+			if got := statusErr.Headers.Get("X-Upstream-Target"); got != "backup" {
+				t.Fatalf("snapshot target header = %q, want backup", got)
+			}
+			if strings.Contains(string(statusErr.Body), "primary-503") || strings.Contains(err.Error(), "primary-503") {
+				t.Fatalf("primary snapshot leaked into final error: %#v / %q", statusErr, err.Error())
+			}
+			if !primaryBody.closed || !finalBody.closed {
+				t.Fatalf("closed primary/final = %v/%v, want true/true", primaryBody.closed, finalBody.closed)
+			}
+		})
+	}
+}

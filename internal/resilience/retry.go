@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"net/http"
@@ -14,6 +15,8 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+const retryableStatusBodyLimit = 1 << 20
+
 // Retrier handles retry logic with exponential backoff and jitter.
 type Retrier struct {
 	cfg atomic.Value
@@ -23,10 +26,39 @@ type Retrier struct {
 // fail so callers can preserve the original status across fallback handling.
 type RetryableStatusError struct {
 	StatusCode int
+	Headers    http.Header
+	Body       []byte
+	Truncated  bool
 }
 
 func (e *RetryableStatusError) Error() string {
 	return fmt.Sprintf("provider returned status %d", e.StatusCode)
+}
+
+func snapshotRetryableStatus(resp *http.Response) *RetryableStatusError {
+	snapshot := &RetryableStatusError{
+		StatusCode: resp.StatusCode,
+		Headers:    resp.Header.Clone(),
+	}
+	if resp.Body == nil {
+		return snapshot
+	}
+
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, retryableStatusBodyLimit+1))
+	_ = resp.Body.Close()
+	if len(body) > retryableStatusBodyLimit {
+		snapshot.Body = make([]byte, retryableStatusBodyLimit)
+		copy(snapshot.Body, body[:retryableStatusBodyLimit])
+		snapshot.Truncated = true
+	} else {
+		snapshot.Body = make([]byte, len(body))
+		copy(snapshot.Body, body)
+	}
+	if readErr != nil {
+		// A partial read cannot be treated as a complete upstream envelope.
+		snapshot.Truncated = true
+	}
+	return snapshot
 }
 
 // RequestError marks a failure produced before an upstream request can be
@@ -118,11 +150,7 @@ func (r *Retrier) Do(ctx context.Context, fn DoFunc) (*http.Response, int, error
 				return resp, attempt, nil
 			}
 
-			lastErr = &RetryableStatusError{StatusCode: resp.StatusCode}
-			// Close responses that will not be returned to the handler.
-			if resp.Body != nil {
-				_ = resp.Body.Close()
-			}
+			lastErr = snapshotRetryableStatus(resp)
 			if !retryableStatus {
 				return nil, attempt, lastErr
 			}

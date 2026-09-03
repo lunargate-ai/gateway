@@ -105,7 +105,15 @@ type FunctionCall struct {
 }
 
 type ResponseFormat struct {
-	Type string `json:"type"`
+	Type       string                    `json:"type"`
+	JSONSchema *JSONSchemaResponseFormat `json:"json_schema,omitempty"`
+}
+
+type JSONSchemaResponseFormat struct {
+	Name        string      `json:"name"`
+	Description string      `json:"description,omitempty"`
+	Schema      interface{} `json:"schema"`
+	Strict      *bool       `json:"strict,omitempty"`
 }
 
 func NormalizeUnifiedRequest(req *UnifiedRequest) error {

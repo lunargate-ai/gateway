@@ -51,12 +51,136 @@ func upstreamProviderError(status int, provider string, body []byte) *providers.
 
 type ChunkObserver func(chunk *models.StreamChunk)
 
+// SSEEvent is a parsed view used only for observing a raw SSE frame. The raw
+// frame is forwarded unchanged; Event and Data are copies for side-channel
+// telemetry and state updates.
+type SSEEvent struct {
+	Event string
+	Data  []byte
+}
+
+// SSEEventObserver reports whether an observed event is terminal.
+type SSEEventObserver func(event SSEEvent) bool
+
 // Handler manages SSE streaming between providers and clients.
 type Handler struct{}
 
 // NewHandler creates a new streaming handler.
 func NewHandler() *Handler {
 	return &Handler{}
+}
+
+// ProxySSE forwards a successful upstream SSE response without translating or
+// reconstructing any frame. It flushes after each complete event, stops on
+// downstream failures, and requires the observer to see a terminal event before
+// a clean upstream EOF.
+func (h *Handler) ProxySSE(
+	ctx context.Context,
+	w http.ResponseWriter,
+	providerResp *http.Response,
+	provider string,
+	observer SSEEventObserver,
+) error {
+	if providerResp == nil || providerResp.Body == nil {
+		return errors.New("provider returned an empty SSE response")
+	}
+	defer providerResp.Body.Close()
+
+	if providerResp.StatusCode < http.StatusOK || providerResp.StatusCode >= http.StatusMultipleChoices {
+		body, _ := io.ReadAll(providerResp.Body)
+		return upstreamProviderError(providerResp.StatusCode, provider, body)
+	}
+
+	if strings.TrimSpace(w.Header().Get("Content-Type")) == "" {
+		w.Header().Set("Content-Type", "text/event-stream")
+	}
+	if strings.TrimSpace(w.Header().Get("Cache-Control")) == "" {
+		w.Header().Set("Cache-Control", "no-cache")
+	}
+	w.WriteHeader(providerResp.StatusCode)
+	controller := http.NewResponseController(w)
+	if err := controller.Flush(); err != nil {
+		return fmt.Errorf("failed to flush native SSE headers: %w", err)
+	}
+
+	reader := bufio.NewReader(providerResp.Body)
+	var frame bytes.Buffer
+	terminalSeen := false
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		line, readErr := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			_, _ = frame.Write(line)
+			if isSSEBlankLine(line) {
+				rawFrame := append([]byte(nil), frame.Bytes()...)
+				if _, err := w.Write(rawFrame); err != nil {
+					return fmt.Errorf("failed to write native SSE frame: %w", err)
+				}
+				if err := controller.Flush(); err != nil {
+					return fmt.Errorf("failed to flush native SSE frame: %w", err)
+				}
+				if observer != nil && observer(parseSSEEvent(rawFrame)) {
+					terminalSeen = true
+				}
+				frame.Reset()
+			}
+		}
+
+		if readErr == nil {
+			continue
+		}
+		if !errors.Is(readErr, io.EOF) {
+			return fmt.Errorf("native SSE read error: %w", readErr)
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if frame.Len() > 0 {
+			if _, err := w.Write(frame.Bytes()); err != nil {
+				return fmt.Errorf("failed to write trailing native SSE bytes: %w", err)
+			}
+			if err := controller.Flush(); err != nil {
+				return fmt.Errorf("failed to flush trailing native SSE bytes: %w", err)
+			}
+		}
+		if !terminalSeen {
+			return fmt.Errorf("%w: native sse", ErrUpstreamStreamIncomplete)
+		}
+		return nil
+	}
+}
+
+func isSSEBlankLine(line []byte) bool {
+	return len(bytes.TrimRight(line, "\r\n")) == 0
+}
+
+func parseSSEEvent(frame []byte) SSEEvent {
+	event := SSEEvent{}
+	dataLines := make([]string, 0, 1)
+	for _, rawLine := range bytes.Split(frame, []byte{'\n'}) {
+		line := strings.TrimSuffix(string(rawLine), "\r")
+		if line == "" || strings.HasPrefix(line, ":") {
+			continue
+		}
+		field, value, hasColon := strings.Cut(line, ":")
+		if !hasColon {
+			value = ""
+		}
+		value = strings.TrimPrefix(value, " ")
+		switch field {
+		case "event":
+			event.Event = value
+		case "data":
+			dataLines = append(dataLines, value)
+		}
+	}
+	if len(dataLines) > 0 {
+		event.Data = []byte(strings.Join(dataLines, "\n"))
+	}
+	return event
 }
 
 // StreamResponse reads an SSE stream from a provider and forwards it to the client.
@@ -87,24 +211,23 @@ func (h *Handler) streamResponse(
 		b, _ := io.ReadAll(providerResp.Body)
 		return upstreamProviderError(providerResp.StatusCode, translator.Name(), b)
 	}
+	defer providerResp.Body.Close()
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		return fmt.Errorf("response writer does not support flushing")
-	}
+	controller := http.NewResponseController(w)
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Transfer-Encoding", "chunked")
 	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
-
-	defer providerResp.Body.Close()
+	if err := controller.Flush(); err != nil {
+		return fmt.Errorf("failed to flush stream headers: %w", err)
+	}
 
 	scanner := bufio.NewScanner(providerResp.Body)
 	// Increase buffer size for large chunks
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	envelope := newChatStreamEnvelopeNormalizer(translator.DefaultModel())
 
 	for scanner.Scan() {
 		select {
@@ -133,14 +256,15 @@ func (h *Handler) streamResponse(
 
 		// Check for stream end
 		if data == "[DONE]" {
-			fmt.Fprintf(w, "data: [DONE]\n\n")
-			flusher.Flush()
+			if err := writeSSEFrame(w, controller, []byte("[DONE]"), "done frame"); err != nil {
+				return err
+			}
 			return nil
 		}
 
 		// Parse through the translator
 		chunk, err := translator.ParseStreamChunk([]byte(data))
-		streamDone := err == providers.ErrStreamDone
+		streamDone := errors.Is(err, providers.ErrStreamDone)
 		if err != nil && !streamDone {
 			return fmt.Errorf("failed to parse stream chunk: %w", err)
 		}
@@ -150,6 +274,7 @@ func (h *Handler) streamResponse(
 		}
 
 		if chunk != nil {
+			chunk = envelope.normalize(chunk)
 			if observer != nil {
 				observer(chunk)
 			}
@@ -159,14 +284,16 @@ func (h *Handler) streamResponse(
 			if err != nil {
 				log.Error().Err(err).Msg("failed to marshal stream chunk")
 			} else {
-				fmt.Fprintf(w, "data: %s\n\n", chunkJSON)
-				flusher.Flush()
+				if err := writeSSEFrame(w, controller, chunkJSON, "stream chunk"); err != nil {
+					return err
+				}
 			}
 		}
 
 		if streamDone {
-			fmt.Fprintf(w, "data: [DONE]\n\n")
-			flusher.Flush()
+			if err := writeSSEFrame(w, controller, []byte("[DONE]"), "done frame"); err != nil {
+				return err
+			}
 			return nil
 		}
 	}
@@ -183,7 +310,7 @@ func (h *Handler) streamResponse(
 // StreamAnthropicResponse handles Anthropic's different SSE format.
 // Anthropic sends "event: type\ndata: json\n\n" pairs.
 func (h *Handler) StreamAnthropicResponse(ctx context.Context, w http.ResponseWriter, providerResp *http.Response, translator models.ProviderTranslator) error {
-	return h.streamAnthropicResponse(ctx, w, providerResp, translator, nil)
+	return h.streamAnthropicResponse(ctx, w, providerResp, translator, nil, true)
 }
 
 func (h *Handler) StreamAnthropicResponseWithObserver(
@@ -193,7 +320,21 @@ func (h *Handler) StreamAnthropicResponseWithObserver(
 	translator models.ProviderTranslator,
 	observer ChunkObserver,
 ) error {
-	return h.streamAnthropicResponse(ctx, w, providerResp, translator, observer)
+	return h.streamAnthropicResponse(ctx, w, providerResp, translator, observer, true)
+}
+
+// StreamAnthropicResponseWithObserverAndUsage controls whether translated
+// usage is exposed to a Chat Completions client while still reporting the
+// original chunk to the gateway observer.
+func (h *Handler) StreamAnthropicResponseWithObserverAndUsage(
+	ctx context.Context,
+	w http.ResponseWriter,
+	providerResp *http.Response,
+	translator models.ProviderTranslator,
+	observer ChunkObserver,
+	includeUsage bool,
+) error {
+	return h.streamAnthropicResponse(ctx, w, providerResp, translator, observer, includeUsage)
 }
 
 func (h *Handler) streamAnthropicResponse(
@@ -202,29 +343,29 @@ func (h *Handler) streamAnthropicResponse(
 	providerResp *http.Response,
 	translator models.ProviderTranslator,
 	observer ChunkObserver,
+	includeUsage bool,
 ) error {
 	if providerResp != nil && providerResp.StatusCode != http.StatusOK {
 		defer providerResp.Body.Close()
 		b, _ := io.ReadAll(providerResp.Body)
 		return upstreamProviderError(providerResp.StatusCode, translator.Name(), b)
 	}
+	defer providerResp.Body.Close()
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		return fmt.Errorf("response writer does not support flushing")
-	}
+	controller := http.NewResponseController(w)
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Transfer-Encoding", "chunked")
 	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
-
-	defer providerResp.Body.Close()
+	if err := controller.Flush(); err != nil {
+		return fmt.Errorf("failed to flush stream headers: %w", err)
+	}
 
 	reader := bufio.NewReader(providerResp.Body)
 	var eventType string
+	envelope := newChatStreamEnvelopeNormalizer(translator.DefaultModel())
 
 	for {
 		select {
@@ -235,7 +376,7 @@ func (h *Handler) streamAnthropicResponse(
 
 		line, err := reader.ReadString('\n')
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				break
 			}
 			return fmt.Errorf("stream read error: %w", err)
@@ -273,7 +414,7 @@ func (h *Handler) streamAnthropicResponse(
 			}
 
 			chunk, parseErr := translator.ParseStreamChunk(payload)
-			streamDone := parseErr == providers.ErrStreamDone
+			streamDone := errors.Is(parseErr, providers.ErrStreamDone)
 			if parseErr != nil && !streamDone {
 				return fmt.Errorf("failed to parse anthropic stream chunk: %w", parseErr)
 			}
@@ -283,22 +424,31 @@ func (h *Handler) streamAnthropicResponse(
 			}
 
 			if chunk != nil {
+				chunk = envelope.normalize(chunk)
 				if observer != nil {
 					observer(chunk)
 				}
 
-				chunkJSON, marshalErr := json.Marshal(chunk)
+				clientChunk := chunk
+				if !includeUsage && chunk.Usage != nil {
+					copyChunk := *chunk
+					copyChunk.Usage = nil
+					clientChunk = &copyChunk
+				}
+				chunkJSON, marshalErr := json.Marshal(clientChunk)
 				if marshalErr != nil {
 					log.Error().Err(marshalErr).Msg("failed to marshal stream chunk")
 				} else {
-					fmt.Fprintf(w, "data: %s\n\n", chunkJSON)
-					flusher.Flush()
+					if err := writeSSEFrame(w, controller, chunkJSON, "stream chunk"); err != nil {
+						return err
+					}
 				}
 			}
 
 			if streamDone {
-				fmt.Fprintf(w, "data: [DONE]\n\n")
-				flusher.Flush()
+				if err := writeSSEFrame(w, controller, []byte("[DONE]"), "done frame"); err != nil {
+					return err
+				}
 				return nil
 			}
 		}
@@ -308,6 +458,16 @@ func (h *Handler) streamAnthropicResponse(
 		return err
 	}
 	return fmt.Errorf("%w: anthropic sse", ErrUpstreamStreamIncomplete)
+}
+
+func writeSSEFrame(w http.ResponseWriter, controller *http.ResponseController, payload []byte, frameName string) error {
+	if _, err := fmt.Fprintf(w, "data: %s\n\n", payload); err != nil {
+		return fmt.Errorf("failed to write %s: %w", frameName, err)
+	}
+	if err := controller.Flush(); err != nil {
+		return fmt.Errorf("failed to flush %s: %w", frameName, err)
+	}
+	return nil
 }
 
 // IsStreamRequest checks if the request body has stream=true.

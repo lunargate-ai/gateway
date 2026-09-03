@@ -40,6 +40,7 @@ type Handler struct {
 	store              *modelstore.Store
 	providerClients    *providerClientRegistry
 	responsesState     *responsesStateStore
+	responseBindings   *responseBindingStore
 	conversationsState *conversationStateStore
 }
 
@@ -72,7 +73,15 @@ func (w *trackedResponseWriter) Write(p []byte) (int, error) {
 }
 
 func (w *trackedFlusherResponseWriter) Flush() {
+	_ = w.FlushError()
+}
+
+func (w *trackedFlusherResponseWriter) FlushError() error {
+	if flusher, ok := w.ResponseWriter.(interface{ FlushError() error }); ok {
+		return flusher.FlushError()
+	}
 	w.flusher.Flush()
+	return nil
 }
 
 func newCapturedResponseWriter() *capturedResponseWriter {
@@ -286,6 +295,7 @@ func NewHandler(
 		store:              store,
 		providerClients:    newProviderClientRegistry(nil),
 		responsesState:     newResponsesStateStore(30 * time.Minute),
+		responseBindings:   newResponseBindingStore(30 * time.Minute),
 		conversationsState: newConversationStateStore(30 * time.Minute),
 	}
 }
@@ -724,24 +734,25 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// Set response headers
 	w.Header().Set("X-LunarGate-Provider", usedTarget.Provider)
+	providerSnapshot, ok := providerRequestSnapshotFromResponse(resp, usedTarget.Provider)
+	if !ok {
+		resp.Body.Close()
+		writeError(w, http.StatusInternalServerError, "provider request snapshot not found", "internal_error")
+		return
+	}
+
 	usedModelRaw := strings.TrimSpace(usedTarget.Model)
 	if usedModelRaw == "" {
 		usedModelRaw = modelid.ModelName(req.Model)
 		if usedModelRaw == "" {
-			if tr, ok := h.registry.Get(usedTarget.Provider); ok {
-				usedModelRaw = strings.TrimSpace(tr.DefaultModel())
-			}
+			usedModelRaw = strings.TrimSpace(providerSnapshot.Translator.DefaultModel())
 		}
 	}
 	usedModelCanonical := modelid.BuildCanonical(usedTarget.Provider, usedModelRaw)
 	req.Model = usedModelCanonical
 	w.Header().Set("X-LunarGate-Model", usedModelCanonical)
 
-	usedProviderType, ok := h.registry.Type(usedTarget.Provider)
-	if !ok {
-		writeError(w, http.StatusInternalServerError, "provider type not found", "internal_error")
-		return
-	}
+	usedProviderType := providerSnapshot.ProviderType
 	setTimingHeaders(w, -1, upstreamStartMS)
 
 	// Handle streaming response
@@ -751,11 +762,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		if f, ok := w.(http.Flusher); ok {
 			tw = &trackedFlusherResponseWriter{trackedResponseWriter: trw, flusher: f}
 		}
-		translator, ok := h.registry.Get(usedTarget.Provider)
-		if !ok {
-			writeError(w, http.StatusInternalServerError, "provider translator not found", "internal_error")
-			return
-		}
+		translator := providerSnapshot.Translator
 		if usedProviderType == "anthropic" {
 			if a, ok := translator.(*providers.AnthropicTranslator); ok {
 				translator = providers.NewAnthropicStreamTranslator(a)
@@ -781,6 +788,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		var finishReason *string
 		var ttftMS int64 = -1
 		var ttltMS int64 = -1
+		var nativeTerminal *nativeResponsesStreamTerminal
 		streamObserver := func(chunk *models.StreamChunk) {
 			if chunk == nil {
 				return
@@ -871,8 +879,50 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 
 		var streamErr error
-		if usedProviderType == "anthropic" {
-			streamErr = h.streamer.StreamAnthropicResponseWithObserver(r.Context(), tw, resp, translator, streamObserver)
+		nativeResponsesStream := strings.EqualFold(strings.TrimSpace(requestType), requestTypeResponses) &&
+			strings.EqualFold(strings.TrimSpace(usedRequestTypes.upstream), requestTypeResponses) &&
+			resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices
+		nativeResponseStatus := http.StatusOK
+		if nativeResponsesStream {
+			nativeResponseStatus = resp.StatusCode
+			copyHeaders(w.Header(), resp.Header)
+			nativeSink, _ := w.(nativeResponsesStreamSink)
+			if nativeSink != nil {
+				nativeSink.enableNativePassthrough()
+			}
+			streamErr = h.streamer.ProxySSE(
+				r.Context(),
+				tw,
+				resp,
+				usedTarget.Provider,
+				func(event streaming.SSEEvent) bool {
+					now := time.Since(startTime).Milliseconds()
+					if ttftMS < 0 && len(event.Data) > 0 {
+						ttftMS = now
+					}
+					terminal, ok := parseNativeResponsesStreamTerminal(event)
+					if !ok {
+						return false
+					}
+					nativeTerminal = terminal
+					tokensIn = terminal.tokensInput
+					tokensOut = terminal.tokensOutput
+					ttltMS = now
+					if nativeSink != nil {
+						nativeSink.recordNativeTerminal(terminal)
+					}
+					return true
+				},
+			)
+		} else if usedProviderType == "anthropic" {
+			streamErr = h.streamer.StreamAnthropicResponseWithObserverAndUsage(
+				r.Context(),
+				tw,
+				resp,
+				translator,
+				streamObserver,
+				includeAnthropicStreamUsage(requestType, &req),
+			)
 		} else if usedProviderType == "ollama" {
 			streamErr = h.streamer.StreamNDJSONResponseWithObserver(r.Context(), tw, resp, translator, streamObserver)
 		} else {
@@ -880,7 +930,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 
 		duration := time.Since(startTime)
-		status := http.StatusOK
+		status := nativeResponseStatus
 		var errCodePtr *string
 		var errMsgPtr *string
 
@@ -942,6 +992,12 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			errCodePtr = &errCode
 			errMsgPtr = &errMsg
 		} else {
+			if nativeTerminal != nil && nativeTerminal.status != "completed" {
+				errCode := "response_" + strings.ReplaceAll(nativeTerminal.status, " ", "_")
+				errMsg := "upstream response ended with status " + nativeTerminal.status
+				errCodePtr = &errCode
+				errMsgPtr = &errMsg
+			}
 			ev := log.Info().
 				Str("request_id", requestID).
 				Str("provider", usedTarget.Provider).
@@ -955,7 +1011,12 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			if ttltMS >= 0 {
 				ev = ev.Int64("ttlt_ms", ttltMS)
 			}
-			ev.Msg("stream completed")
+			if nativeTerminal != nil {
+				ev = ev.Str("response_status", nativeTerminal.status)
+				ev.Msg("stream terminated")
+			} else {
+				ev.Msg("stream completed")
+			}
 		}
 
 		h.metrics.RequestsTotal.WithLabelValues(usedTarget.Provider, usedModelRaw, strconv.Itoa(status), resolved.RouteName).Inc()
@@ -1027,7 +1088,9 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 
 				var respObj interface{}
-				if h.collector.ShareResponses() {
+				if h.collector.ShareResponses() && nativeTerminal != nil {
+					respObj = nativeTerminal.response
+				} else if h.collector.ShareResponses() {
 					usage := &models.Usage{
 						PromptTokens:     tokensIn,
 						CompletionTokens: tokensOut,
@@ -1098,15 +1161,21 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Handle non-streaming response
-	translator, ok := h.registry.Get(usedTarget.Provider)
-	if !ok {
-		resp.Body.Close()
-		writeError(w, http.StatusInternalServerError, "provider translator not found", "internal_error")
-		return
+	// A native Responses endpoint may use any successful HTTP status. Keep its
+	// transport envelope intact while still parsing the minimal unified snapshot
+	// needed by metrics and local state handling.
+	responseStatus := http.StatusOK
+	var responseHeaders http.Header
+	nativeResponsesEnvelope := strings.EqualFold(strings.TrimSpace(requestType), requestTypeResponses) &&
+		strings.EqualFold(strings.TrimSpace(usedRequestTypes.upstream), requestTypeResponses) &&
+		resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices
+	if nativeResponsesEnvelope {
+		responseStatus = resp.StatusCode
+		responseHeaders = resp.Header.Clone()
 	}
 
-	unified, err := translator.ParseResponse(resp)
+	// Handle non-streaming response
+	unified, err := providerSnapshot.Translator.ParseResponse(resp)
 	if err != nil {
 		duration := time.Since(startTime)
 		status := http.StatusBadGateway
@@ -1219,6 +1288,9 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	if nativeResponsesEnvelope {
+		copyHeaders(w.Header(), responseHeaders)
+	}
 
 	// Cache the response
 	if !noCache && h.cache.Enabled() {
@@ -1228,7 +1300,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// Record metrics
 	duration := time.Since(startTime)
-	statusCode := "200"
+	statusCode := strconv.Itoa(responseStatus)
 	h.metrics.RequestsTotal.WithLabelValues(usedTarget.Provider, usedModelRaw, statusCode, resolved.RouteName).Inc()
 	h.metrics.RequestDuration.WithLabelValues(usedTarget.Provider, usedModelRaw).Observe(duration.Seconds())
 
@@ -1250,7 +1322,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if h.collector != nil {
 		routeUsed := resolved.RouteName
 		targetIndex := resolved.Index
-		status := http.StatusOK
+		status := responseStatus
 		var tokensIn, tokensOut int
 		if unified.Usage != nil {
 			tokensIn = unified.Usage.PromptTokens
@@ -1297,7 +1369,12 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				reqObj = buildCollectorRequestLogPayload(body, usedSampling)
 			}
 			if h.collector.ShareResponses() {
-				respBytes, _ := json.Marshal(unified)
+				respBytes := []byte(nil)
+				if nativeResponsesEnvelope && json.Valid(unified.RawJSON) {
+					respBytes = unified.RawJSON
+				} else {
+					respBytes, _ = json.Marshal(unified)
+				}
 				_ = json.Unmarshal(respBytes, &respObj)
 			}
 			events = append(events, observability.Event{
@@ -1327,8 +1404,17 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		h.collector.Enqueue(r.Context(), requestID, events)
 	}
 
-	writeAPIJSON(w, http.StatusOK, unified)
+	writeAPIJSON(w, responseStatus, unified)
 	return
+}
+
+func includeAnthropicStreamUsage(requestType string, req *models.UnifiedRequest) bool {
+	// The Responses stream contract requires terminal usage for its lifecycle
+	// events. Chat Completions only exposes it when the client opts in.
+	if strings.EqualFold(strings.TrimSpace(requestType), requestTypeResponses) {
+		return true
+	}
+	return req != nil && req.StreamOptions != nil && req.StreamOptions.IncludeUsage
 }
 
 // ListModels handles GET /v1/models.
@@ -1356,12 +1442,16 @@ func (h *Handler) GetModel(w http.ResponseWriter, r *http.Request) {
 
 // callProvider makes the actual HTTP request to the LLM provider.
 func (h *Handler) callProvider(ctx context.Context, target routing.Target, req *models.UnifiedRequest, beforeUpstream func()) (*http.Response, error) {
-	translator, ok := h.registry.Get(target.Provider)
+	providerSnapshot, ok := h.registry.Snapshot(target.Provider)
 	if !ok {
 		return nil, fmt.Errorf("unknown provider: %s", target.Provider)
 	}
+	ctx = withProviderRequestSnapshot(ctx, target.Provider, providerSnapshot)
 	if upstreamRequestType := strings.TrimSpace(target.UpstreamRequestType); upstreamRequestType != "" {
 		ctx = providers.WithUpstreamRequestType(ctx, upstreamRequestType)
+	}
+	if sourceRequestType := strings.TrimSpace(req.SourceRequestType); sourceRequestType != "" {
+		ctx = providers.WithSourceRequestType(ctx, sourceRequestType)
 	}
 
 	// Each route target owns the concrete upstream model. This is especially
@@ -1373,7 +1463,7 @@ func (h *Handler) callProvider(ctx context.Context, target routing.Target, req *
 	}
 	reqCopy.Model = modelid.ModelName(reqCopy.Model)
 
-	httpReq, err := translator.TranslateRequest(ctx, &reqCopy)
+	httpReq, err := providerSnapshot.Translator.TranslateRequest(ctx, &reqCopy)
 	if err != nil {
 		return nil, resilience.NewRequestError(fmt.Errorf("failed to translate request for %s: %w", target.Provider, err))
 	}
@@ -1402,6 +1492,9 @@ func (h *Handler) callProvider(ctx context.Context, target routing.Target, req *
 			return nil, fmt.Errorf("%w: provider %s", errUpstreamTTFTTimeout, target.Provider)
 		}
 		return nil, fmt.Errorf("failed to call provider %s: %w", target.Provider, err)
+	}
+	if resp.Request == nil {
+		resp.Request = httpReq
 	}
 
 	remaining := clientCfg.timeout - time.Since(startedAt)
@@ -1538,6 +1631,14 @@ func (h *Handler) executeChatCompletionsUnified(r *http.Request) (int, http.Head
 
 	if status >= 400 {
 		return status, headers, nil, body, nil
+	}
+	var envelope struct {
+		Object string `json:"object"`
+	}
+	if err := json.Unmarshal(body, &envelope); err == nil && strings.EqualFold(strings.TrimSpace(envelope.Object), "response") {
+		return status, headers, &models.UnifiedResponse{
+			RawJSON: append(json.RawMessage(nil), body...),
+		}, nil, nil
 	}
 
 	var unified models.UnifiedResponse

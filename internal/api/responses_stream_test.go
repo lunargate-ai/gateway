@@ -42,6 +42,36 @@ func TestResponsesStreamProxy_EmitsFailedInsteadOfCompletedAfterStreamError(t *t
 	}
 }
 
+func TestResponsesStreamProxy_ReturnsDownstreamFlushError(t *testing.T) {
+	writer := &responsesFlushErrorWriter{header: make(http.Header)}
+	proxy := newResponsesStreamProxy(writer)
+
+	err := proxy.ensureStarted()
+	if !errors.Is(err, errResponsesDownstreamFlush) {
+		t.Fatalf("ensureStarted error = %v, want downstream flush error", err)
+	}
+}
+
+var errResponsesDownstreamFlush = errors.New("injected responses downstream flush failure")
+
+type responsesFlushErrorWriter struct {
+	header http.Header
+}
+
+func (w *responsesFlushErrorWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *responsesFlushErrorWriter) WriteHeader(int) {}
+
+func (w *responsesFlushErrorWriter) Write(payload []byte) (int, error) {
+	return len(payload), nil
+}
+
+func (w *responsesFlushErrorWriter) FlushError() error {
+	return errResponsesDownstreamFlush
+}
+
 func TestResponsesStreamProxy_ToolCallIDsStayStableAcrossCallAndFC(t *testing.T) {
 	rec := httptest.NewRecorder()
 	proxy := newResponsesStreamProxy(rec)

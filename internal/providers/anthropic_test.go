@@ -3,6 +3,7 @@ package providers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"testing"
 
@@ -99,6 +100,110 @@ func TestAnthropicTranslator_PreservesSystemAndDeveloperSegmentOrder(t *testing.
 	})
 	if len(payload.Messages) != 1 || payload.Messages[0].Role != "user" {
 		t.Fatalf("expected instruction roles to stay out of messages, got %#v", payload.Messages)
+	}
+}
+
+func TestAnthropicTranslator_MapsSupportedClientControls(t *testing.T) {
+	translator := NewAnthropicTranslator(config.ProviderConfig{
+		APIKey:  "dummy",
+		BaseURL: "https://api.anthropic.com",
+		Capabilities: config.ProviderCapabilities{
+			ReasoningEffort:   true,
+			StructuredOutputs: true,
+		},
+	})
+	one := 1
+	strict := true
+	payload := translateAnthropicRequest(t, translator, &models.UnifiedRequest{
+		Model:           "claude-opus-5",
+		Messages:        []models.Message{{Role: "user", Content: "return JSON"}},
+		N:               &one,
+		User:            "customer-123",
+		ReasoningEffort: "xhigh",
+		Stop:            []interface{}{"END", "STOP"},
+		ToolChoice:      "required",
+		ResponseFormat: &models.ResponseFormat{
+			Type: "json_schema",
+			JSONSchema: &models.JSONSchemaResponseFormat{
+				Name:   "answer",
+				Schema: map[string]interface{}{"type": "object"},
+				Strict: &strict,
+			},
+		},
+	})
+
+	if payload.Metadata == nil || payload.Metadata.UserID != "customer-123" {
+		t.Fatalf("metadata = %#v, want mapped user_id", payload.Metadata)
+	}
+	if payload.Thinking == nil || payload.Thinking.Type != "adaptive" {
+		t.Fatalf("thinking = %#v, want adaptive", payload.Thinking)
+	}
+	if payload.OutputConfig == nil || payload.OutputConfig.Effort != "xhigh" ||
+		payload.OutputConfig.Format == nil || payload.OutputConfig.Format.Type != "json_schema" {
+		t.Fatalf("output_config = %#v", payload.OutputConfig)
+	}
+	schema, ok := payload.OutputConfig.Format.Schema.(map[string]interface{})
+	if !ok || schema["type"] != "object" {
+		t.Fatalf("structured output schema = %#v", payload.OutputConfig.Format.Schema)
+	}
+	if len(payload.StopSequences) != 2 || payload.StopSequences[1] != "STOP" {
+		t.Fatalf("stop_sequences = %#v", payload.StopSequences)
+	}
+	choice, ok := payload.ToolChoice.(map[string]interface{})
+	if !ok || choice["type"] != "any" {
+		t.Fatalf("tool_choice = %#v", payload.ToolChoice)
+	}
+}
+
+func TestAnthropicTranslator_RejectsUnsupportedClientControls(t *testing.T) {
+	two := 2
+	zero := 0.0
+	seed := 42
+	store := true
+	tests := []struct {
+		name      string
+		request   models.UnifiedRequest
+		wantField string
+	}{
+		{name: "multiple choices", request: models.UnifiedRequest{N: &two}, wantField: "n"},
+		{name: "presence penalty", request: models.UnifiedRequest{PresencePenalty: &zero}, wantField: "presence_penalty"},
+		{name: "frequency penalty", request: models.UnifiedRequest{FrequencyPenalty: &zero}, wantField: "frequency_penalty"},
+		{name: "logit bias", request: models.UnifiedRequest{LogitBias: map[string]int{}}, wantField: "logit_bias"},
+		{name: "seed", request: models.UnifiedRequest{Seed: &seed}, wantField: "seed"},
+		{name: "chat storage", request: models.UnifiedRequest{Store: &store}, wantField: "store"},
+		{name: "invalid stop", request: models.UnifiedRequest{Stop: []interface{}{"END", 1}}, wantField: "stop"},
+		{name: "invalid tool choice", request: models.UnifiedRequest{ToolChoice: "sometimes"}, wantField: "tool_choice"},
+		{name: "reasoning without capability", request: models.UnifiedRequest{ReasoningEffort: "high"}, wantField: "reasoning_effort"},
+		{name: "structured output without capability", request: models.UnifiedRequest{ResponseFormat: &models.ResponseFormat{Type: "json_schema", JSONSchema: &models.JSONSchemaResponseFormat{Schema: map[string]interface{}{"type": "object"}}}}, wantField: "response_format"},
+		{name: "json object", request: models.UnifiedRequest{ResponseFormat: &models.ResponseFormat{Type: "json_object"}}, wantField: "response_format"},
+	}
+
+	translator := NewAnthropicTranslator(config.ProviderConfig{APIKey: "dummy"})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := translator.ValidateRequestCompatibility("anthropic-backup", &tt.request)
+			var compatibilityErr *models.CompatibilityError
+			if !errors.As(err, &compatibilityErr) {
+				t.Fatalf("error = %v, want CompatibilityError", err)
+			}
+			if compatibilityErr.Field != tt.wantField || compatibilityErr.Provider != "anthropic-backup" {
+				t.Fatalf("compatibility error = %#v", compatibilityErr)
+			}
+		})
+	}
+}
+
+func TestAnthropicTranslator_AllowsNonStoringRequests(t *testing.T) {
+	store := false
+	one := 1
+	translator := NewAnthropicTranslator(config.ProviderConfig{APIKey: "dummy"})
+	err := translator.ValidateRequestCompatibility("anthropic", &models.UnifiedRequest{
+		Store:          &store,
+		N:              &one,
+		ResponseFormat: &models.ResponseFormat{Type: "text"},
+	})
+	if err != nil {
+		t.Fatalf("locally represented controls were rejected: %v", err)
 	}
 }
 

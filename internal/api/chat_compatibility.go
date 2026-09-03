@@ -13,6 +13,10 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+type chatRequestCompatibilityValidator interface {
+	ValidateRequestCompatibility(providerID string, req *models.UnifiedRequest) error
+}
+
 func (h *Handler) validateChatCompatibility(target routing.Target, req *models.UnifiedRequest) error {
 	if h == nil || h.registry == nil || req == nil {
 		return nil
@@ -21,6 +25,16 @@ func (h *Handler) validateChatCompatibility(target routing.Target, req *models.U
 	providerType, ok := h.registry.Type(providerID)
 	if !ok {
 		return nil
+	}
+	if err := validateTranslatedResponsesCompatibility(target, providerID, providerType, req); err != nil {
+		return err
+	}
+	if translator, exists := h.registry.Get(providerID); exists {
+		if validator, validates := translator.(chatRequestCompatibilityValidator); validates {
+			if err := validator.ValidateRequestCompatibility(providerID, req); err != nil {
+				return err
+			}
+		}
 	}
 	if strings.EqualFold(providerType, "openai") && rawJSONObjectHasField(req.RawJSON, "top_k") {
 		return &models.CompatibilityError{
@@ -38,7 +52,15 @@ func (h *Handler) validateChatCompatibility(target routing.Target, req *models.U
 			Reason:   "response state is not available locally and this target does not provide native Responses continuation",
 		}
 	}
-
+	if strings.EqualFold(strings.TrimSpace(req.SourceRequestType), "responses") &&
+		rawResponsesConversationID(req.RawJSON) != "" &&
+		!strings.EqualFold(strings.TrimSpace(target.UpstreamRequestType), "responses") {
+		return &models.CompatibilityError{
+			Field:    "conversation",
+			Provider: providerID,
+			Reason:   "conversation state is not available locally and this target does not provide native Conversations support",
+		}
+	}
 	for index, toolType := range rawRequestToolTypes(req.RawJSON) {
 		if toolType == "" || toolType == "function" {
 			continue
