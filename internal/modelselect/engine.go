@@ -32,6 +32,7 @@ func NewEngine(cfg config.ModelSelectionConfig) *Engine {
 }
 
 func (e *Engine) UpdateConfig(cfg config.ModelSelectionConfig) {
+	cfg = cloneConfig(cfg)
 	cc := &compiledConfig{cfg: cfg}
 
 	if cfg.Enabled {
@@ -69,7 +70,34 @@ func (e *Engine) Config() config.ModelSelectionConfig {
 	if !ok || v == nil {
 		return config.ModelSelectionConfig{}
 	}
-	return v.cfg
+	return cloneConfig(v.cfg)
+}
+
+func cloneConfig(cfg config.ModelSelectionConfig) config.ModelSelectionConfig {
+	cloned := cfg
+	cloneInt := func(value *int) *int {
+		if value == nil {
+			return nil
+		}
+		copy := *value
+		return &copy
+	}
+	cloned.Complexity.Simple.MaxUserChars = cloneInt(cfg.Complexity.Simple.MaxUserChars)
+	cloned.Complexity.Simple.MinUserChars = cloneInt(cfg.Complexity.Simple.MinUserChars)
+	cloned.Complexity.Simple.MaxMessages = cloneInt(cfg.Complexity.Simple.MaxMessages)
+	cloned.Complexity.Simple.MinMessages = cloneInt(cfg.Complexity.Simple.MinMessages)
+	cloned.Complexity.Simple.AnyOf = append([]string(nil), cfg.Complexity.Simple.AnyOf...)
+	cloned.Complexity.Complex.MaxUserChars = cloneInt(cfg.Complexity.Complex.MaxUserChars)
+	cloned.Complexity.Complex.MinUserChars = cloneInt(cfg.Complexity.Complex.MinUserChars)
+	cloned.Complexity.Complex.MaxMessages = cloneInt(cfg.Complexity.Complex.MaxMessages)
+	cloned.Complexity.Complex.MinMessages = cloneInt(cfg.Complexity.Complex.MinMessages)
+	cloned.Complexity.Complex.AnyOf = append([]string(nil), cfg.Complexity.Complex.AnyOf...)
+	cloned.Skills = make([]config.ModelSelectionSkillRule, len(cfg.Skills))
+	for i, skill := range cfg.Skills {
+		cloned.Skills[i] = skill
+		cloned.Skills[i].RegexAny = append([]string(nil), skill.RegexAny...)
+	}
+	return cloned
 }
 
 func (e *Engine) Enabled() bool {
@@ -105,17 +133,21 @@ func (e *Engine) EnrichHeaders(req *models.UnifiedRequest, headers map[string]st
 		}
 	}
 
-	hasTools := req != nil && (len(req.Tools) > 0 || req.ToolChoice != nil)
+	hasTools := false
+	if req != nil {
+		hasTools = len(req.Tools) > 0 && requestContainsToolIntent(req)
+	}
 	requiresJSON := false
 	if req != nil && req.ResponseFormat != nil {
-		t := strings.TrimSpace(req.ResponseFormat.Type)
-		requiresJSON = t == "json" || t == "json_object"
+		t := strings.ToLower(strings.TrimSpace(req.ResponseFormat.Type))
+		requiresJSON = t == "json" || t == "json_object" || t == "json_schema"
 	}
 
 	score := classifyComplexityScore(cfg.ComplexityScoring, userChars, userText, hasTools)
-	complexity = classifyComplexityTier(cfg.ComplexityTiers, score)
-	if complexity == "" {
+	if complexityRulesConfigured(cfg.Complexity) {
 		complexity = classifyComplexity(cfg.Complexity, userChars, msgCount, hasTools, requiresJSON)
+	} else {
+		complexity = classifyComplexityTier(cfg.ComplexityTiers, score)
 	}
 	skill = classifySkill(v.skills, userText)
 
@@ -133,13 +165,42 @@ func (e *Engine) EnrichHeaders(req *models.UnifiedRequest, headers map[string]st
 		if k := strings.TrimSpace(cfg.OutputHeaders.Skill); k != "" && strings.TrimSpace(skill) != "" {
 			headers[strings.ToLower(k)] = skill
 		}
-		// Add tools requirement header for routing
+		// Add the tools requirement header whenever the request may use tools.
+		// Only an explicit tool_choice=none opts out of tool-capable routing.
 		if hasTools {
 			headers["x-lunargate-requires-tools"] = "true"
 		}
 	}
 
 	return complexity, skill
+}
+
+func requestContainsToolIntent(req *models.UnifiedRequest) bool {
+	if req == nil {
+		return false
+	}
+	if len(req.Tools) == 0 {
+		return false
+	}
+	for _, msg := range req.Messages {
+		if len(msg.ToolCalls) > 0 {
+			return true
+		}
+		if strings.EqualFold(strings.TrimSpace(msg.Role), "tool") && strings.TrimSpace(msg.ToolCallID) != "" {
+			return true
+		}
+	}
+	switch v := req.ToolChoice.(type) {
+	case nil:
+		return true
+	case string:
+		s := strings.ToLower(strings.TrimSpace(v))
+		return s != "none"
+	case map[string]interface{}:
+		return true
+	default:
+		return true
+	}
 }
 
 func classifyComplexityScore(cfg config.ModelSelectionComplexityScoringConfig, userChars int, userText []string, hasTools bool) int {
@@ -285,10 +346,7 @@ func classifyComplexity(
 	requiresJSON bool,
 ) string {
 	// If no rules are configured, use sane defaults.
-	isEmpty := rules.Simple.MaxUserChars == nil && rules.Simple.MinUserChars == nil && rules.Simple.MaxMessages == nil && rules.Simple.MinMessages == nil && len(rules.Simple.AnyOf) == 0 && !rules.Simple.RequireNoTools && !rules.Simple.RequireNoJSON &&
-		rules.Complex.MaxUserChars == nil && rules.Complex.MinUserChars == nil && rules.Complex.MaxMessages == nil && rules.Complex.MinMessages == nil && len(rules.Complex.AnyOf) == 0 && !rules.Complex.RequireNoTools && !rules.Complex.RequireNoJSON
-
-	if isEmpty {
+	if !complexityRulesConfigured(rules) {
 		if userChars <= 800 && msgCount <= 6 && !hasTools && !requiresJSON {
 			return "simple"
 		}
@@ -303,6 +361,23 @@ func classifyComplexity(
 	}
 
 	return "simple"
+}
+
+func complexityRulesConfigured(rules config.ModelSelectionComplexityRules) bool {
+	return rules.Simple.MaxUserChars != nil ||
+		rules.Simple.MinUserChars != nil ||
+		rules.Simple.MaxMessages != nil ||
+		rules.Simple.MinMessages != nil ||
+		len(rules.Simple.AnyOf) > 0 ||
+		rules.Simple.RequireNoTools ||
+		rules.Simple.RequireNoJSON ||
+		rules.Complex.MaxUserChars != nil ||
+		rules.Complex.MinUserChars != nil ||
+		rules.Complex.MaxMessages != nil ||
+		rules.Complex.MinMessages != nil ||
+		len(rules.Complex.AnyOf) > 0 ||
+		rules.Complex.RequireNoTools ||
+		rules.Complex.RequireNoJSON
 }
 
 func matchesComplexityRule(

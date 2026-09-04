@@ -3,10 +3,79 @@ package security
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/lunargate-ai/gateway/internal/config"
 )
+
+func TestManagerRejectsEnabledAuthWithoutProvider(t *testing.T) {
+	for _, provider := range []string{"", "none", " NONE "} {
+		t.Run(strings.TrimSpace(provider), func(t *testing.T) {
+			_, err := NewManager(config.SecurityConfig{Enabled: true, Provider: provider})
+			if err == nil {
+				t.Fatal("NewManager returned nil error")
+			}
+			if !strings.Contains(err.Error(), "must not be none") {
+				t.Fatalf("NewManager error = %q", err)
+			}
+		})
+	}
+}
+
+func TestManagerKeepsAuthStateWhenReloadDisablesProvider(t *testing.T) {
+	manager, err := NewManager(config.SecurityConfig{
+		Enabled:  true,
+		Provider: "api_key",
+		APIKey: config.APIKeyAuthConfig{Keys: []config.APIKeyCredential{
+			{Name: "active", Value: "lg_test_active"},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("NewManager returned error: %v", err)
+	}
+
+	if err := manager.UpdateConfig(config.SecurityConfig{Enabled: true, Provider: "none"}); err == nil {
+		t.Fatal("UpdateConfig returned nil error")
+	}
+
+	handler := manager.Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	unauthenticated := httptest.NewRecorder()
+	handler.ServeHTTP(unauthenticated, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if unauthenticated.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated status = %d, want %d", unauthenticated.Code, http.StatusUnauthorized)
+	}
+
+	authenticatedRequest := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	authenticatedRequest.Header.Set("Authorization", "lg_test_active")
+	authenticated := httptest.NewRecorder()
+	handler.ServeHTTP(authenticated, authenticatedRequest)
+	if authenticated.Code != http.StatusNoContent {
+		t.Fatalf("authenticated status = %d, want %d", authenticated.Code, http.StatusNoContent)
+	}
+}
+
+func TestManagerMiddlewareFailsClosedWithoutAuthenticator(t *testing.T) {
+	manager := &Manager{}
+	manager.state.Store(&runtimeState{enabled: true, provider: "api_key"})
+	nextCalled := false
+	handler := manager.Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		nextCalled = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+
+	if nextCalled {
+		t.Fatal("middleware called protected handler without an authenticator")
+	}
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusInternalServerError)
+	}
+}
 
 func TestManager_APIKeyAuthViaAuthorizationHeader(t *testing.T) {
 	manager, err := NewManager(config.SecurityConfig{

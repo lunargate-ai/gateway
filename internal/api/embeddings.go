@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,7 @@ import (
 	"github.com/lunargate-ai/gateway/internal/modelid"
 	"github.com/lunargate-ai/gateway/internal/observability"
 	"github.com/lunargate-ai/gateway/internal/providers"
+	"github.com/lunargate-ai/gateway/internal/resilience"
 	"github.com/lunargate-ai/gateway/internal/routing"
 	"github.com/lunargate-ai/gateway/pkg/models"
 	"github.com/rs/zerolog/log"
@@ -32,31 +34,16 @@ func parseEmbeddingsRequest(w http.ResponseWriter, r *http.Request, captureBody 
 	defer r.Body.Close()
 
 	var req models.EmbeddingsRequest
-	var body []byte
-
-	if captureBody {
-		var err error
-		body, err = io.ReadAll(r.Body)
-		if err != nil {
-			writeRequestReadError(w, err)
-			return nil, nil, false
-		}
-		if err := json.Unmarshal(body, &req); err != nil {
-			writeRequestDecodeError(w, err)
-			return nil, nil, false
-		}
-	} else {
-		decoder := json.NewDecoder(r.Body)
-		if err := decoder.Decode(&req); err != nil {
-			writeRequestDecodeError(w, err)
-			return nil, nil, false
-		}
-		var extra json.RawMessage
-		if err := decoder.Decode(&extra); err != io.EOF {
-			writeRequestDecodeError(w, err)
-			return nil, nil, false
-		}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeRequestReadError(w, err)
+		return nil, nil, false
 	}
+	if err := decodeJSONStrict(bytes.NewReader(body), &req); err != nil {
+		writeRequestDecodeError(w, err)
+		return nil, nil, false
+	}
+	req.RawJSON = append(json.RawMessage(nil), body...)
 
 	if strings.TrimSpace(req.Model) == "" {
 		writeError(w, http.StatusBadRequest, "model is required", "invalid_request_error")
@@ -67,16 +54,10 @@ func parseEmbeddingsRequest(w http.ResponseWriter, r *http.Request, captureBody 
 		return nil, nil, false
 	}
 
-	return body, &req, true
-}
-
-func cloneTagsWithRequestType(tags map[string]string, requestType string) map[string]string {
-	out := make(map[string]string, len(tags)+1)
-	for k, v := range tags {
-		out[k] = v
+	if !captureBody {
+		return nil, &req, true
 	}
-	out["x-lunargate-request-type"] = requestType
-	return out
+	return body, &req, true
 }
 
 func extractUserAndSession(headers map[string]string) (*string, *string) {
@@ -97,6 +78,10 @@ func (h *Handler) resolveEmbeddingsRoute(ctx context.Context, path string, heade
 	resolved, err := h.router.Resolve(ctx, path, headers)
 	if err == nil {
 		return resolved, nil
+	}
+	var unavailable *routing.RequestedTargetUnavailableError
+	if errors.As(err, &unavailable) {
+		return nil, err
 	}
 	if strings.TrimSpace(requestedProvider) == "" {
 		return nil, err
@@ -126,32 +111,146 @@ func (h *Handler) resolveEmbeddingsRoute(ctx context.Context, path string, heade
 	}, nil
 }
 
-func (h *Handler) callEmbeddingsProvider(ctx context.Context, target routing.Target, req *models.EmbeddingsRequest, beforeUpstream func()) (*http.Response, error) {
+func (h *Handler) validateEmbeddingsCompatibility(target routing.Target, req *models.EmbeddingsRequest) error {
+	if h == nil || req == nil {
+		return nil
+	}
+	if h.registry == nil {
+		return &models.CompatibilityError{
+			Field:    "provider",
+			Provider: target.Provider,
+			Reason:   "provider registry is unavailable",
+		}
+	}
 	translator, ok := h.registry.Get(target.Provider)
+	if !ok {
+		return &models.CompatibilityError{
+			Field:    "provider",
+			Provider: target.Provider,
+			Reason:   "provider is not configured",
+		}
+	}
+	if _, ok := translator.(embeddingsTranslator); !ok {
+		return &models.CompatibilityError{
+			Field:    "provider",
+			Provider: target.Provider,
+			Reason:   "provider does not implement the embeddings API",
+		}
+	}
+	providerType, typeOK := h.registry.Type(target.Provider)
+	format := strings.ToLower(strings.TrimSpace(req.EncodingFormat))
+	switch format {
+	case "", "float":
+	case "base64":
+		capabilities, ok := h.registry.Capabilities(target.Provider)
+		if ok && typeOK && capabilities.EmbeddingsBase64 && strings.EqualFold(providerType, "openai") {
+			return nil
+		}
+		return &models.CompatibilityError{
+			Field:    "encoding_format",
+			Provider: target.Provider,
+			Reason:   "base64 embeddings are not enabled for this provider",
+		}
+	default:
+		return &models.CompatibilityError{
+			Field:    "encoding_format",
+			Provider: target.Provider,
+			Reason:   fmt.Sprintf("unsupported value %q", req.EncodingFormat),
+		}
+	}
+	if typeOK && strings.EqualFold(providerType, "ollama") {
+		if req.Dimensions != nil {
+			return &models.CompatibilityError{
+				Field:    "dimensions",
+				Provider: target.Provider,
+				Reason:   "Ollama's embed API does not expose output dimension selection",
+			}
+		}
+		if strings.TrimSpace(req.User) != "" {
+			return &models.CompatibilityError{
+				Field:    "user",
+				Provider: target.Provider,
+				Reason:   "Ollama's embed API has no equivalent end-user identifier field",
+			}
+		}
+		if !ollamaEmbeddingInputCompatible(req.Input) {
+			return &models.CompatibilityError{
+				Field:    "input",
+				Provider: target.Provider,
+				Reason:   "Ollama's embed API accepts only a string or an array of strings",
+			}
+		}
+	}
+	return nil
+}
+
+func ollamaEmbeddingInputCompatible(input interface{}) bool {
+	switch value := input.(type) {
+	case string:
+		return true
+	case []string:
+		return true
+	case []interface{}:
+		for _, item := range value {
+			if _, ok := item.(string); !ok {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *Handler) compatibleEmbeddingsFallbacks(fallbacks []routing.Target, req *models.EmbeddingsRequest) []routing.Target {
+	if len(fallbacks) == 0 {
+		return nil
+	}
+	compatible := make([]routing.Target, 0, len(fallbacks))
+	for _, target := range fallbacks {
+		if err := h.validateEmbeddingsCompatibility(target, req); err != nil {
+			log.Warn().
+				Err(err).
+				Str("provider", target.Provider).
+				Str("model", target.Model).
+				Msg("skipping incompatible embeddings fallback target")
+			continue
+		}
+		compatible = append(compatible, target)
+	}
+	return compatible
+}
+
+func (h *Handler) callEmbeddingsProvider(ctx context.Context, target routing.Target, req *models.EmbeddingsRequest, beforeUpstream func()) (*http.Response, error) {
+	providerSnapshot, ok := circuitBreakerTargetSnapshotFromContext(ctx, target)
+	if !ok {
+		providerSnapshot, ok = h.registry.Snapshot(target.Provider)
+	}
 	if !ok {
 		return nil, fmt.Errorf("unknown provider: %s", target.Provider)
 	}
-	embeddingTranslator, ok := translator.(embeddingsTranslator)
+	embeddingTranslator, ok := providerSnapshot.Translator.(embeddingsTranslator)
 	if !ok {
 		return nil, fmt.Errorf("provider %s does not support embeddings", target.Provider)
 	}
+	ctx = withProviderRequestSnapshot(ctx, target.Provider, providerSnapshot)
 
 	reqCopy := *req
-	if strings.TrimSpace(reqCopy.Model) == "" && strings.TrimSpace(target.Model) != "" {
+	if strings.TrimSpace(target.Model) != "" {
 		reqCopy.Model = strings.TrimSpace(target.Model)
 	}
 	reqCopy.Model = modelid.ModelName(reqCopy.Model)
 
 	httpReq, err := embeddingTranslator.TranslateEmbeddingsRequest(ctx, &reqCopy)
 	if err != nil {
-		return nil, fmt.Errorf("failed to translate embeddings request for %s: %w", target.Provider, err)
+		return nil, resilience.NewRequestError(fmt.Errorf("failed to translate embeddings request for %s: %w", target.Provider, err))
 	}
 	if beforeUpstream != nil {
 		beforeUpstream()
 	}
 
 	clientCfg := providerClientConfig{
-		client:  newProviderHTTPClient(defaultUpstreamTimeout),
+		client:  newProviderHTTPClient(),
 		timeout: defaultUpstreamTimeout,
 		mode:    upstreamTimeoutModeTTFT,
 	}
@@ -161,38 +260,24 @@ func (h *Handler) callEmbeddingsProvider(ctx context.Context, target routing.Tar
 		}
 	}
 
-	startedAt := time.Now()
-	resp, err := clientCfg.client.Do(httpReq)
+	resp, err := doProviderRequest(httpReq, clientCfg, target.Provider, "failed to call provider")
 	if err != nil {
-		if isHTTPTimeoutError(err) {
-			if clientCfg.mode == upstreamTimeoutModeTotal {
-				return nil, fmt.Errorf("%w: provider %s", errUpstreamTotalTimeout, target.Provider)
-			}
-			return nil, fmt.Errorf("%w: provider %s", errUpstreamTTFTTimeout, target.Provider)
-		}
-		return nil, fmt.Errorf("failed to call provider %s: %w", target.Provider, err)
-	}
-
-	remaining := clientCfg.timeout - time.Since(startedAt)
-	if transport, ok := clientCfg.client.Transport.(*http.Transport); ok && transport.ResponseHeaderTimeout > 0 {
-		remaining = transport.ResponseHeaderTimeout - time.Since(startedAt)
-	}
-	if remaining <= 0 {
-		resp.Body.Close()
-		if clientCfg.mode == upstreamTimeoutModeTotal {
-			return nil, fmt.Errorf("%w: provider %s", errUpstreamTotalTimeout, target.Provider)
-		}
-		return nil, fmt.Errorf("%w: provider %s", errUpstreamTTFTTimeout, target.Provider)
-	}
-	if clientCfg.mode == upstreamTimeoutModeTotal {
-		resp.Body = wrapBodyWithTotalTimeout(resp.Body, remaining)
-	} else {
-		resp.Body = wrapBodyWithTTFTTimeout(resp.Body, remaining)
+		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode < http.StatusBadRequest {
+			_ = resp.Body.Close()
+			return nil, invalidProviderResponseStatus(target.Provider, resp.StatusCode)
+		}
 		return resp, nil
 	}
-	return resp, nil
+
+	parsed, err := parseEmbeddingsProviderResponse(embeddingTranslator, resp)
+	if err != nil {
+		return nil, err
+	}
+	normalizeEmbeddingsResponseUsage(parsed)
+	return responseWithParsedEmbeddings(resp, target.Provider, parsed), nil
 }
 
 func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
@@ -239,6 +324,8 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 	if p, m, ok := modelid.SplitCanonical(req.Model); ok {
 		requestedProvider = strings.TrimSpace(p)
 		requestedModelRaw = strings.TrimSpace(m)
+	} else {
+		requestedModelRaw = strings.TrimSpace(req.Model)
 	}
 	if strings.TrimSpace(requestedProvider) == "" {
 		requestedProvider = strings.TrimSpace(explicitProvider)
@@ -254,6 +341,7 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 	if explicitProvider != "" {
 		headers["x-lunargate-provider"] = explicitProvider
 	}
+	headers["x-lunargate-request-type"] = requestTypeEmbeddings
 	if h.collector != nil {
 		if v := strings.TrimSpace(h.collector.GatewayLat()); v != "" {
 			headers["x-lunargate-gateway-lat"] = v
@@ -263,12 +351,28 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	resolved, err := h.resolveEmbeddingsRoute(r.Context(), r.URL.Path, headers, requestedProvider)
+	routingHeaders := routingHeadersForRequest(r, h.router.MatchHeaderNames(), headers)
+	resolved, err := h.resolveEmbeddingsRoute(r.Context(), r.URL.Path, routingHeaders, requestedProvider)
 	if err != nil {
+		var unavailable *routing.RequestedTargetUnavailableError
+		if errors.As(err, &unavailable) {
+			writeRequestedTargetUnavailable(w, unavailable)
+			return
+		}
 		log.Error().Err(err).Str("request_id", requestID).Msg("failed to resolve embeddings route")
 		writeError(w, http.StatusBadGateway, "no route matched for this request", "routing_error")
 		return
 	}
+	if err := h.validateEmbeddingsCompatibility(resolved.Target, &req); err != nil {
+		var compatibilityErr *models.CompatibilityError
+		if errors.As(err, &compatibilityErr) {
+			writeCompatibilityError(w, compatibilityErr)
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
+		return
+	}
+	resolved.Fallbacks = h.compatibleEmbeddingsFallbacks(resolved.Fallbacks, &req)
 	w.Header().Set("X-LunarGate-Route", resolved.RouteName)
 
 	if requestedProvider != "" && strings.TrimSpace(resolved.Target.Provider) != requestedProvider {
@@ -295,20 +399,62 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 		req.Model = modelid.BuildCanonical(resolved.Target.Provider, req.Model)
 		headers["x-lunargate-model"] = req.Model
 	}
+	requestTypes := embeddingsAPIRequestTypes()
+	collectorHeaders := requestTypes.tags(headers)
+	traceTags := h.enrichCollectorTags(collectorHeaders, resolved.Target.Provider, req.Model, false)
 
 	noCache := r.Header.Get("X-LunarGate-No-Cache") == "true"
 	if !noCache && h.cache.Enabled() {
-		cacheKey := middleware.GenerateEmbeddingsKey(&req)
+		lookupModelRaw := h.effectiveTargetModel(resolved.Target, req.Model)
+		cacheKey := h.runtimeCacheKey(
+			middleware.GenerateEmbeddingsKeyForResolvedTargetWithHeaders(
+				&req,
+				resolved.Target.Provider,
+				lookupModelRaw,
+				resolved.Target.UpstreamRequestType,
+				r.Header,
+			),
+			resolved.Target.Provider,
+		)
 		if cached := h.cache.Get(cacheKey); cached != nil {
 			if cachedResp, ok := cached.(*models.EmbeddingsResponse); ok {
 				h.metrics.CacheHits.WithLabelValues("hit").Inc()
 				cacheHit = true
-				durationMS := time.Since(startTime).Milliseconds()
+				cachedModelRaw := lookupModelRaw
+				cachedModelCanonical := modelid.BuildCanonical(resolved.Target.Provider, cachedModelRaw)
+				userPtr, sessionIDPtr := extractUserAndSession(headers)
+				tokensIn := 0
+				if cachedResp.Usage != nil {
+					tokensIn = cachedResp.Usage.PromptTokens
+					if tokensIn == 0 {
+						tokensIn = cachedResp.Usage.TotalTokens
+					}
+				}
+				var requestPayload interface{}
+				if h.collector != nil && h.collector.SharePrompts() {
+					_ = json.Unmarshal(body, &requestPayload)
+				}
+				duration := h.recordCacheHit(r.Context(), cacheHitObservation{
+					requestID:    requestID,
+					startTime:    startTime,
+					requestTypes: requestTypes,
+					provider:     resolved.Target.Provider,
+					model:        cachedModelCanonical,
+					metricsModel: boundedModelMetricLabel(resolved.Target, cachedModelRaw),
+					route:        resolved.RouteName,
+					targetIndex:  resolved.Index,
+					user:         userPtr,
+					sessionID:    sessionIDPtr,
+					tags:         h.enrichCollectorTags(collectorHeaders, resolved.Target.Provider, cachedModelCanonical, false),
+					tokensInput:  tokensIn,
+					request:      requestPayload,
+					response:     embeddingsResponseForCollector(cachedResp),
+				})
 				w.Header().Set("X-LunarGate-Cache-Status", "HIT")
 				w.Header().Set("X-LunarGate-Provider", resolved.Target.Provider)
-				w.Header().Set("X-LunarGate-Model", req.Model)
-				setTimingHeaders(w, durationMS, durationMS)
-				writeJSON(w, http.StatusOK, models.CloneEmbeddingsResponse(cachedResp))
+				w.Header().Set("X-LunarGate-Model", cachedModelCanonical)
+				setTimingHeaders(w, duration.Milliseconds(), duration.Milliseconds())
+				writeEmbeddingsJSON(w, http.StatusOK, models.CloneEmbeddingsResponse(cachedResp))
 				return
 			}
 		}
@@ -325,7 +471,6 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 		Str("model", req.Model).
 		Msg("routing embeddings request")
 
-	traceTags := cloneTagsWithRequestType(h.enrichCollectorTags(headers, resolved.Target.Provider, req.Model, false), "embeddings")
 	if h.collector != nil {
 		startEvt := []observability.Event{{
 			Type: "trace",
@@ -351,14 +496,29 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	requestCtx := requestContextWithRetryPolicy(r)
+	requestCtx = h.withCircuitBreakerTargetSnapshots(requestCtx, resolved)
 	resp, usedTarget, fallbackUsed, retryCount, cbState, err := h.fallback.Execute(requestCtx, resolved.Target, resolved.Fallbacks, executeFunc)
 	h.observeCircuitBreakerState(usedTarget.Provider, cbState)
+	usedModelForTags := strings.TrimSpace(usedTarget.Model)
+	if usedModelForTags == "" {
+		usedModelForTags = modelid.ModelName(req.Model)
+		if usedModelForTags == "" {
+			if translator, ok := h.registry.Get(usedTarget.Provider); ok {
+				usedModelForTags = strings.TrimSpace(translator.DefaultModel())
+			}
+		}
+	}
+	usedCanonicalModelForTags := modelid.BuildCanonical(usedTarget.Provider, usedModelForTags)
+	usedTraceTags := h.enrichCollectorTags(collectorHeaders, usedTarget.Provider, usedCanonicalModelForTags, false)
 	if err != nil {
 		duration := time.Since(startTime)
 		status := http.StatusBadGateway
 		errCode := "provider_error"
 		errMsg := "all embedding providers unavailable"
-		if errors.Is(err, context.Canceled) {
+		requestFailure := false
+		clientTerminated := isClientRequestTermination(r.Context(), err)
+		var upstreamFailure *upstreamHTTPError
+		if clientTerminated {
 			status = 499
 			errCode = "client_cancelled"
 			errMsg = "client disconnected"
@@ -366,6 +526,17 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 				Str("request_id", requestID).
 				Dur("duration", duration).
 				Msg("embeddings request cancelled")
+		} else if requestStatus, requestErrCode, requestErrMsg, ok := requestFailureFromError(err); ok {
+			status = requestStatus
+			errCode = requestErrCode
+			errMsg = requestErrMsg
+			requestFailure = true
+			log.Warn().
+				Err(err).
+				Str("request_id", requestID).
+				Int("status_code", status).
+				Dur("duration", duration).
+				Msg("embeddings request rejected before upstream call")
 		} else if isUpstreamTTFTTimeout(err) {
 			errCode = "upstream_timeout"
 			errMsg = "provider timed out waiting for first byte"
@@ -381,21 +552,51 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 				Dur("duration", duration).
 				Msg("embeddings total timeout")
 		} else {
-			log.Error().Err(err).
-				Str("request_id", requestID).
-				Dur("duration", duration).
-				Msg("all embeddings providers failed")
+			providerType, _ := h.registry.Type(usedTarget.Provider)
+			if failure, ok := upstreamHTTPErrorFromRetry(err, providerType); ok {
+				upstreamFailure = failure
+				status = failure.status
+				errCode = failure.errType
+				errMsg = failure.message
+				log.Warn().
+					Err(err).
+					Str("request_id", requestID).
+					Int("status_code", status).
+					Dur("duration", duration).
+					Msg("upstream embeddings provider failure after retries")
+			} else if failureStatus, failureType, failureMessage, ok := classifyProviderResponseError(err); ok {
+				status = failureStatus
+				errCode = failureType
+				errMsg = failureMessage
+				log.Warn().
+					Err(err).
+					Str("request_id", requestID).
+					Int("status_code", status).
+					Dur("duration", duration).
+					Msg("embeddings provider returned an invalid response")
+			} else {
+				log.Error().Err(err).
+					Str("request_id", requestID).
+					Dur("duration", duration).
+					Msg("all embeddings providers failed")
+			}
 		}
-		if !errors.Is(err, context.Canceled) {
-			h.metrics.ProviderErrors.WithLabelValues(resolved.Target.Provider, "all_failed").Inc()
+		if !clientTerminated && !requestFailure {
+			h.metrics.ProviderErrors.WithLabelValues(usedTarget.Provider, "all_failed").Inc()
 		}
 		setTimingHeaders(w, duration.Milliseconds(), upstreamStartMS)
-		writeError(w, status, errMsg, errCode)
+		if upstreamFailure != nil {
+			upstreamFailure.write(w)
+		} else {
+			writeError(w, status, errMsg, errCode)
+		}
 		if h.collector != nil {
 			errCodeForCollector := errCode
 			errMsgForCollector := err.Error()
-			if errors.Is(err, context.Canceled) {
+			if clientTerminated {
 				errMsgForCollector = "client disconnected"
+			} else if upstreamFailure != nil {
+				errMsgForCollector = upstreamFailure.message
 			} else if isUpstreamTTFTTimeout(err) {
 				errCodeForCollector = "upstream_timeout"
 				errMsgForCollector = "provider timed out waiting for first byte"
@@ -415,26 +616,26 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 				Data: observability.MetricEventData{
 					RequestID:            requestID,
 					Timestamp:            startTime.UTC(),
-					RequestType:          "embeddings",
+					RequestType:          requestTypes.client,
+					UpstreamRequestType:  requestTypes.upstream,
 					DurationMS:           duration.Milliseconds(),
 					GatewayPreUpstreamMS: upstreamPtr,
 					Provider:             usedTarget.Provider,
-					Model:                req.Model,
+					Model:                usedCanonicalModelForTags,
 					User:                 userPtr,
 					SessionID:            sessionIDPtr,
 					TokensInput:          0,
 					TokensOutput:         0,
 					CostUSD:              0,
 					StatusCode:           status,
-					ErrorCode:            &errCodeForCollector,
-					ErrorMessage:         &errMsgForCollector,
+					ErrorCode:            observability.MetricErrorClass(status, true),
 					CacheHit:             cacheHit,
 					RouteUsed:            &routeUsed,
 					TargetIndex:          &targetIndex,
 					FallbackUsed:         fallbackUsed,
 					RetryCount:           retryCount,
 					CircuitBreakerState:  &cbState,
-					Tags:                 traceTags,
+					Tags:                 usedTraceTags,
 				},
 			}}
 			if h.collector.SharePrompts() {
@@ -443,23 +644,24 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 				events = append(events, observability.Event{
 					Type: "request_log",
 					Data: observability.RequestLogEventData{
-						RequestID:    requestID,
-						Timestamp:    startTime.UTC(),
-						RequestType:  "embeddings",
-						User:         userPtr,
-						SessionID:    sessionIDPtr,
-						Provider:     usedTarget.Provider,
-						Model:        req.Model,
-						StatusCode:   status,
-						DurationMS:   duration.Milliseconds(),
-						RouteUsed:    &routeUsed,
-						CacheHit:     cacheHit,
-						FallbackUsed: fallbackUsed,
-						RetryCount:   retryCount,
-						ErrorCode:    &errCodeForCollector,
-						ErrorMessage: &errMsgForCollector,
-						Tags:         traceTags,
-						Request:      reqAny,
+						RequestID:           requestID,
+						Timestamp:           startTime.UTC(),
+						RequestType:         requestTypes.client,
+						UpstreamRequestType: requestTypes.upstream,
+						User:                userPtr,
+						SessionID:           sessionIDPtr,
+						Provider:            usedTarget.Provider,
+						Model:               usedCanonicalModelForTags,
+						StatusCode:          status,
+						DurationMS:          duration.Milliseconds(),
+						RouteUsed:           &routeUsed,
+						CacheHit:            cacheHit,
+						FallbackUsed:        fallbackUsed,
+						RetryCount:          retryCount,
+						ErrorCode:           &errCodeForCollector,
+						ErrorMessage:        &errMsgForCollector,
+						Tags:                usedTraceTags,
+						Request:             reqAny,
 					},
 				})
 			}
@@ -473,41 +675,43 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("X-LunarGate-Provider", usedTarget.Provider)
+	providerSnapshot, ok := providerRequestSnapshotFromResponse(resp, usedTarget.Provider)
+	if !ok {
+		resp.Body.Close()
+		writeError(w, http.StatusInternalServerError, "provider request snapshot not found", "internal_error")
+		return
+	}
 	usedModelRaw := strings.TrimSpace(usedTarget.Model)
 	if usedModelRaw == "" {
 		usedModelRaw = modelid.ModelName(req.Model)
 		if usedModelRaw == "" {
-			if tr, ok := h.registry.Get(usedTarget.Provider); ok {
-				usedModelRaw = strings.TrimSpace(tr.DefaultModel())
-			}
+			usedModelRaw = strings.TrimSpace(providerSnapshot.Translator.DefaultModel())
 		}
 	}
 	usedModelCanonical := modelid.BuildCanonical(usedTarget.Provider, usedModelRaw)
+	metricsModelRaw := boundedModelMetricLabel(usedTarget, usedModelRaw)
+	usedTraceTags = h.enrichCollectorTags(collectorHeaders, usedTarget.Provider, usedModelCanonical, false)
 	req.Model = usedModelCanonical
 	w.Header().Set("X-LunarGate-Model", usedModelCanonical)
 
-	usedProviderType, ok := h.registry.Type(usedTarget.Provider)
-	if !ok {
-		resp.Body.Close()
-		writeError(w, http.StatusInternalServerError, "provider type not found", "internal_error")
-		return
-	}
+	usedProviderType := providerSnapshot.ProviderType
 	setTimingHeaders(w, -1, upstreamStartMS)
 
-	translator, ok := h.registry.Get(usedTarget.Provider)
-	if !ok {
-		resp.Body.Close()
-		writeError(w, http.StatusInternalServerError, "provider translator not found", "internal_error")
-		return
-	}
-	embeddingsTranslator, ok := translator.(embeddingsTranslator)
-	if !ok {
-		resp.Body.Close()
-		writeError(w, http.StatusBadGateway, "provider does not support embeddings", "provider_error")
-		return
-	}
+	responseHeaders := resp.Header.Clone()
 
-	embeddingsResp, err := embeddingsTranslator.ParseEmbeddingsResponse(resp)
+	var embeddingsResp *models.EmbeddingsResponse
+	var upstreamFailure *upstreamHTTPError
+	if resp.StatusCode >= http.StatusBadRequest {
+		upstreamFailure = readUpstreamHTTPError(resp, usedProviderType)
+		err = upstreamFailure
+	} else {
+		var parsed bool
+		embeddingsResp, parsed = parsedEmbeddingsFromResponse(resp, usedTarget.Provider)
+		if !parsed {
+			err = &providerResponseParseError{cause: errors.New("parsed embeddings response not found")}
+		}
+	}
+	copyHeaders(w.Header(), responseHeaders)
 	if err != nil {
 		duration := time.Since(startTime)
 		status := http.StatusBadGateway
@@ -516,7 +720,13 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 		errMsg := "failed to parse provider response: " + err.Error()
 		metricErrType := "parse_error"
 		var pe *providers.ProviderError
-		if errors.As(err, &pe) {
+		if upstreamFailure != nil {
+			status = upstreamFailure.status
+			respErrType = upstreamFailure.errType
+			collectorErrCode = upstreamFailure.errType
+			errMsg = upstreamFailure.message
+			metricErrType = upstreamFailure.errType
+		} else if errors.As(err, &pe) {
 			if pe.StatusCode != 0 {
 				status = pe.StatusCode
 			}
@@ -549,9 +759,13 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 			Str("provider", usedTarget.Provider).
 			Dur("duration", duration).
 			Msg("failed to parse embeddings provider response")
-		h.metrics.ProviderErrors.WithLabelValues(usedTarget.Provider, metricErrType).Inc()
+		h.metrics.ProviderErrors.WithLabelValues(usedTarget.Provider, boundedProviderErrorMetricType(status, metricErrType)).Inc()
 		setTimingHeaders(w, duration.Milliseconds(), upstreamStartMS)
-		writeError(w, status, errMsg, respErrType)
+		if upstreamFailure != nil {
+			upstreamFailure.write(w)
+		} else {
+			writeError(w, status, errMsg, respErrType)
+		}
 		if h.collector != nil {
 			errCode := collectorErrCode
 			routeUsed := resolved.RouteName
@@ -566,7 +780,8 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 				Data: observability.MetricEventData{
 					RequestID:            requestID,
 					Timestamp:            startTime.UTC(),
-					RequestType:          "embeddings",
+					RequestType:          requestTypes.client,
+					UpstreamRequestType:  requestTypes.upstream,
 					DurationMS:           duration.Milliseconds(),
 					GatewayPreUpstreamMS: upstreamPtr,
 					Provider:             usedTarget.Provider,
@@ -577,15 +792,14 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 					TokensOutput:         0,
 					CostUSD:              0,
 					StatusCode:           status,
-					ErrorCode:            &errCode,
-					ErrorMessage:         &errMsg,
+					ErrorCode:            observability.MetricErrorClass(status, true),
 					CacheHit:             cacheHit,
 					RouteUsed:            &routeUsed,
 					TargetIndex:          &targetIndex,
 					FallbackUsed:         fallbackUsed,
 					RetryCount:           retryCount,
 					CircuitBreakerState:  &cbState,
-					Tags:                 traceTags,
+					Tags:                 usedTraceTags,
 				},
 			}}
 			if h.collector.SharePrompts() {
@@ -594,23 +808,24 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 				events = append(events, observability.Event{
 					Type: "request_log",
 					Data: observability.RequestLogEventData{
-						RequestID:    requestID,
-						Timestamp:    startTime.UTC(),
-						RequestType:  "embeddings",
-						User:         userPtr,
-						SessionID:    sessionIDPtr,
-						Provider:     usedTarget.Provider,
-						Model:        usedModelCanonical,
-						StatusCode:   status,
-						DurationMS:   duration.Milliseconds(),
-						RouteUsed:    &routeUsed,
-						CacheHit:     cacheHit,
-						FallbackUsed: fallbackUsed,
-						RetryCount:   retryCount,
-						ErrorCode:    &errCode,
-						ErrorMessage: &errMsg,
-						Tags:         traceTags,
-						Request:      reqAny,
+						RequestID:           requestID,
+						Timestamp:           startTime.UTC(),
+						RequestType:         requestTypes.client,
+						UpstreamRequestType: requestTypes.upstream,
+						User:                userPtr,
+						SessionID:           sessionIDPtr,
+						Provider:            usedTarget.Provider,
+						Model:               usedModelCanonical,
+						StatusCode:          status,
+						DurationMS:          duration.Milliseconds(),
+						RouteUsed:           &routeUsed,
+						CacheHit:            cacheHit,
+						FallbackUsed:        fallbackUsed,
+						RetryCount:          retryCount,
+						ErrorCode:           &errCode,
+						ErrorMessage:        &errMsg,
+						Tags:                usedTraceTags,
+						Request:             reqAny,
 					},
 				})
 			}
@@ -620,13 +835,22 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !noCache && h.cache.Enabled() {
-		cacheKey := middleware.GenerateEmbeddingsKey(&req)
+		cacheKey := h.runtimeCacheKey(
+			middleware.GenerateEmbeddingsKeyForResolvedTargetWithHeaders(
+				&req,
+				usedTarget.Provider,
+				usedModelRaw,
+				usedTarget.UpstreamRequestType,
+				r.Header,
+			),
+			usedTarget.Provider,
+		)
 		h.cache.Set(cacheKey, models.CloneEmbeddingsResponse(embeddingsResp))
 	}
 
 	duration := time.Since(startTime)
-	h.metrics.RequestsTotal.WithLabelValues(usedTarget.Provider, usedModelRaw, strconv.Itoa(http.StatusOK), resolved.RouteName).Inc()
-	h.metrics.RequestDuration.WithLabelValues(usedTarget.Provider, usedModelRaw).Observe(duration.Seconds())
+	h.metrics.RequestsTotal.WithLabelValues(usedTarget.Provider, metricsModelRaw, strconv.Itoa(http.StatusOK), resolved.RouteName).Inc()
+	h.metrics.RequestDuration.WithLabelValues(usedTarget.Provider, metricsModelRaw).Observe(duration.Seconds())
 
 	var tokensIn int
 	if embeddingsResp.Usage != nil {
@@ -635,9 +859,8 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 			tokensIn = embeddingsResp.Usage.TotalTokens
 		}
 	}
-	if tokensIn > 0 {
-		h.metrics.TokensTotal.WithLabelValues(usedTarget.Provider, usedModelRaw, "input").Add(float64(tokensIn))
-	}
+	tokenUsage := models.TokenUsage{InputTokens: tokensIn}.Normalized()
+	h.metrics.ObserveTokenUsage(usedTarget.Provider, metricsModelRaw, tokenUsage)
 
 	setTimingHeaders(w, duration.Milliseconds(), upstreamStartMS)
 
@@ -653,7 +876,7 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 	if h.collector != nil {
 		routeUsed := resolved.RouteName
 		targetIndex := resolved.Index
-		costUSD := observability.EstimateCostUSD(usedProviderType, usedModelRaw, tokensIn, 0)
+		costUSD := observability.EstimateTokenUsageCostUSD(usedTarget.Provider, usedProviderType, usedModelRaw, tokenUsage)
 		var upstreamPtr *int64
 		if upstreamStartMS >= 0 {
 			v := upstreamStartMS
@@ -664,7 +887,8 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 			Data: observability.MetricEventData{
 				RequestID:            requestID,
 				Timestamp:            startTime.UTC(),
-				RequestType:          "embeddings",
+				RequestType:          requestTypes.client,
+				UpstreamRequestType:  requestTypes.upstream,
 				DurationMS:           duration.Milliseconds(),
 				GatewayPreUpstreamMS: upstreamPtr,
 				Provider:             usedTarget.Provider,
@@ -681,7 +905,7 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 				FallbackUsed:         fallbackUsed,
 				RetryCount:           retryCount,
 				CircuitBreakerState:  &cbState,
-				Tags:                 traceTags,
+				Tags:                 usedTraceTags,
 			},
 		}}
 		if h.collector.SharePrompts() || h.collector.ShareResponses() {
@@ -691,33 +915,62 @@ func (h *Handler) Embeddings(w http.ResponseWriter, r *http.Request) {
 				_ = json.Unmarshal(body, &reqObj)
 			}
 			if h.collector.ShareResponses() {
-				respBytes, _ := json.Marshal(embeddingsResp)
-				_ = json.Unmarshal(respBytes, &respObj)
+				respObj = embeddingsResponseForCollector(embeddingsResp)
 			}
 			events = append(events, observability.Event{
 				Type: "request_log",
 				Data: observability.RequestLogEventData{
-					RequestID:    requestID,
-					Timestamp:    startTime.UTC(),
-					RequestType:  "embeddings",
-					User:         userPtr,
-					SessionID:    sessionIDPtr,
-					Provider:     usedTarget.Provider,
-					Model:        req.Model,
-					StatusCode:   http.StatusOK,
-					DurationMS:   duration.Milliseconds(),
-					RouteUsed:    &routeUsed,
-					CacheHit:     cacheHit,
-					FallbackUsed: fallbackUsed,
-					RetryCount:   retryCount,
-					Tags:         traceTags,
-					Request:      reqObj,
-					Response:     respObj,
+					RequestID:           requestID,
+					Timestamp:           startTime.UTC(),
+					RequestType:         requestTypes.client,
+					UpstreamRequestType: requestTypes.upstream,
+					User:                userPtr,
+					SessionID:           sessionIDPtr,
+					Provider:            usedTarget.Provider,
+					Model:               req.Model,
+					StatusCode:          http.StatusOK,
+					DurationMS:          duration.Milliseconds(),
+					RouteUsed:           &routeUsed,
+					CacheHit:            cacheHit,
+					FallbackUsed:        fallbackUsed,
+					RetryCount:          retryCount,
+					Tags:                usedTraceTags,
+					Request:             reqObj,
+					Response:            respObj,
 				},
 			})
 		}
 		h.collector.Enqueue(r.Context(), requestID, events)
 	}
 
-	writeJSON(w, http.StatusOK, embeddingsResp)
+	writeEmbeddingsJSON(w, http.StatusOK, embeddingsResp)
+}
+
+func embeddingsResponseJSON(resp *models.EmbeddingsResponse) []byte {
+	if resp != nil && json.Valid(bytes.TrimSpace(resp.RawJSON)) {
+		return append([]byte(nil), resp.RawJSON...)
+	}
+	body, _ := json.Marshal(resp)
+	return body
+}
+
+func embeddingsResponseForCollector(resp *models.EmbeddingsResponse) interface{} {
+	var payload interface{}
+	if err := json.Unmarshal(embeddingsResponseJSON(resp), &payload); err != nil {
+		return resp
+	}
+	return payload
+}
+
+func writeEmbeddingsJSON(w http.ResponseWriter, status int, resp *models.EmbeddingsResponse) {
+	raw := embeddingsResponseJSON(resp)
+	if len(bytes.TrimSpace(raw)) == 0 || !json.Valid(raw) {
+		writeJSON(w, status, resp)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if _, err := w.Write(raw); err != nil {
+		log.Error().Err(err).Msg("failed to write embeddings JSON response")
+	}
 }

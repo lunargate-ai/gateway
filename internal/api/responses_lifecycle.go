@@ -1,0 +1,453 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+)
+
+const (
+	defaultResponseInputItemsLimit = 20
+	maxResponseInputItemsLimit     = 100
+)
+
+type responseInputItemList struct {
+	Object  string            `json:"object"`
+	Data    []json.RawMessage `json:"data"`
+	FirstID *string           `json:"first_id"`
+	LastID  *string           `json:"last_id"`
+	HasMore bool              `json:"has_more"`
+}
+
+// RetrieveResponse returns a locally emulated response or proxies the request
+// to the native provider that owns the response ID.
+func (h *Handler) RetrieveResponse(w http.ResponseWriter, r *http.Request) {
+	responseID, ok := clientURLResourceID(w, r, "response_id")
+	if !ok {
+		return
+	}
+	binding, bound, err := h.boundResponseBinding(r, responseID, responseNativeLifecycle)
+	if err != nil {
+		writeResponseBindingResolutionError(w, err)
+		return
+	}
+	if bound && !binding.LocalSnapshot {
+		h.proxyResponseLifecycleRequest(w, r, binding, http.MethodGet, "responses/"+url.PathEscape(responseID), nil, responseID)
+		return
+	}
+	if bound && binding.LocalSnapshot && h != nil && h.responsesState != nil {
+		if response, _, ok := h.responsesState.getCompleted(responseID); ok {
+			if param := unsupportedLocalResponseRetrieveParam(r); param != "" {
+				code := "unsupported_feature"
+				writeErrorDetail(
+					w,
+					http.StatusBadRequest,
+					fmt.Sprintf("%s is not supported for locally stored responses", param),
+					"invalid_request_error",
+					&param,
+					&code,
+				)
+				return
+			}
+			writeJSON(w, http.StatusOK, response)
+			return
+		}
+	}
+	if bound && binding.LocalSnapshot {
+		writeResponseNotFound(w, responseID)
+		return
+	}
+	if h != nil && h.responsesState != nil {
+		h.responsesState.discard(responseID)
+	}
+
+	if binding, ok, err := h.explicitResponseBinding(r, responseNativeLifecycle); err != nil {
+		writeResponseBindingResolutionError(w, err)
+		return
+	} else if ok {
+		h.proxyResponseLifecycleRequest(w, r, binding, http.MethodGet, "responses/"+url.PathEscape(responseID), nil, responseID)
+		return
+	}
+	writeResponseNotFound(w, responseID)
+}
+
+func unsupportedLocalResponseRetrieveParam(r *http.Request) string {
+	if r == nil || r.URL == nil {
+		return ""
+	}
+	query := r.URL.Query()
+	for _, param := range []string{"include", "include_obfuscation", "starting_after"} {
+		for key := range query {
+			if strings.TrimSuffix(strings.TrimSpace(key), "[]") == param {
+				return param
+			}
+		}
+	}
+	return ""
+}
+
+// DeleteResponse deletes either locally emulated state or the bound native
+// resource. Native deletion is attempted exactly once and the owner binding is
+// released only after the upstream confirms success.
+func (h *Handler) DeleteResponse(w http.ResponseWriter, r *http.Request) {
+	responseID, ok := clientURLResourceID(w, r, "response_id")
+	if !ok {
+		return
+	}
+	binding, bound, err := h.boundResponseBinding(r, responseID, responseNativeLifecycle)
+	if err != nil {
+		writeResponseBindingResolutionError(w, err)
+		return
+	}
+	if bound && !binding.LocalSnapshot {
+		response, requestErr := h.makeResponseLifecycleRequest(r, binding, http.MethodDelete, "responses/"+url.PathEscape(responseID), nil)
+		if requestErr != nil {
+			writeNativeResponseTransportError(w, r.Context(), binding, requestErr)
+			return
+		}
+		if response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
+			h.responseBindings.deleteIfOwned(responseID, binding)
+		}
+		h.proxyNativeResponse(w, r, binding, response)
+		return
+	}
+	if bound && binding.LocalSnapshot && h != nil && h.responsesState != nil && h.responsesState.delete(responseID) {
+		if h.responseBindings != nil {
+			h.responseBindings.deleteIfOwned(responseID, binding)
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if bound && binding.LocalSnapshot {
+		writeResponseNotFound(w, responseID)
+		return
+	}
+	if h != nil && h.responsesState != nil {
+		h.responsesState.discard(responseID)
+	}
+
+	if binding, ok, err := h.explicitResponseBinding(r, responseNativeLifecycle); err != nil {
+		writeResponseBindingResolutionError(w, err)
+		return
+	} else if ok {
+		response, requestErr := h.makeResponseLifecycleRequest(r, binding, http.MethodDelete, "responses/"+url.PathEscape(responseID), nil)
+		if requestErr != nil {
+			writeNativeResponseTransportError(w, r.Context(), binding, requestErr)
+			return
+		}
+		h.proxyNativeResponse(w, r, binding, response)
+		return
+	}
+	writeResponseNotFound(w, responseID)
+}
+
+// CancelResponse proxies native cancellation exactly once. Locally emulated
+// responses cannot be cancelled because they are already terminal snapshots.
+func (h *Handler) CancelResponse(w http.ResponseWriter, r *http.Request) {
+	responseID, ok := clientURLResourceID(w, r, "response_id")
+	if !ok {
+		return
+	}
+	body, ok := readResponseOperationBody(w, r)
+	if !ok {
+		return
+	}
+	binding, bound, err := h.boundResponseBinding(r, responseID, responseNativeCancellation)
+	if err != nil {
+		writeResponseBindingResolutionError(w, err)
+		return
+	}
+	if bound && !binding.LocalSnapshot {
+		h.proxyResponseLifecycleRequest(w, r, binding, http.MethodPost, "responses/"+url.PathEscape(responseID)+"/cancel", body, responseID)
+		return
+	}
+	if bound && binding.LocalSnapshot && h != nil && h.responsesState != nil {
+		if _, _, local := h.responsesState.getCompleted(responseID); local {
+			param := "response_id"
+			code := "unsupported_feature"
+			writeErrorDetail(w, http.StatusBadRequest, "cancellation is not supported for locally stored responses", "invalid_request_error", &param, &code)
+			return
+		}
+	}
+	if bound && binding.LocalSnapshot {
+		writeResponseNotFound(w, responseID)
+		return
+	}
+	if h != nil && h.responsesState != nil {
+		h.responsesState.discard(responseID)
+	}
+
+	if binding, explicit, err := h.explicitResponseBinding(r, responseNativeCancellation); err != nil {
+		writeResponseBindingResolutionError(w, err)
+		return
+	} else if explicit {
+		h.proxyResponseLifecycleRequest(w, r, binding, http.MethodPost, "responses/"+url.PathEscape(responseID)+"/cancel", body, responseID)
+		return
+	}
+	writeResponseNotFound(w, responseID)
+}
+
+// ListResponseInputItems lists the locally retained input items used to create
+// a stored response. Results follow the Responses API cursor envelope.
+func (h *Handler) ListResponseInputItems(w http.ResponseWriter, r *http.Request) {
+	responseID, ok := clientURLResourceID(w, r, "response_id")
+	if !ok {
+		return
+	}
+	after, ok := clientOptionalResourceID(w, r.URL.Query().Get("after"), "after")
+	if !ok {
+		return
+	}
+	binding, bound, err := h.boundResponseBinding(r, responseID, responseNativeLifecycle)
+	if err != nil {
+		writeResponseBindingResolutionError(w, err)
+		return
+	}
+	if bound && !binding.LocalSnapshot {
+		h.proxyResponseLifecycleRequest(w, r, binding, http.MethodGet, "responses/"+url.PathEscape(responseID)+"/input_items", nil, "")
+		return
+	}
+	if bound && binding.LocalSnapshot && h != nil && h.responsesState != nil {
+		if _, inputItems, ok := h.responsesState.getCompleted(responseID); ok {
+			if responseInputItemsIncludeRequested(r) {
+				param := "include"
+				code := "unsupported_feature"
+				writeErrorDetail(
+					w,
+					http.StatusBadRequest,
+					"include is not supported for locally stored response input items",
+					"invalid_request_error",
+					&param,
+					&code,
+				)
+				return
+			}
+
+			page, param, err := paginateResponseInputItems(
+				inputItems,
+				after,
+				strings.TrimSpace(r.URL.Query().Get("order")),
+				strings.TrimSpace(r.URL.Query().Get("limit")),
+			)
+			if err != nil {
+				code := "invalid_value"
+				writeErrorDetail(w, http.StatusBadRequest, err.Error(), "invalid_request_error", &param, &code)
+				return
+			}
+
+			writeJSON(w, http.StatusOK, page)
+			return
+		}
+	}
+	if bound && binding.LocalSnapshot {
+		writeResponseNotFound(w, responseID)
+		return
+	}
+	if h != nil && h.responsesState != nil {
+		h.responsesState.discard(responseID)
+	}
+
+	if binding, ok, err := h.explicitResponseBinding(r, responseNativeLifecycle); err != nil {
+		writeResponseBindingResolutionError(w, err)
+		return
+	} else if ok {
+		h.proxyResponseLifecycleRequest(w, r, binding, http.MethodGet, "responses/"+url.PathEscape(responseID)+"/input_items", nil, "")
+		return
+	}
+	writeResponseNotFound(w, responseID)
+}
+
+func (h *Handler) proxyResponseLifecycleRequest(
+	w http.ResponseWriter,
+	r *http.Request,
+	binding responseBinding,
+	method string,
+	path string,
+	body []byte,
+	expectedResponseID string,
+) {
+	contract := nativeResponseBodyContract{}
+	if expectedResponseID != "" {
+		contract = nativeResponseBodyContract{
+			expectedID:     expectedResponseID,
+			expectedObject: "response",
+			requireID:      true,
+		}
+	}
+	h.proxyResponseLifecycleRequestWithContract(w, r, binding, method, path, body, contract)
+}
+
+func (h *Handler) proxyResponseLifecycleRequestWithContract(
+	w http.ResponseWriter,
+	r *http.Request,
+	binding responseBinding,
+	method string,
+	path string,
+	body []byte,
+	contract nativeResponseBodyContract,
+) {
+	response, err := h.makeResponseLifecycleRequest(r, binding, method, path, body)
+	if err != nil {
+		writeNativeResponseTransportError(w, r.Context(), binding, err)
+		return
+	}
+	h.proxyNativeResponseWithContract(w, r, binding, response, contract)
+}
+
+func writeNativeResponseTransportError(w http.ResponseWriter, parent context.Context, binding responseBinding, err error) {
+	writeNativeLifecycleTransportError(
+		w,
+		parent,
+		binding.Provider,
+		err,
+		"native response provider request failed",
+		"upstream response provider request failed",
+	)
+}
+
+func (h *Handler) makeResponseLifecycleRequest(
+	r *http.Request,
+	binding responseBinding,
+	method string,
+	path string,
+	body []byte,
+) (*http.Response, error) {
+	rawQuery := ""
+	if r != nil && r.URL != nil {
+		rawQuery = r.URL.RawQuery
+	}
+	return h.nativeResponseRequest(r.Context(), method, binding, path, rawQuery, body, r.Header)
+}
+
+func readResponseOperationBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	if r == nil || r.Body == nil {
+		return nil, true
+	}
+	limitRequestBody(w, r)
+	defer r.Body.Close()
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeRequestReadError(w, err)
+		return nil, false
+	}
+	return body, true
+}
+
+func writeResponseBindingResolutionError(w http.ResponseWriter, err error) {
+	resolutionErr, ok := err.(*responseBindingResolutionError)
+	if !ok || resolutionErr == nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
+		return
+	}
+	param := resolutionErr.param
+	code := resolutionErr.code
+	writeErrorDetail(w, http.StatusBadRequest, resolutionErr.message, "invalid_request_error", &param, &code)
+}
+
+func responseInputItemsIncludeRequested(r *http.Request) bool {
+	if r == nil || r.URL == nil {
+		return false
+	}
+	for key := range r.URL.Query() {
+		normalized := strings.TrimSuffix(strings.TrimSpace(key), "[]")
+		if normalized == "include" {
+			return true
+		}
+	}
+	return false
+}
+
+func paginateResponseInputItems(
+	inputItems []json.RawMessage,
+	after string,
+	orderValue string,
+	limitValue string,
+) (responseInputItemList, string, error) {
+	limit := defaultResponseInputItemsLimit
+	if limitValue != "" {
+		parsed, err := strconv.Atoi(limitValue)
+		if err != nil || parsed < 1 || parsed > maxResponseInputItemsLimit {
+			return responseInputItemList{}, "limit", fmt.Errorf(
+				"limit must be an integer between 1 and %d",
+				maxResponseInputItemsLimit,
+			)
+		}
+		limit = parsed
+	}
+
+	order := strings.ToLower(orderValue)
+	if order == "" {
+		order = "desc"
+	}
+	if order != "asc" && order != "desc" {
+		return responseInputItemList{}, "order", fmt.Errorf("order must be 'asc' or 'desc'")
+	}
+
+	ordered := cloneResponsesRawMessages(inputItems)
+	if order == "desc" {
+		for left, right := 0, len(ordered)-1; left < right; left, right = left+1, right-1 {
+			ordered[left], ordered[right] = ordered[right], ordered[left]
+		}
+	}
+
+	start := 0
+	if after != "" {
+		found := false
+		for index, item := range ordered {
+			if responseInputItemID(item) == after {
+				start = index + 1
+				found = true
+				break
+			}
+		}
+		if !found {
+			return responseInputItemList{}, "after", fmt.Errorf("item with id %q was not found", after)
+		}
+	}
+
+	end := start + limit
+	if end > len(ordered) {
+		end = len(ordered)
+	}
+	data := make([]json.RawMessage, end-start)
+	copy(data, ordered[start:end])
+
+	page := responseInputItemList{
+		Object:  "list",
+		Data:    data,
+		HasMore: end < len(ordered),
+	}
+	if len(data) > 0 {
+		firstID := responseInputItemID(data[0])
+		lastID := responseInputItemID(data[len(data)-1])
+		page.FirstID = &firstID
+		page.LastID = &lastID
+	}
+	return page, "", nil
+}
+
+func responseInputItemID(item json.RawMessage) string {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(item, &fields); err != nil {
+		return ""
+	}
+	return parseJSONStringRaw(fields["id"])
+}
+
+func writeResponseNotFound(w http.ResponseWriter, responseID string) {
+	param := "response_id"
+	code := "response_not_found"
+	writeErrorDetail(
+		w,
+		http.StatusNotFound,
+		fmt.Sprintf("Response with id '%s' not found.", responseID),
+		"invalid_request_error",
+		&param,
+		&code,
+	)
+}

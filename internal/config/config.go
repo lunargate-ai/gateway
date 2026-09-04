@@ -2,24 +2,42 @@ package config
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
+	"math"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/lunargate-ai/gateway/internal/safeurl"
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/viper"
+	"gopkg.in/yaml.v3"
 )
 
-const defaultDataSharingBackendURL = "https://api.lunargate.ai/v1"
+const (
+	defaultBackendURL         = "https://api.lunargate.ai/v1"
+	defaultUpdateCheckURL     = "https://get.lunargate.ai/latest"
+	defaultUpdateCheckPeriod  = 24 * time.Hour
+	defaultUpdateCheckTimeout = 3 * time.Second
+	// DefaultModelsFetchTTL is the effective cache duration for fetch-mode discovery.
+	DefaultModelsFetchTTL = 10 * time.Minute
+	// MaxRetryAttempts bounds cumulative provider timeouts and retry load per request.
+	MaxRetryAttempts = 10
+)
 
 // Config holds the entire gateway configuration.
 type Config struct {
+	General     GeneralConfig             `mapstructure:"general"`
 	Server      ServerConfig              `mapstructure:"server"`
 	Providers   map[string]ProviderConfig `mapstructure:"providers"`
 	Routing     RoutingConfig             `mapstructure:"routing"`
@@ -30,6 +48,19 @@ type Config struct {
 	Logging     LoggingConfig             `mapstructure:"logging"`
 	Security    SecurityConfig            `mapstructure:"security"`
 	DataSharing DataSharingConfig         `mapstructure:"data_sharing"`
+	UpdateCheck UpdateCheckConfig         `mapstructure:"update_check"`
+}
+
+type GeneralConfig struct {
+	APIKey     string `mapstructure:"api_key"`
+	BackendURL string `mapstructure:"backend_url"`
+}
+
+type UpdateCheckConfig struct {
+	Enabled  bool          `mapstructure:"enabled"`
+	Endpoint string        `mapstructure:"endpoint"`
+	Interval time.Duration `mapstructure:"interval"`
+	Timeout  time.Duration `mapstructure:"timeout"`
 }
 
 type ServerConfig struct {
@@ -41,7 +72,11 @@ type ServerConfig struct {
 }
 
 func (s ServerConfig) Address() string {
-	return fmt.Sprintf("%s:%d", s.Host, s.Port)
+	host := strings.TrimSpace(s.Host)
+	if normalized, err := normalizeServerHost(host); err == nil {
+		host = normalized
+	}
+	return net.JoinHostPort(host, strconv.Itoa(s.Port))
 }
 
 type ProviderConfig struct {
@@ -58,8 +93,31 @@ type ProviderConfig struct {
 	TimeoutMode            string               `mapstructure:"timeout_mode"`
 	CompatibilityProfile   string               `mapstructure:"compatibility_profile"`
 	NormalizeDeveloperRole bool                 `mapstructure:"normalize_developer_role"`
+	ExtractReasoningTags   bool                 `mapstructure:"extract_reasoning_tags"`
 	Extra                  map[string]string    `mapstructure:"extra"`
 	Models                 ProviderModelsConfig `mapstructure:"models"`
+	Capabilities           ProviderCapabilities `mapstructure:"capabilities"`
+}
+
+// ProviderCapabilities declares optional API contracts that must never be
+// inferred from a provider's type or URL. Zero values are deliberately safe.
+type ProviderCapabilities struct {
+	ChatCompletionsLifecycle bool `mapstructure:"chat_completions_lifecycle"`
+	ResponsesLifecycle       bool `mapstructure:"responses_lifecycle"`
+	Conversations            bool `mapstructure:"conversations"`
+	BackgroundResponses      bool `mapstructure:"background_responses"`
+	ResponseCancellation     bool `mapstructure:"response_cancellation"`
+	ResponseCompaction       bool `mapstructure:"response_compaction"`
+	ResponseInputTokens      bool `mapstructure:"response_input_tokens"`
+	EmbeddingsBase64         bool `mapstructure:"embeddings_base64"`
+	StructuredOutputs        bool `mapstructure:"structured_outputs"`
+	ReasoningEffort          bool `mapstructure:"reasoning_effort"`
+	// ReasoningEffortLevels narrows model-dependent levels. An empty list
+	// enables only the common low, medium, and high levels.
+	ReasoningEffortLevels []string `mapstructure:"reasoning_effort_levels"`
+	// AdaptiveThinking permits thinking.type=adaptive in translated requests.
+	AdaptiveThinking bool     `mapstructure:"adaptive_thinking"`
+	HostedTools      []string `mapstructure:"hosted_tools"`
 }
 
 type ProviderModelsConfig struct {
@@ -158,7 +216,16 @@ type CacheConfig struct {
 	Enabled bool          `mapstructure:"enabled"`
 	TTL     time.Duration `mapstructure:"ttl"`
 	MaxSize int           `mapstructure:"max_size"`
+	// Byte limits account for the cache key and retained serialized response
+	// buffers. They intentionally exclude fixed per-entry Go object overhead.
+	MaxEntryBytes int `mapstructure:"max_entry_bytes"`
+	MaxBytes      int `mapstructure:"max_bytes"`
 }
+
+const (
+	DefaultCacheMaxEntryBytes = 16 << 20
+	DefaultCacheMaxBytes      = 64 << 20
+)
 
 type RetryConfig struct {
 	Enabled         bool          `mapstructure:"enabled"`
@@ -208,18 +275,19 @@ type ExternalAuthConfig struct {
 	Timeout          time.Duration `mapstructure:"timeout"`
 }
 
-// DataSharingConfig controls what request/response data the gateway forwards
-// to the SaaS backend. When disabled (default), ONLY metrics are sent (zero data leakage).
-// When enabled, prompts and/or responses can be forwarded for log inspection in the dashboard.
+// DataSharingConfig controls all gateway communication with the SaaS backend.
+// Enabled is the master switch for collection and remote control. Prompt and
+// response forwarding remain independently opt-in when the master switch is on.
 type DataSharingConfig struct {
 	Enabled        bool   `mapstructure:"enabled"`
 	SharePrompts   bool   `mapstructure:"share_prompts"`
 	ShareResponses bool   `mapstructure:"share_responses"`
-	BackendURL     string `mapstructure:"backend_url"`
 	APIKey         string `mapstructure:"api_key"`
-	GatewayLat     string `mapstructure:"gateway_lat"`
-	GatewayLon     string `mapstructure:"gateway_lon"`
-	RemoteControl  bool   `mapstructure:"remote_control"`
+	// BackendURL is a deprecated compatibility alias for general.backend_url.
+	BackendURL    string `mapstructure:"backend_url"`
+	GatewayLat    string `mapstructure:"gateway_lat"`
+	GatewayLon    string `mapstructure:"gateway_lon"`
+	RemoteControl bool   `mapstructure:"remote_control"`
 }
 
 // Manager handles config loading, validation, and hot-reloading.
@@ -256,6 +324,8 @@ func NewManager(path string) (*Manager, error) {
 }
 
 func (m *Manager) setDefaults() {
+	m.v.SetDefault("general.api_key", "")
+
 	m.v.SetDefault("server.host", "0.0.0.0")
 	m.v.SetDefault("server.port", 8080)
 	m.v.SetDefault("server.read_timeout", "30s")
@@ -271,6 +341,8 @@ func (m *Manager) setDefaults() {
 	m.v.SetDefault("caching.enabled", false)
 	m.v.SetDefault("caching.ttl", "1h")
 	m.v.SetDefault("caching.max_size", 1000)
+	m.v.SetDefault("caching.max_entry_bytes", DefaultCacheMaxEntryBytes)
+	m.v.SetDefault("caching.max_bytes", DefaultCacheMaxBytes)
 
 	m.v.SetDefault("retry.enabled", true)
 	m.v.SetDefault("retry.max_attempts", 3)
@@ -309,39 +381,154 @@ func (m *Manager) setDefaults() {
 	m.v.SetDefault("data_sharing.enabled", false)
 	m.v.SetDefault("data_sharing.share_prompts", false)
 	m.v.SetDefault("data_sharing.share_responses", false)
-	m.v.SetDefault("data_sharing.backend_url", defaultDataSharingBackendURL)
 	m.v.SetDefault("data_sharing.api_key", "")
 	m.v.SetDefault("data_sharing.remote_control", false)
+
+	m.v.SetDefault("update_check.enabled", true)
+	m.v.SetDefault("update_check.endpoint", defaultUpdateCheckURL)
+	m.v.SetDefault("update_check.interval", defaultUpdateCheckPeriod)
+	m.v.SetDefault("update_check.timeout", defaultUpdateCheckTimeout)
 }
 
 func (m *Manager) load() error {
-	if err := m.v.ReadInConfig(); err != nil {
+	rawConfig, err := os.ReadFile(m.path)
+	if err != nil {
+		return fmt.Errorf("failed to read config file: %w", err)
+	}
+	if isYAMLConfigPath(m.path) {
+		if err := validateRoutingHeaderKeyDuplicates(rawConfig); err != nil {
+			return fmt.Errorf("invalid config: %w", err)
+		}
+	}
+	if err := m.v.ReadConfig(bytes.NewReader(rawConfig)); err != nil {
 		return fmt.Errorf("failed to read config file: %w", err)
 	}
 
 	cfg := &Config{}
-	if err := m.v.Unmarshal(cfg); err != nil {
+	if err := m.v.UnmarshalExact(cfg); err != nil {
 		return fmt.Errorf("failed to unmarshal config: %w", err)
 	}
 
 	expandConfigEnv(cfg)
+	normalizeProviderCapabilities(cfg)
 	normalizeSecurityConfig(cfg)
+	resolveGatewayAPIKey(cfg)
+	cfg.UpdateCheck.Endpoint = strings.TrimSpace(cfg.UpdateCheck.Endpoint)
+	if cfg.UpdateCheck.Endpoint == "" {
+		cfg.UpdateCheck.Endpoint = defaultUpdateCheckURL
+	}
 	if err := validateConfig(cfg); err != nil {
 		return fmt.Errorf("invalid config: %w", err)
 	}
 
-	cfg.DataSharing.BackendURL = expandEnv(cfg.DataSharing.BackendURL)
-	cfg.DataSharing.BackendURL = strings.TrimRight(strings.TrimSpace(cfg.DataSharing.BackendURL), "/")
-	if strings.HasSuffix(cfg.DataSharing.BackendURL, "/collector") {
-		cfg.DataSharing.BackendURL = strings.TrimSuffix(cfg.DataSharing.BackendURL, "/collector")
+	if cfg.UpdateCheck.Interval <= 0 {
+		cfg.UpdateCheck.Interval = defaultUpdateCheckPeriod
 	}
-	if strings.TrimSpace(cfg.DataSharing.BackendURL) == "" {
-		cfg.DataSharing.BackendURL = defaultDataSharingBackendURL
+	if cfg.UpdateCheck.Timeout <= 0 {
+		cfg.UpdateCheck.Timeout = defaultUpdateCheckTimeout
 	}
-	cfg.DataSharing.APIKey = expandEnv(cfg.DataSharing.APIKey)
 
 	m.current.Store(cfg)
 	return nil
+}
+
+func isYAMLConfigPath(path string) bool {
+	extension := strings.ToLower(filepath.Ext(path))
+	return extension == ".yaml" || extension == ".yml"
+}
+
+func validateRoutingHeaderKeyDuplicates(rawConfig []byte) error {
+	var document yaml.Node
+	if err := yaml.Unmarshal(rawConfig, &document); err != nil {
+		return err
+	}
+	if len(document.Content) == 0 {
+		return nil
+	}
+
+	routing := yamlMappingValue(document.Content[0], "routing")
+	routes := yamlMappingValue(routing, "routes")
+	if routes == nil || routes.Kind != yaml.SequenceNode {
+		return nil
+	}
+
+	for routeIndex, route := range routes.Content {
+		match := yamlMappingValue(route, "match")
+		headers := yamlMappingValue(match, "headers")
+		if headers == nil || headers.Kind != yaml.MappingNode {
+			continue
+		}
+
+		seen := make(map[string]struct{}, len(headers.Content)/2)
+		for index := 0; index+1 < len(headers.Content); index += 2 {
+			keyNode := dereferenceYAMLNode(headers.Content[index])
+			if keyNode == nil || keyNode.Kind != yaml.ScalarNode {
+				continue
+			}
+			name := strings.ToLower(strings.TrimSpace(keyNode.Value))
+			if _, exists := seen[name]; exists {
+				return fmt.Errorf("routing.routes[%d].match.headers contains duplicate header %q after normalization", routeIndex, name)
+			}
+			seen[name] = struct{}{}
+		}
+	}
+	return nil
+}
+
+func yamlMappingValue(node *yaml.Node, key string) *yaml.Node {
+	node = dereferenceYAMLNode(node)
+	if node == nil || node.Kind != yaml.MappingNode {
+		return nil
+	}
+	for index := 0; index+1 < len(node.Content); index += 2 {
+		keyNode := dereferenceYAMLNode(node.Content[index])
+		if keyNode != nil && keyNode.Kind == yaml.ScalarNode && strings.EqualFold(strings.TrimSpace(keyNode.Value), key) {
+			return dereferenceYAMLNode(node.Content[index+1])
+		}
+	}
+	return nil
+}
+
+func dereferenceYAMLNode(node *yaml.Node) *yaml.Node {
+	for node != nil && node.Kind == yaml.AliasNode {
+		node = node.Alias
+	}
+	return node
+}
+
+func normalizeProviderCapabilities(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+	for providerID, providerCfg := range cfg.Providers {
+		if len(providerCfg.Capabilities.HostedTools) > 0 {
+			providerCfg.Capabilities.HostedTools = normalizeCapabilityValues(providerCfg.Capabilities.HostedTools)
+		}
+		if len(providerCfg.Capabilities.ReasoningEffortLevels) > 0 {
+			providerCfg.Capabilities.ReasoningEffortLevels = normalizeCapabilityValues(providerCfg.Capabilities.ReasoningEffortLevels)
+		}
+		cfg.Providers[providerID] = providerCfg
+	}
+}
+
+func normalizeCapabilityValues(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(values))
+	normalized := make([]string, 0, len(values))
+	for _, raw := range values {
+		value := strings.ToLower(strings.TrimSpace(raw))
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		normalized = append(normalized, value)
+	}
+	return normalized
 }
 
 func normalizeSecurityConfig(cfg *Config) {
@@ -400,9 +587,64 @@ func normalizeSecurityConfig(cfg *Config) {
 	}
 }
 
+func resolveGatewayAPIKey(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+
+	generalKey := strings.TrimSpace(expandEnv(cfg.General.APIKey))
+	legacyDataSharingKey := strings.TrimSpace(expandEnv(cfg.DataSharing.APIKey))
+
+	switch {
+	case generalKey != "" && legacyDataSharingKey != "" && generalKey != legacyDataSharingKey:
+		log.Warn().Msg("both general.api_key and deprecated data_sharing.api_key are set; using general.api_key")
+	case generalKey == "" && legacyDataSharingKey != "":
+		generalKey = legacyDataSharingKey
+		log.Warn().Msg("data_sharing.api_key is deprecated; move this value to general.api_key")
+	}
+
+	cfg.General.APIKey = generalKey
+	cfg.DataSharing.APIKey = generalKey
+}
+
 func validateConfig(cfg *Config) error {
 	if cfg == nil {
 		return nil
+	}
+	normalizeBackendConfig(cfg)
+	if err := normalizeRoutingConfig(&cfg.Routing); err != nil {
+		return err
+	}
+	if err := validateServerConfig(cfg.Server); err != nil {
+		return err
+	}
+	providerTypes, err := validateProviderConfigs(cfg.Providers)
+	if err != nil {
+		return err
+	}
+	if err := validateRoutingConfig(cfg.Routing, providerTypes); err != nil {
+		return err
+	}
+	if err := validateModelSelectionConfig(&cfg.ModelSelect); err != nil {
+		return err
+	}
+	if err := validateRateLimitConfig(cfg.RateLimit); err != nil {
+		return err
+	}
+	if err := validateCacheConfig(cfg.Cache); err != nil {
+		return err
+	}
+	if err := validateLoggingConfig(&cfg.Logging); err != nil {
+		return err
+	}
+	if err := validateRetryConfig(cfg.Retry); err != nil {
+		return err
+	}
+	if err := validateUpdateCheckConfig(cfg.UpdateCheck); err != nil {
+		return err
+	}
+	if err := validateBackendConfig(cfg); err != nil {
+		return err
 	}
 
 	securityCfg := cfg.Security
@@ -417,6 +659,9 @@ func validateConfig(cfg *Config) error {
 
 	switch provider {
 	case "none":
+		if securityCfg.Enabled {
+			return fmt.Errorf("security.provider must not be none when security.enabled is true")
+		}
 		return nil
 	case "api_key":
 		if len(securityCfg.APIKey.Keys) == 0 {
@@ -436,6 +681,572 @@ func validateConfig(cfg *Config) error {
 	default:
 		return fmt.Errorf("unsupported security.provider %q", securityCfg.Provider)
 	}
+}
+
+func normalizeBackendConfig(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+	backendURL := strings.TrimSpace(expandEnv(cfg.General.BackendURL))
+	if backendURL == "" {
+		backendURL = strings.TrimSpace(expandEnv(cfg.DataSharing.BackendURL))
+	}
+	if backendURL == "" {
+		backendURL = defaultBackendURL
+	}
+	cfg.General.BackendURL = backendURL
+}
+
+func validateBackendConfig(cfg *Config) error {
+	parsed, err := safeurl.ParseHTTPBaseURL(cfg.General.BackendURL)
+	if err != nil {
+		return fmt.Errorf("general.backend_url must be an absolute HTTP or HTTPS URL")
+	}
+	if err := normalizeBackendURLPath(parsed); err != nil {
+		return fmt.Errorf("general.backend_url must be an absolute HTTP or HTTPS URL")
+	}
+	cfg.General.BackendURL = parsed.String()
+
+	if cfg.DataSharing.RemoteControl && !cfg.DataSharing.Enabled {
+		return fmt.Errorf("data_sharing.enabled must be true when data_sharing.remote_control is enabled")
+	}
+	if cfg.DataSharing.Enabled && strings.TrimSpace(cfg.General.APIKey) == "" {
+		return fmt.Errorf("general.api_key must not be empty when data_sharing.enabled is true")
+	}
+	return nil
+}
+
+func normalizeBackendURLPath(parsed *url.URL) error {
+	escapedPath := strings.TrimRight(parsed.EscapedPath(), "/")
+	if strings.HasSuffix(escapedPath, "/collector") {
+		escapedPath = strings.TrimSuffix(escapedPath, "/collector")
+	}
+	decodedPath, err := url.PathUnescape(escapedPath)
+	if err != nil {
+		return err
+	}
+	parsed.Path = decodedPath
+	parsed.RawPath = escapedPath
+	return nil
+}
+
+func normalizeRoutingConfig(cfg *RoutingConfig) error {
+	if cfg == nil {
+		return nil
+	}
+
+	cfg.DefaultStrategy = strings.ToLower(strings.TrimSpace(cfg.DefaultStrategy))
+	if cfg.DefaultStrategy == "" {
+		cfg.DefaultStrategy = "round-robin"
+	}
+
+	for routeIndex := range cfg.Routes {
+		headers := cfg.Routes[routeIndex].Match.Headers
+		if len(headers) == 0 {
+			continue
+		}
+
+		normalizedHeaders := make(map[string]string, len(headers))
+		for rawName, value := range headers {
+			name := strings.ToLower(strings.TrimSpace(rawName))
+			if name == "" {
+				return fmt.Errorf("routing.routes[%d].match.headers must not contain an empty header name", routeIndex)
+			}
+			if _, exists := normalizedHeaders[name]; exists {
+				return fmt.Errorf("routing.routes[%d].match.headers contains duplicate header %q after normalization", routeIndex, name)
+			}
+			normalizedHeaders[name] = value
+		}
+		cfg.Routes[routeIndex].Match.Headers = normalizedHeaders
+	}
+	return nil
+}
+
+func validateServerConfig(cfg ServerConfig) error {
+	if _, err := normalizeServerHost(cfg.Host); err != nil {
+		return fmt.Errorf("server.host must be empty, a valid IP address, or a valid DNS hostname")
+	}
+	if cfg.Port < 1 || cfg.Port > 65535 {
+		return fmt.Errorf("server.port must be between 1 and 65535")
+	}
+	timeouts := []struct {
+		name  string
+		value time.Duration
+	}{
+		{name: "read_timeout", value: cfg.ReadTimeout},
+		{name: "write_timeout", value: cfg.WriteTimeout},
+		{name: "idle_timeout", value: cfg.IdleTimeout},
+	}
+	for _, timeout := range timeouts {
+		if timeout.value < 0 {
+			return fmt.Errorf("server.%s must not be negative", timeout.name)
+		}
+	}
+	return nil
+}
+
+func normalizeServerHost(raw string) (string, error) {
+	host := strings.TrimSpace(raw)
+	if host == "" {
+		return "", nil
+	}
+
+	if strings.ContainsAny(host, "[]") {
+		if len(host) < 3 || host[0] != '[' || host[len(host)-1] != ']' {
+			return "", fmt.Errorf("malformed bracketed host")
+		}
+		host = host[1 : len(host)-1]
+		if strings.ContainsAny(host, "[]") || !validIPv6Host(host) {
+			return "", fmt.Errorf("brackets are only valid around an IPv6 address")
+		}
+		return host, nil
+	}
+
+	if net.ParseIP(host) != nil || validIPv6Host(host) || validDNSHostname(host) {
+		return host, nil
+	}
+	return "", fmt.Errorf("invalid host")
+}
+
+func validIPv6Host(host string) bool {
+	address, zone, zoned := strings.Cut(host, "%")
+	if !strings.Contains(address, ":") || net.ParseIP(address) == nil {
+		return false
+	}
+	if !zoned {
+		return true
+	}
+	return zone != "" && !strings.ContainsAny(zone, "%[]/\\\t\r\n ")
+}
+
+func validDNSHostname(host string) bool {
+	trimmed := strings.TrimSuffix(host, ".")
+	if trimmed == "" || len(trimmed) > 253 {
+		return false
+	}
+	if strings.Contains(trimmed, ":") {
+		return false
+	}
+
+	numeric := true
+	for _, char := range trimmed {
+		if (char < '0' || char > '9') && char != '.' {
+			numeric = false
+			break
+		}
+	}
+	if numeric && strings.Contains(trimmed, ".") {
+		return false
+	}
+
+	for _, label := range strings.Split(trimmed, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, char := range label {
+			if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
+				(char >= '0' && char <= '9') || char == '-' {
+				continue
+			}
+			return false
+		}
+	}
+	return true
+}
+
+func validateProviderConfigs(providers map[string]ProviderConfig) (map[string]string, error) {
+	providerIDs := make([]string, 0, len(providers))
+	for providerID := range providers {
+		providerIDs = append(providerIDs, providerID)
+	}
+	sort.Strings(providerIDs)
+
+	resolvedTypes := make(map[string]string, len(providers))
+	for _, providerID := range providerIDs {
+		if strings.TrimSpace(providerID) == "" {
+			return nil, fmt.Errorf("providers must not contain an empty provider ID")
+		}
+		providerCfg := providers[providerID]
+		providerType := strings.ToLower(strings.TrimSpace(providerCfg.Type))
+		if providerType == "" {
+			switch providerID {
+			case "openai", "anthropic", "ollama":
+				providerType = providerID
+			default:
+				return nil, fmt.Errorf("providers[%q].type is required for a custom provider", providerID)
+			}
+		}
+		switch providerType {
+		case "openai", "anthropic", "ollama":
+		default:
+			return nil, fmt.Errorf("providers[%q].type %q is not supported", providerID, providerCfg.Type)
+		}
+		if strings.TrimSpace(providerCfg.BaseURL) != "" {
+			if _, err := safeurl.ParseHTTPBaseURL(providerCfg.BaseURL); err != nil {
+				return nil, fmt.Errorf("providers[%q].base_url must be an absolute HTTP or HTTPS URL", providerID)
+			}
+		}
+		if providerCfg.Timeout < 0 {
+			return nil, fmt.Errorf("providers[%q].timeout must not be negative", providerID)
+		}
+		timeoutMode := strings.ToLower(strings.TrimSpace(providerCfg.TimeoutMode))
+		switch timeoutMode {
+		case "", "ttft", "total", "last_byte":
+		default:
+			return nil, fmt.Errorf("providers[%q].timeout_mode must be ttft, total, or last_byte", providerID)
+		}
+		modelMode := strings.ToLower(strings.TrimSpace(providerCfg.Models.Mode))
+		if modelMode == "" {
+			modelMode = "translator"
+		}
+		switch modelMode {
+		case "translator", "static", "fetch":
+		default:
+			return nil, fmt.Errorf("providers[%q].models.mode must be translator, static, or fetch", providerID)
+		}
+		if providerCfg.Models.Fetch.TTL < 0 {
+			return nil, fmt.Errorf("providers[%q].models.fetch.ttl must not be negative", providerID)
+		}
+		if modelMode == "fetch" {
+			switch providerType {
+			case "openai", "ollama":
+			default:
+				return nil, fmt.Errorf("providers[%q].models.mode=fetch is not supported for provider type %q", providerID, providerType)
+			}
+			if providerCfg.Models.Fetch.TTL == 0 {
+				providerCfg.Models.Fetch.TTL = DefaultModelsFetchTTL
+			}
+		}
+		providerCfg.Models.Mode = modelMode
+		providers[providerID] = providerCfg
+		resolvedTypes[providerID] = providerType
+	}
+	return resolvedTypes, nil
+}
+
+func validateRoutingConfig(cfg RoutingConfig, providerTypes map[string]string) error {
+	switch cfg.DefaultStrategy {
+	case "weighted", "round-robin", "random":
+	default:
+		return fmt.Errorf("routing.default_strategy must be weighted, round-robin, or random")
+	}
+	if len(cfg.Routes) == 0 {
+		return fmt.Errorf("routing.routes must contain at least one route")
+	}
+	routeNames := make(map[string]struct{}, len(cfg.Routes))
+	for routeIndex, route := range cfg.Routes {
+		routeName := strings.TrimSpace(route.Name)
+		if routeName == "" {
+			return fmt.Errorf("routing.routes[%d].name must not be empty", routeIndex)
+		}
+		if _, exists := routeNames[routeName]; exists {
+			return fmt.Errorf("routing.routes[%d].name %q is duplicated", routeIndex, routeName)
+		}
+		routeNames[routeName] = struct{}{}
+		if len(route.Targets) == 0 {
+			return fmt.Errorf("routing.routes[%d].targets must contain at least one target", routeIndex)
+		}
+
+		groups := []struct {
+			name    string
+			targets []TargetConfig
+		}{
+			{name: "targets", targets: route.Targets},
+			{name: "fallback", targets: route.Fallback},
+		}
+		for _, group := range groups {
+			totalWeight := 0
+			for targetIndex, target := range group.targets {
+				providerField := fmt.Sprintf("routing.routes[%d].%s[%d].provider", routeIndex, group.name, targetIndex)
+				if strings.TrimSpace(target.Provider) == "" {
+					return fmt.Errorf("%s must not be empty", providerField)
+				}
+				providerType, ok := providerTypes[target.Provider]
+				if !ok {
+					return fmt.Errorf("%s references unknown or invalid provider %q", providerField, target.Provider)
+				}
+				weightField := fmt.Sprintf("routing.routes[%d].%s[%d].weight", routeIndex, group.name, targetIndex)
+				if target.Weight <= 0 {
+					return fmt.Errorf("%s must be greater than zero", weightField)
+				}
+				if target.Weight > math.MaxInt-totalWeight {
+					return fmt.Errorf("routing.routes[%d].%s weights exceed the supported total", routeIndex, group.name)
+				}
+				totalWeight += target.Weight
+
+				requestType := strings.ToLower(strings.TrimSpace(target.UpstreamRequestType))
+				if requestType == "" || requestType == "chat_completions" {
+					continue
+				}
+				field := fmt.Sprintf("routing.routes[%d].%s[%d].upstream_request_type", routeIndex, group.name, targetIndex)
+				if requestType != "responses" {
+					return fmt.Errorf("%s must be chat_completions or responses", field)
+				}
+				if providerType != "openai" {
+					return fmt.Errorf("%s requires an openai provider, got %q", field, providerType)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func validateModelSelectionConfig(cfg *ModelSelectionConfig) error {
+	if cfg == nil || !cfg.Enabled {
+		return nil
+	}
+
+	reservedHeaders := map[string]struct{}{
+		"x-lunargate-model":          {},
+		"x-lunargate-provider":       {},
+		"x-lunargate-request-type":   {},
+		"x-lunargate-requires-tools": {},
+		"x-lunargate-route":          {},
+	}
+	outputHeaders := []struct {
+		field string
+		value *string
+	}{
+		{field: "complexity", value: &cfg.OutputHeaders.Complexity},
+		{field: "score", value: &cfg.OutputHeaders.Score},
+		{field: "skill", value: &cfg.OutputHeaders.Skill},
+	}
+	seenHeaders := make(map[string]string, len(outputHeaders))
+	for _, outputHeader := range outputHeaders {
+		name := strings.ToLower(strings.TrimSpace(*outputHeader.value))
+		*outputHeader.value = name
+		if name == "" {
+			continue
+		}
+		field := "model_selection.output_headers." + outputHeader.field
+		if _, reserved := reservedHeaders[name]; reserved {
+			return fmt.Errorf("%s must not use reserved routing header %q", field, name)
+		}
+		if previousField, exists := seenHeaders[name]; exists {
+			return fmt.Errorf("%s duplicates model_selection.output_headers.%s", field, previousField)
+		}
+		seenHeaders[name] = outputHeader.field
+	}
+
+	tiers := cfg.ComplexityTiers
+	if tiers.Tier01Max <= 0 {
+		return fmt.Errorf("model_selection.complexity_tiers.tier_01_max must be greater than zero when enabled")
+	}
+	if tiers.Tier23Max <= tiers.Tier01Max {
+		return fmt.Errorf("model_selection.complexity_tiers.tier_23_max must be greater than tier_01_max")
+	}
+	if tiers.Tier45Max <= tiers.Tier23Max {
+		return fmt.Errorf("model_selection.complexity_tiers.tier_45_max must be greater than tier_23_max")
+	}
+
+	if err := validateModelSelectionComplexityRule("simple", &cfg.Complexity.Simple); err != nil {
+		return err
+	}
+	if err := validateModelSelectionComplexityRule("complex", &cfg.Complexity.Complex); err != nil {
+		return err
+	}
+
+	seenSkills := make(map[string]struct{}, len(cfg.Skills))
+	for skillIndex := range cfg.Skills {
+		skill := &cfg.Skills[skillIndex]
+		skill.Name = strings.TrimSpace(skill.Name)
+		nameField := fmt.Sprintf("model_selection.skills[%d].name", skillIndex)
+		if skill.Name == "" {
+			return fmt.Errorf("%s must not be empty", nameField)
+		}
+		canonicalName := strings.ToLower(skill.Name)
+		if _, exists := seenSkills[canonicalName]; exists {
+			return fmt.Errorf("%s is duplicated", nameField)
+		}
+		seenSkills[canonicalName] = struct{}{}
+		if len(skill.RegexAny) == 0 {
+			return fmt.Errorf("model_selection.skills[%d].regex_any must contain at least one regular expression", skillIndex)
+		}
+		for regexIndex := range skill.RegexAny {
+			pattern := strings.TrimSpace(skill.RegexAny[regexIndex])
+			field := fmt.Sprintf("model_selection.skills[%d].regex_any[%d]", skillIndex, regexIndex)
+			if pattern == "" {
+				return fmt.Errorf("%s must not be empty", field)
+			}
+			if _, err := regexp.Compile(pattern); err != nil {
+				return fmt.Errorf("%s must be a valid regular expression", field)
+			}
+			skill.RegexAny[regexIndex] = pattern
+		}
+	}
+	return nil
+}
+
+func validateModelSelectionComplexityRule(name string, rule *ModelSelectionComplexityRule) error {
+	if rule == nil {
+		return nil
+	}
+	prefix := "model_selection.complexity." + name
+	bounds := []struct {
+		field string
+		value *int
+	}{
+		{field: "max_user_chars", value: rule.MaxUserChars},
+		{field: "min_user_chars", value: rule.MinUserChars},
+		{field: "max_messages", value: rule.MaxMessages},
+		{field: "min_messages", value: rule.MinMessages},
+	}
+	for _, bound := range bounds {
+		if bound.value != nil && *bound.value < 0 {
+			return fmt.Errorf("%s.%s must not be negative", prefix, bound.field)
+		}
+	}
+	if rule.MinUserChars != nil && rule.MaxUserChars != nil && *rule.MinUserChars > *rule.MaxUserChars {
+		return fmt.Errorf("%s.min_user_chars must not exceed max_user_chars", prefix)
+	}
+	if rule.MinMessages != nil && rule.MaxMessages != nil && *rule.MinMessages > *rule.MaxMessages {
+		return fmt.Errorf("%s.min_messages must not exceed max_messages", prefix)
+	}
+
+	seenConditions := make(map[string]struct{}, len(rule.AnyOf))
+	for conditionIndex := range rule.AnyOf {
+		condition := strings.ToLower(strings.TrimSpace(rule.AnyOf[conditionIndex]))
+		field := fmt.Sprintf("%s.any_of[%d]", prefix, conditionIndex)
+		switch condition {
+		case "has_tools":
+			if rule.RequireNoTools {
+				return fmt.Errorf("%s conflicts with %s.require_no_tools", field, prefix)
+			}
+		case "requires_json":
+			if rule.RequireNoJSON {
+				return fmt.Errorf("%s conflicts with %s.require_no_json", field, prefix)
+			}
+		default:
+			return fmt.Errorf("%s must be has_tools or requires_json", field)
+		}
+		if _, exists := seenConditions[condition]; exists {
+			return fmt.Errorf("%s is duplicated", field)
+		}
+		seenConditions[condition] = struct{}{}
+		rule.AnyOf[conditionIndex] = condition
+	}
+	return nil
+}
+
+func validateRateLimitConfig(cfg RateLimitConfig) error {
+	if !cfg.Enabled {
+		return nil
+	}
+	if cfg.RequestsPerMinute <= 0 {
+		return fmt.Errorf("rate_limiting.requests_per_minute must be greater than zero when enabled")
+	}
+	if cfg.BurstSize < 0 {
+		return fmt.Errorf("rate_limiting.burst_size must not be negative when enabled")
+	}
+	return nil
+}
+
+func validateCacheConfig(cfg CacheConfig) error {
+	if !cfg.Enabled {
+		return nil
+	}
+	if cfg.TTL <= 0 {
+		return fmt.Errorf("caching.ttl must be greater than zero when enabled")
+	}
+	if cfg.MaxSize <= 0 {
+		return fmt.Errorf("caching.max_size must be greater than zero when enabled")
+	}
+	if cfg.MaxEntryBytes <= 0 {
+		return fmt.Errorf("caching.max_entry_bytes must be greater than zero when enabled")
+	}
+	if cfg.MaxBytes <= 0 {
+		return fmt.Errorf("caching.max_bytes must be greater than zero when enabled")
+	}
+	if cfg.MaxEntryBytes > cfg.MaxBytes {
+		return fmt.Errorf("caching.max_entry_bytes must not exceed caching.max_bytes when enabled")
+	}
+	return nil
+}
+
+func validateLoggingConfig(cfg *LoggingConfig) error {
+	if cfg == nil {
+		return nil
+	}
+
+	level := strings.ToLower(strings.TrimSpace(cfg.Level))
+	if level == "" {
+		level = "info"
+	}
+	switch level {
+	case "trace", "debug", "info", "warn", "error", "fatal", "panic", "disabled":
+	default:
+		return fmt.Errorf("logging.level must be one of trace, debug, info, warn, error, fatal, panic, or disabled")
+	}
+
+	format := strings.ToLower(strings.TrimSpace(cfg.Format))
+	if format == "" {
+		format = "console"
+	}
+	switch format {
+	case "console", "json":
+	default:
+		return fmt.Errorf("logging.format must be console or json")
+	}
+
+	cfg.Level = level
+	cfg.Format = format
+	return nil
+}
+
+func validateRetryConfig(cfg RetryConfig) error {
+	if !cfg.Enabled {
+		return nil
+	}
+	if cfg.MaxAttempts < 1 {
+		return fmt.Errorf("retry.max_attempts must be at least 1 when enabled")
+	}
+	if cfg.MaxAttempts > MaxRetryAttempts {
+		return fmt.Errorf("retry.max_attempts must not exceed %d when enabled", MaxRetryAttempts)
+	}
+	if cfg.InitialDelay < 0 {
+		return fmt.Errorf("retry.initial_delay must not be negative when enabled")
+	}
+	if cfg.MaxDelay < 0 {
+		return fmt.Errorf("retry.max_delay must not be negative when enabled")
+	}
+	if cfg.MaxDelay < cfg.InitialDelay {
+		return fmt.Errorf("retry.max_delay must be greater than or equal to retry.initial_delay")
+	}
+	if math.IsNaN(cfg.Multiplier) || math.IsInf(cfg.Multiplier, 0) || cfg.Multiplier < 1 {
+		return fmt.Errorf("retry.multiplier must be a finite value greater than or equal to 1")
+	}
+	if math.IsNaN(cfg.JitterFactor) || math.IsInf(cfg.JitterFactor, 0) || cfg.JitterFactor < 0 || cfg.JitterFactor > 1 {
+		return fmt.Errorf("retry.jitter_factor must be a finite value between 0 and 1")
+	}
+	for index, status := range cfg.RetryableErrors {
+		if status < 400 || status > 599 {
+			return fmt.Errorf("retry.retryable_errors[%d] must be between 400 and 599", index)
+		}
+	}
+	return nil
+}
+
+func validateUpdateCheckConfig(cfg UpdateCheckConfig) error {
+	if !cfg.Enabled {
+		return nil
+	}
+	endpoint := strings.TrimSpace(cfg.Endpoint)
+	parsed, err := url.Parse(endpoint)
+	if err != nil || !parsed.IsAbs() || parsed.Host == "" {
+		return fmt.Errorf("update_check.endpoint must be an absolute HTTP or HTTPS URL when enabled")
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https":
+	default:
+		return fmt.Errorf("update_check.endpoint must be an absolute HTTP or HTTPS URL when enabled")
+	}
+	if cfg.Interval <= 0 {
+		return fmt.Errorf("update_check.interval must be greater than zero when enabled")
+	}
+	if cfg.Timeout <= 0 {
+		return fmt.Errorf("update_check.timeout must be greater than zero when enabled")
+	}
+	return nil
 }
 
 // expandEnv replaces ${VAR} patterns with environment variable values.

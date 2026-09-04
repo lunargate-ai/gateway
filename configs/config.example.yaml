@@ -9,20 +9,55 @@ server:
   write_timeout: 0s
   idle_timeout: 60s
 
+# Shared gateway identity used by Dashboard integrations.
+general:
+  api_key: "${LUNARGATE_GATEWAY_API_KEY}"
+  backend_url: "${LUNARGATE_BACKEND_URL}"
+
+# Automatic release checks. The gateway sends only its current version and
+# CPU architecture. Set enabled to false to disable all update-check traffic.
+update_check:
+  enabled: true
+  endpoint: "${LUNARGATE_UPDATE_CHECK_ENDPOINT}"
+  interval: 24h
+  timeout: 3s
+
 # LLM Provider Configuration
 providers:
   openai:
     api_key: "${OPENAI_API_KEY}"
-    default_model: "gpt-4-turbo"
+    default_model: "gpt-5.6-terra"
     organization: "${OPENAI_ORG_ID}"
+    # Extended APIs are opt-in. Enable only contracts implemented by the
+    # exact upstream behind base_url.
+    capabilities:
+      chat_completions_lifecycle: true
+      responses_lifecycle: true
+      conversations: true
+      background_responses: true
+      response_cancellation: true
+      response_compaction: true
+      response_input_tokens: true
+      embeddings_base64: true
+      hosted_tools: []
 
   openai-second-account:
     type: "openai"
     api_key: "${OPENAI_API_KEY2}"
+    # Response-side compatibility shim only; outgoing requests are never
+    # rewritten. Defaults to false, including with compatibility_profile:
+    # deepseek. Enable only when complete literal <think>...</think> regions
+    # are part of the upstream response contract.
+    extract_reasoning_tags: false
 
   anthropic:
     api_key: "${ANTHROPIC_API_KEY}"
-    default_model: "claude-3-sonnet-20240229"
+    default_model: "claude-sonnet-4-6"
+    capabilities:
+      structured_outputs: true
+      reasoning_effort: true
+      reasoning_effort_levels: [low, medium, high, max]
+      adaptive_thinking: true
 
   abacus:
     type: "openai"
@@ -35,6 +70,15 @@ routing:
   default_strategy: "weighted"
 
   routes:
+    - name: "openai-native-responses"
+      match:
+        path: "/v1/responses"
+      targets:
+        - provider: openai
+          model: gpt-5.6-terra
+          upstream_request_type: responses
+          weight: 100
+
     - name: "complexity-tier-0-1"
       match:
         path: "/v1/chat/completions"
@@ -52,7 +96,7 @@ routing:
           x-lunargate-complexity: "2-3"
       targets:
         - provider: openai
-          model: gpt-4-turbo
+          model: gpt-5.6-terra
           weight: 100
 
     - name: "complexity-tier-4-5"
@@ -62,7 +106,7 @@ routing:
           x-lunargate-complexity: "4-5"
       targets:
         - provider: anthropic
-          model: claude-3-sonnet-20240229
+          model: claude-sonnet-4-6
           weight: 100
 
     - name: "complexity-tier-6plus"
@@ -80,17 +124,18 @@ routing:
         path: "*"
       targets:
         - provider: openai
-          model: gpt-4-turbo
+          model: gpt-5.6-terra
           weight: 70
         - provider: openai-second-account
-          model: gpt-4-turbo
+          model: gpt-5.6-terra
           weight: 10
         - provider: anthropic
-          model: claude-3-sonnet-20240229
+          model: claude-sonnet-4-6
           weight: 30
       fallback:
         - provider: anthropic
-          model: claude-3-sonnet-20240229
+          model: claude-sonnet-4-6
+          weight: 100
 
 model_selection:
   enabled: true
@@ -130,6 +175,8 @@ caching:
   enabled: true
   ttl: 1h
   max_size: 1000
+  max_entry_bytes: 16777216 # 16 MiB
+  max_bytes: 67108864 # 64 MiB total
 
 # Retry Configuration
 retry:
@@ -156,15 +203,15 @@ security:
   #     - name: "dashboard"
   #       value: "${LUNARGATE_CLIENT_API_KEY}"
 
-# Data Sharing - Controls what data the gateway sends to the LunarGate Dashboard on app.lunargate.ai.
-# By default, ONLY metrics are sent (zero data leakage mode).
-# Enable to forward prompts/responses for log inspection in the dashboard.
-# WARNING: Enabling this means prompt/response content leaves your infrastructure.
+# Dashboard connectivity for collector export and optional remote control.
+# With `enabled: true` and both share flags false, the collector sends only its
+# fixed metadata/metrics allowlist. The remote-control sandbox is separate: when
+# enabled, each sandbox request and its bounded full response use the control
+# channel regardless of the two collector share flags.
 # Create the gateway API key in the "Gateways" section of https://app.lunargate.ai
+# and set it under `general.api_key`.
 data_sharing:
-  enabled: false              # Master switch - must be true for any sharing
+  enabled: false              # Master switch for collector and remote control
   share_prompts: false        # Forward user prompts to SaaS backend
   share_responses: false      # Forward LLM responses to SaaS backend
-  backend_url: "${LUNARGATE_BACKEND_URL}"
-  api_key: "${LUNARGATE_GATEWAY_API_KEY}"
-  remote_control: false
+  remote_control: false       # Sandbox control channel; may carry request/response content

@@ -7,14 +7,15 @@ import (
 
 // Metrics holds all Prometheus metrics for the gateway.
 type Metrics struct {
-	RequestsTotal    *prometheus.CounterVec
-	RequestDuration  *prometheus.HistogramVec
-	TokensTotal      *prometheus.CounterVec
-	CacheHits        *prometheus.CounterVec
-	ProviderErrors   *prometheus.CounterVec
-	FallbacksUsed    prometheus.Counter
+	RequestsTotal       *prometheus.CounterVec
+	RequestDuration     *prometheus.HistogramVec
+	TokensTotal         *prometheus.CounterVec
+	CacheTokensTotal    *prometheus.CounterVec
+	CacheHits           *prometheus.CounterVec
+	ProviderErrors      *prometheus.CounterVec
+	FallbacksUsed       prometheus.Counter
 	CircuitBreakerState *prometheus.GaugeVec
-	ActiveRequests   prometheus.Gauge
+	ActiveRequests      prometheus.Gauge
 }
 
 // NewMetrics registers and returns all gateway metrics.
@@ -41,8 +42,14 @@ func NewMetricsWithRegisterer(reg prometheus.Registerer) *Metrics {
 		TokensTotal: factory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "ai_router",
 			Name:      "tokens_total",
-			Help:      "Total number of tokens processed",
+			Help:      "Inclusive total number of tokens processed",
 		}, []string{"provider", "model", "direction"}),
+
+		CacheTokensTotal: factory.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "ai_router",
+			Name:      "cache_tokens_total",
+			Help:      "Prompt-cache token subsets by operation; already included in input tokens_total",
+		}, []string{"provider", "model", "operation"}),
 
 		CacheHits: factory.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "ai_router",

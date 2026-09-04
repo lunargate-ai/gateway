@@ -1,19 +1,35 @@
 package middleware
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"math"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lunargate-ai/gateway/internal/config"
 	"github.com/lunargate-ai/gateway/internal/security"
 	"github.com/rs/zerolog/log"
 )
+
+type peerAddressContextKey struct{}
+
+// CapturePeerAddress retains the socket peer before proxy-derived middleware
+// rewrites RemoteAddr. Until trusted proxies are configurable, unverified
+// forwarding headers must not create independent rate-limit identities.
+func CapturePeerAddress(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		peer := remoteHost(r.RemoteAddr)
+		ctx := context.WithValue(r.Context(), peerAddressContextKey{}, peer)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
 
 // TokenBucket implements a simple in-memory token bucket rate limiter.
 type TokenBucket struct {
@@ -25,41 +41,64 @@ type TokenBucket struct {
 }
 
 func newTokenBucket(maxTokens float64, refillRate float64) *TokenBucket {
+	return newTokenBucketAt(maxTokens, refillRate, time.Now())
+}
+
+func newTokenBucketAt(maxTokens float64, refillRate float64, now time.Time) *TokenBucket {
 	return &TokenBucket{
 		tokens:     maxTokens,
 		maxTokens:  maxTokens,
 		refillRate: refillRate,
-		lastRefill: time.Now(),
+		lastRefill: now,
 	}
 }
 
-func (tb *TokenBucket) allow() (bool, float64) {
+func (tb *TokenBucket) allow() (bool, int, int) {
+	return tb.allowAt(time.Now())
+}
+
+func (tb *TokenBucket) allowAt(now time.Time) (allowed bool, remaining int, retryAfterSeconds int) {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
 
-	now := time.Now()
 	elapsed := now.Sub(tb.lastRefill).Seconds()
-	tb.tokens += elapsed * tb.refillRate
+	if elapsed > 0 {
+		tb.tokens += elapsed * tb.refillRate
+	}
 	if tb.tokens > tb.maxTokens {
 		tb.tokens = tb.maxTokens
 	}
-	tb.lastRefill = now
+	if now.After(tb.lastRefill) {
+		tb.lastRefill = now
+	}
 
 	if tb.tokens >= 1 {
 		tb.tokens--
-		return true, tb.tokens
+		return true, int(math.Floor(tb.tokens)), 0
 	}
 
-	return false, 0
+	retryAfterSeconds = 1
+	if tb.refillRate > 0 {
+		retryAfterSeconds = int(math.Ceil((1 - tb.tokens) / tb.refillRate))
+		if retryAfterSeconds < 1 {
+			retryAfterSeconds = 1
+		}
+	}
+	return false, int(math.Floor(tb.tokens)), retryAfterSeconds
 }
 
 // RateLimiter is a middleware that limits request rates using token bucket algorithm.
 type RateLimiter struct {
-	mu         sync.RWMutex
-	buckets    map[string]*bucketEntry
-	cfg        config.RateLimitConfig
+	current    atomic.Pointer[rateLimitSnapshot]
 	maxBuckets int
 	bucketTTL  time.Duration
+	now        func() time.Time
+}
+
+type rateLimitSnapshot struct {
+	cfg     config.RateLimitConfig
+	mu      sync.Mutex
+	buckets map[string]*bucketEntry
 }
 
 type bucketEntry struct {
@@ -69,43 +108,59 @@ type bucketEntry struct {
 
 // NewRateLimiter creates a new rate limiter middleware.
 func NewRateLimiter(cfg config.RateLimitConfig) *RateLimiter {
-	return &RateLimiter{
-		buckets:    make(map[string]*bucketEntry),
-		cfg:        cfg,
+	rl := &RateLimiter{
 		maxBuckets: 10000,
 		bucketTTL:  15 * time.Minute,
+		now:        time.Now,
+	}
+	rl.current.Store(newRateLimitSnapshot(cfg))
+	return rl
+}
+
+func newRateLimitSnapshot(cfg config.RateLimitConfig) *rateLimitSnapshot {
+	return &rateLimitSnapshot{
+		cfg:     cfg,
+		buckets: make(map[string]*bucketEntry),
 	}
 }
 
 // UpdateConfig hot-reloads rate limit config.
 func (rl *RateLimiter) UpdateConfig(cfg config.RateLimitConfig) {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-	rl.cfg = cfg
-	// Reset buckets on config change
-	rl.buckets = make(map[string]*bucketEntry)
-	log.Info().Msg("rate limiter config updated")
+	if rl == nil {
+		return
+	}
+	for {
+		current := rl.current.Load()
+		if current != nil && current.cfg == cfg {
+			return
+		}
+		if rl.current.CompareAndSwap(current, newRateLimitSnapshot(cfg)) {
+			log.Info().Msg("rate limiter config updated")
+			return
+		}
+	}
 }
 
 // Middleware returns the HTTP middleware handler.
 func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !rl.cfg.Enabled {
+		snapshot := rl.current.Load()
+		if snapshot == nil || !snapshot.cfg.Enabled {
 			next.ServeHTTP(w, r)
 			return
 		}
 
 		key := extractRateLimitKey(r)
-		bucket := rl.getBucket(key)
+		bucket := rl.getBucket(key, snapshot)
 
-		allowed, remaining := bucket.allow()
+		allowed, remaining, retryAfterSeconds := bucket.allowAt(rl.currentTime())
 
-		limit := rl.cfg.RequestsPerMinute
+		limit := snapshot.cfg.RequestsPerMinute
 		w.Header().Set("X-RateLimit-Limit", strconv.Itoa(limit))
-		w.Header().Set("X-RateLimit-Remaining", strconv.FormatFloat(remaining, 'f', 0, 64))
+		w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(remaining))
 
 		if !allowed {
-			w.Header().Set("Retry-After", "60")
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds))
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusTooManyRequests)
 			_, _ = w.Write([]byte(`{"error":{"message":"Rate limit exceeded","type":"rate_limit_error","code":"rate_limit_exceeded"}}`))
@@ -116,51 +171,47 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 	})
 }
 
-func (rl *RateLimiter) getBucket(key string) *TokenBucket {
-	now := time.Now()
-	rl.mu.RLock()
-	entry, ok := rl.buckets[key]
-	rl.mu.RUnlock()
-	if ok {
-		rl.mu.Lock()
-		if entry2, ok2 := rl.buckets[key]; ok2 {
-			entry2.lastSeen = now
-			b := entry2.bucket
-			rl.mu.Unlock()
-			return b
-		}
-		rl.mu.Unlock()
-	}
+func (rl *RateLimiter) getBucket(key string, snapshot *rateLimitSnapshot) *TokenBucket {
+	now := rl.currentTime()
+	snapshot.mu.Lock()
+	defer snapshot.mu.Unlock()
 
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-
-	if entry, ok = rl.buckets[key]; ok {
+	if entry, ok := snapshot.buckets[key]; ok {
 		entry.lastSeen = now
 		return entry.bucket
 	}
 
-	rl.evictLocked(now)
+	rl.evictLocked(snapshot, now)
 
-	rpm := float64(rl.cfg.RequestsPerMinute)
-	burst := float64(rl.cfg.BurstSize)
+	rpm := float64(snapshot.cfg.RequestsPerMinute)
+	burst := float64(snapshot.cfg.BurstSize)
 	if burst <= 0 {
 		burst = rpm / 6 // default burst = 10s worth
+		if burst < 1 {
+			burst = 1
+		}
 	}
-	b := newTokenBucket(burst, rpm/60.0)
-	rl.buckets[key] = &bucketEntry{bucket: b, lastSeen: now}
+	b := newTokenBucketAt(burst, rpm/60.0, now)
+	snapshot.buckets[key] = &bucketEntry{bucket: b, lastSeen: now}
 	return b
 }
 
-func (rl *RateLimiter) evictLocked(now time.Time) {
+func (rl *RateLimiter) currentTime() time.Time {
+	if rl.now != nil {
+		return rl.now()
+	}
+	return time.Now()
+}
+
+func (rl *RateLimiter) evictLocked(snapshot *rateLimitSnapshot, now time.Time) {
 	if rl.bucketTTL > 0 {
-		for k, e := range rl.buckets {
+		for k, e := range snapshot.buckets {
 			if e == nil {
-				delete(rl.buckets, k)
+				delete(snapshot.buckets, k)
 				continue
 			}
 			if now.Sub(e.lastSeen) > rl.bucketTTL {
-				delete(rl.buckets, k)
+				delete(snapshot.buckets, k)
 			}
 		}
 	}
@@ -168,10 +219,10 @@ func (rl *RateLimiter) evictLocked(now time.Time) {
 	if rl.maxBuckets <= 0 {
 		return
 	}
-	for len(rl.buckets) >= rl.maxBuckets {
+	for len(snapshot.buckets) >= rl.maxBuckets {
 		var oldestKey string
 		oldestTime := now
-		for k, e := range rl.buckets {
+		for k, e := range snapshot.buckets {
 			if e == nil {
 				oldestKey = k
 				break
@@ -184,7 +235,7 @@ func (rl *RateLimiter) evictLocked(now time.Time) {
 		if oldestKey == "" {
 			return
 		}
-		delete(rl.buckets, oldestKey)
+		delete(snapshot.buckets, oldestKey)
 	}
 }
 
@@ -198,16 +249,16 @@ func extractRateLimitKey(r *http.Request) string {
 		return "subject:" + hashKey(info.Subject)
 	}
 
-	// Prefer API key header, then IP
-	if key := strings.TrimSpace(r.Header.Get("X-API-Key")); key != "" {
-		return "key:" + hashKey(key)
+	if peer, ok := r.Context().Value(peerAddressContextKey{}).(string); ok {
+		return "ip:" + strings.TrimSpace(peer)
 	}
-	if key := strings.TrimSpace(r.Header.Get("Authorization")); key != "" {
-		return "auth:" + hashKey(key)
-	}
-	addr := strings.TrimSpace(r.RemoteAddr)
+	return "ip:" + remoteHost(r.RemoteAddr)
+}
+
+func remoteHost(remoteAddr string) string {
+	addr := strings.TrimSpace(remoteAddr)
 	if host, _, err := net.SplitHostPort(addr); err == nil && host != "" {
-		return "ip:" + host
+		return host
 	}
-	return "ip:" + addr
+	return addr
 }

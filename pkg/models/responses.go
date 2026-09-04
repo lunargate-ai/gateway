@@ -8,18 +8,34 @@ import (
 )
 
 type ResponsesRequest struct {
+	RawJSON            json.RawMessage `json:"-"`
 	Model              string          `json:"model"`
 	Input              interface{}     `json:"input"`
 	PreviousResponseID string          `json:"previous_response_id,omitempty"`
-	Instructions       string          `json:"instructions,omitempty"`
+	Instructions       interface{}     `json:"instructions,omitempty"`
 	Reasoning          *Reasoning      `json:"reasoning,omitempty"`
+	Text               *ResponsesText  `json:"text,omitempty"`
 	Temperature        *float64        `json:"temperature,omitempty"`
 	TopP               *float64        `json:"top_p,omitempty"`
 	MaxOutputTokens    *int            `json:"max_output_tokens,omitempty"`
 	Tools              []ResponsesTool `json:"tools,omitempty"`
 	ToolChoice         interface{}     `json:"tool_choice,omitempty"`
 	Stream             bool            `json:"stream,omitempty"`
+	Store              *bool           `json:"store,omitempty"`
 	User               string          `json:"user,omitempty"`
+}
+
+type ResponsesText struct {
+	Format    *ResponsesTextFormat `json:"format,omitempty"`
+	Verbosity string               `json:"verbosity,omitempty"`
+}
+
+type ResponsesTextFormat struct {
+	Type        string      `json:"type"`
+	Name        string      `json:"name,omitempty"`
+	Description string      `json:"description,omitempty"`
+	Schema      interface{} `json:"schema,omitempty"`
+	Strict      *bool       `json:"strict,omitempty"`
 }
 
 type ResponsesTool struct {
@@ -28,17 +44,39 @@ type ResponsesTool struct {
 	Name        string        `json:"name,omitempty"`
 	Description string        `json:"description,omitempty"`
 	Parameters  interface{}   `json:"parameters,omitempty"`
+	Strict      *bool         `json:"strict,omitempty"`
 }
 
 type ResponsesResponse struct {
-	ID         string            `json:"id"`
-	Object     string            `json:"object"`
-	CreatedAt  int64             `json:"created_at"`
-	Status     string            `json:"status"`
-	Model      string            `json:"model"`
-	Output     []ResponsesOutput `json:"output"`
-	OutputText string            `json:"output_text"`
-	Usage      *ResponsesUsage   `json:"usage,omitempty"`
+	ID                string                      `json:"id"`
+	Object            string                      `json:"object"`
+	CreatedAt         int64                       `json:"created_at"`
+	Status            string                      `json:"status"`
+	IncompleteDetails *ResponsesIncompleteDetails `json:"incomplete_details,omitempty"`
+	Model             string                      `json:"model"`
+	Output            []ResponsesOutput           `json:"output"`
+	OutputText        string                      `json:"-"`
+	Usage             *ResponsesUsage             `json:"usage,omitempty"`
+}
+
+// UnmarshalJSON accepts the SDK convenience output_text emitted by some
+// compatible providers while keeping it impossible to marshal back onto the
+// stable Responses wire contract.
+func (r *ResponsesResponse) UnmarshalJSON(data []byte) error {
+	type responseAlias ResponsesResponse
+	wire := struct {
+		*responseAlias
+		OutputText string `json:"output_text"`
+	}{responseAlias: (*responseAlias)(r)}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	r.OutputText = wire.OutputText
+	return nil
+}
+
+type ResponsesIncompleteDetails struct {
+	Reason string `json:"reason"`
 }
 
 type ResponsesOutput struct {
@@ -56,6 +94,7 @@ type ResponsesOutput struct {
 type ResponsesContentPart struct {
 	Type        string `json:"type"`
 	Text        string `json:"text,omitempty"`
+	Refusal     string `json:"refusal,omitempty"`
 	Annotations []any  `json:"annotations,omitempty"`
 }
 
@@ -65,25 +104,90 @@ type ResponsesSummaryPart struct {
 }
 
 type ResponsesUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
-	TotalTokens  int `json:"total_tokens"`
+	InputTokens         int                           `json:"input_tokens"`
+	InputTokensDetails  *InputTokensDetails           `json:"input_tokens_details"`
+	OutputTokens        int                           `json:"output_tokens"`
+	OutputTokensDetails *ResponsesOutputTokensDetails `json:"output_tokens_details"`
+	TotalTokens         int                           `json:"total_tokens"`
+}
+
+// ResponsesOutputTokensDetails is required whenever a Responses usage object
+// is present.
+type ResponsesOutputTokensDetails struct {
+	ReasoningTokens int `json:"reasoning_tokens"`
+}
+
+// MarshalJSON keeps the Responses usage contract complete even though the
+// provider-neutral Chat detail type omits zero-valued counters elsewhere.
+func (u ResponsesUsage) MarshalJSON() ([]byte, error) {
+	inputDetails := ResponsesInputTokensDetailsJSON{}
+	if u.InputTokensDetails != nil {
+		inputDetails.CachedTokens = u.InputTokensDetails.CachedTokens
+		inputDetails.CacheWriteTokens = u.InputTokensDetails.CacheWriteTokens
+	}
+	outputDetails := ResponsesOutputTokensDetails{}
+	if u.OutputTokensDetails != nil {
+		outputDetails = *u.OutputTokensDetails
+	}
+	type wireUsage struct {
+		InputTokens         int                             `json:"input_tokens"`
+		InputTokensDetails  ResponsesInputTokensDetailsJSON `json:"input_tokens_details"`
+		OutputTokens        int                             `json:"output_tokens"`
+		OutputTokensDetails ResponsesOutputTokensDetails    `json:"output_tokens_details"`
+		TotalTokens         int                             `json:"total_tokens"`
+	}
+	return json.Marshal(wireUsage{
+		InputTokens:         u.InputTokens,
+		InputTokensDetails:  inputDetails,
+		OutputTokens:        u.OutputTokens,
+		OutputTokensDetails: outputDetails,
+		TotalTokens:         u.TotalTokens,
+	})
+}
+
+type ResponsesInputTokensDetailsJSON struct {
+	CachedTokens     int `json:"cached_tokens"`
+	CacheWriteTokens int `json:"cache_write_tokens"`
+}
+
+const (
+	ResponsesIncompleteReasonMaxOutputTokens = "max_output_tokens"
+	ResponsesIncompleteReasonMaxMessages     = "max_messages"
+	ResponsesIncompleteReasonContentFilter   = "content_filter"
+)
+
+// ResponsesIncompleteReasonForFinishReason maps terminal Chat Completions
+// reasons that represent partial output to their Responses API equivalent.
+func ResponsesIncompleteReasonForFinishReason(finishReason string) string {
+	switch strings.ToLower(strings.TrimSpace(finishReason)) {
+	case "length":
+		return ResponsesIncompleteReasonMaxOutputTokens
+	case "content_filter":
+		return ResponsesIncompleteReasonContentFilter
+	default:
+		return ""
+	}
 }
 
 func ResponsesToUnifiedRequest(req *ResponsesRequest) (*UnifiedRequest, error) {
 	if req == nil {
 		return nil, fmt.Errorf("request is required")
 	}
-	if strings.TrimSpace(req.Model) == "" {
-		return nil, fmt.Errorf("model is required")
-	}
 
-	messages, err := responsesInputToMessages(req.Input)
+	var messages []Message
+	if req.Input != nil {
+		var err error
+		messages, err = responsesInputToMessages(req.Input)
+		if err != nil {
+			return nil, err
+		}
+	}
+	instructions, err := responsesInstructionsToMessages(req.Instructions)
 	if err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(req.Instructions) != "" {
-		messages = append([]Message{{Role: "system", Content: strings.TrimSpace(req.Instructions)}}, messages...)
+	if len(instructions) > 0 {
+		messages = append(instructions, messages...)
 	}
 
 	tools, err := responsesToolsToUnified(req.Tools)
@@ -97,16 +201,31 @@ func ResponsesToUnifiedRequest(req *ResponsesRequest) (*UnifiedRequest, error) {
 	}
 
 	unified := &UnifiedRequest{
+		RawJSON:            append(json.RawMessage(nil), req.RawJSON...),
+		SourceRequestType:  "responses",
 		Model:              strings.TrimSpace(req.Model),
 		Messages:           messages,
 		Tools:              tools,
 		ToolChoice:         toolChoice,
 		Stream:             req.Stream,
+		Store:              req.Store,
 		User:               req.User,
-		PreviousResponseID: strings.TrimSpace(req.PreviousResponseID),
+		PreviousResponseID: req.PreviousResponseID,
 	}
 	if req.Reasoning != nil {
 		unified.ReasoningEffort = strings.TrimSpace(req.Reasoning.Effort)
+	}
+	if req.Text != nil && req.Text.Format != nil {
+		format := req.Text.Format
+		unified.ResponseFormat = &ResponseFormat{Type: strings.TrimSpace(format.Type)}
+		if strings.EqualFold(strings.TrimSpace(format.Type), "json_schema") {
+			unified.ResponseFormat.JSONSchema = &JSONSchemaResponseFormat{
+				Name:        format.Name,
+				Description: format.Description,
+				Schema:      format.Schema,
+				Strict:      format.Strict,
+			}
+		}
 	}
 
 	if req.Temperature != nil {
@@ -122,12 +241,37 @@ func ResponsesToUnifiedRequest(req *ResponsesRequest) (*UnifiedRequest, error) {
 	return unified, nil
 }
 
+func responsesInstructionsToMessages(instructions interface{}) ([]Message, error) {
+	switch value := instructions.(type) {
+	case nil:
+		return nil, nil
+	case string:
+		if strings.TrimSpace(value) == "" {
+			return nil, nil
+		}
+		return []Message{{Role: "developer", Content: value}}, nil
+	case []interface{}:
+		if len(value) == 0 {
+			return nil, nil
+		}
+		return responsesInputToMessages(value)
+	default:
+		return nil, fmt.Errorf("unsupported instructions format")
+	}
+}
+
 // UnifiedResponseToResponses maps unified chat-completions responses into
 // Responses API shape. It prioritizes assistant text and tool calls; for
 // non-string assistant content it preserves data by serializing to text.
 func UnifiedResponseToResponses(resp *UnifiedResponse) *ResponsesResponse {
 	if resp == nil {
 		return nil
+	}
+
+	status := "completed"
+	incompleteReason := responsesIncompleteReasonForChoices(resp.Choices)
+	if incompleteReason != "" {
+		status = "incomplete"
 	}
 
 	output := make([]ResponsesOutput, 0, len(resp.Choices)+1)
@@ -138,35 +282,37 @@ func UnifiedResponseToResponses(resp *UnifiedResponse) *ResponsesResponse {
 			continue
 		}
 
-		msgID := fmt.Sprintf("msg_%s_%d", strings.TrimSpace(resp.ID), i)
+		msgID := fmt.Sprintf("msg_%s_%d", resp.ID, i)
 		parts := make([]ResponsesContentPart, 0, 1)
 		if content, ok := choice.Message.Content.(string); ok {
-			text := strings.TrimSpace(content)
-			if text != "" {
-				parts = append(parts, ResponsesContentPart{Type: "output_text", Text: text, Annotations: []any{}})
-				outputText = append(outputText, text)
+			if strings.TrimSpace(content) != "" {
+				parts = append(parts, ResponsesContentPart{Type: "output_text", Text: content, Annotations: []any{}})
+				outputText = append(outputText, content)
 			}
 		} else if choice.Message.Content != nil {
-			text := strings.TrimSpace(stringifyAny(choice.Message.Content))
-			if text != "" {
+			text := stringifyAny(choice.Message.Content)
+			if strings.TrimSpace(text) != "" {
 				parts = append(parts, ResponsesContentPart{Type: "output_text", Text: text, Annotations: []any{}})
 				outputText = append(outputText, text)
 			}
+		}
+		if refusal := choice.Message.Refusal; refusal != "" {
+			parts = append(parts, ResponsesContentPart{Type: "refusal", Refusal: refusal})
 		}
 
 		output = append(output, ResponsesOutput{
 			Type:    "message",
 			ID:      msgID,
-			Status:  "completed",
+			Status:  status,
 			Role:    "assistant",
 			Content: parts,
 		})
 
-		if reasoning := strings.TrimSpace(choice.Message.ReasoningContent); reasoning != "" {
+		if reasoning := choice.Message.ReasoningContent; strings.TrimSpace(reasoning) != "" {
 			output = append(output, ResponsesOutput{
 				Type:   "reasoning",
-				ID:     fmt.Sprintf("rs_%s_%d", strings.TrimSpace(resp.ID), i),
-				Status: "completed",
+				ID:     fmt.Sprintf("rs_%s_%d", resp.ID, i),
+				Status: status,
 				Summary: []ResponsesSummaryPart{{
 					Type: "summary_text",
 					Text: reasoning,
@@ -181,7 +327,7 @@ func UnifiedResponseToResponses(resp *UnifiedResponse) *ResponsesResponse {
 				CallID:    tc.ID,
 				Name:      tc.Function.Name,
 				Arguments: tc.Function.Arguments,
-				Status:    "completed",
+				Status:    status,
 			})
 		}
 	}
@@ -190,21 +336,64 @@ func UnifiedResponseToResponses(resp *UnifiedResponse) *ResponsesResponse {
 		ID:         resp.ID,
 		Object:     "response",
 		CreatedAt:  resp.Created,
-		Status:     "completed",
+		Status:     status,
 		Model:      resp.Model,
 		Output:     output,
 		OutputText: strings.Join(outputText, "\n"),
 	}
+	if incompleteReason != "" {
+		out.IncompleteDetails = &ResponsesIncompleteDetails{Reason: incompleteReason}
+	}
 
 	if resp.Usage != nil {
-		out.Usage = &ResponsesUsage{
-			InputTokens:  resp.Usage.PromptTokens,
-			OutputTokens: resp.Usage.CompletionTokens,
-			TotalTokens:  resp.Usage.TotalTokens,
-		}
+		out.Usage = ResponsesUsageFromChat(resp.Usage)
 	}
 
 	return out
+}
+
+// ResponsesUsageFromChat converts provider-neutral Chat Completions usage to
+// the complete Responses usage shape while retaining normalized cache counts.
+func ResponsesUsageFromChat(usage *Usage) *ResponsesUsage {
+	if usage == nil {
+		return nil
+	}
+
+	tokenUsage := TokenUsageFromUsage(usage)
+	totalTokens := NonNegativeTokenCount(usage.TotalTokens)
+	if componentTotal := SaturatingTokenSum(tokenUsage.InputTokens, tokenUsage.OutputTokens); componentTotal > totalTokens {
+		totalTokens = componentTotal
+	}
+
+	return &ResponsesUsage{
+		InputTokens: tokenUsage.InputTokens,
+		InputTokensDetails: &InputTokensDetails{
+			CachedTokens:     tokenUsage.CachedInputTokens,
+			CacheWriteTokens: tokenUsage.CacheWriteInputTokens,
+		},
+		OutputTokens: tokenUsage.OutputTokens,
+		OutputTokensDetails: &ResponsesOutputTokensDetails{
+			ReasoningTokens: tokenUsage.ReasoningOutputTokens,
+		},
+		TotalTokens: totalTokens,
+	}
+}
+
+func responsesIncompleteReasonForChoices(choices []Choice) string {
+	reason := ""
+	for _, choice := range choices {
+		if choice.FinishReason == nil {
+			continue
+		}
+		mapped := ResponsesIncompleteReasonForFinishReason(*choice.FinishReason)
+		if mapped == ResponsesIncompleteReasonContentFilter {
+			return mapped
+		}
+		if reason == "" {
+			reason = mapped
+		}
+	}
+	return reason
 }
 
 func responsesInputToMessages(input interface{}) ([]Message, error) {
@@ -275,12 +464,12 @@ func responsesInputItemToMessage(item interface{}) (*Message, error) {
 	}
 
 	itemType := strings.TrimSpace(toString(obj["type"]))
-	toolCallID := strings.TrimSpace(toString(obj["tool_call_id"]))
+	toolCallID := toString(obj["tool_call_id"])
 	if toolCallID == "" {
-		toolCallID = strings.TrimSpace(toString(obj["call_id"]))
+		toolCallID = toString(obj["call_id"])
 	}
 	if toolCallID == "" {
-		toolCallID = strings.TrimSpace(toString(obj["id"]))
+		toolCallID = toString(obj["id"])
 	}
 	if itemType == "function_call_output" {
 		if toolCallID == "" {
@@ -298,9 +487,9 @@ func responsesInputItemToMessage(item interface{}) (*Message, error) {
 		if name == "" {
 			return nil, nil
 		}
-		callID := strings.TrimSpace(toString(obj["call_id"]))
+		callID := toString(obj["call_id"])
 		if callID == "" {
-			callID = strings.TrimSpace(toString(obj["id"]))
+			callID = toString(obj["id"])
 		}
 		args := stringifyAny(obj["arguments"])
 		idx := 0
@@ -318,6 +507,12 @@ func responsesInputItemToMessage(item interface{}) (*Message, error) {
 			}},
 		}, nil
 	}
+	if itemType != "" && itemType != "message" {
+		// Preserve a non-empty typed representation until the resolved target can
+		// decide whether the original Responses item is natively supported. A
+		// translated target rejects this item from RawJSON before upstream use.
+		return &Message{Role: "user", Content: stringifyAny(obj)}, nil
+	}
 
 	role := strings.TrimSpace(toString(obj["role"]))
 	if role == "" {
@@ -326,8 +521,8 @@ func responsesInputItemToMessage(item interface{}) (*Message, error) {
 
 	content := obj["content"]
 	if content == nil {
-		text := strings.TrimSpace(toString(obj["text"]))
-		if text == "" {
+		text := toString(obj["text"])
+		if strings.TrimSpace(text) == "" {
 			return nil, nil
 		}
 		return &Message{Role: role, Content: text, ToolCallID: toolCallID}, nil
@@ -340,7 +535,7 @@ func responsesInputItemToMessage(item interface{}) (*Message, error) {
 		}
 		return &Message{Role: role, Content: c, ToolCallID: toolCallID}, nil
 	case []interface{}:
-		parts := make([]map[string]interface{}, 0, len(c))
+		parts := make([]interface{}, 0, len(c))
 		for _, part := range c {
 			partObj, ok := part.(map[string]interface{})
 			if !ok {
@@ -351,12 +546,23 @@ func responsesInputItemToMessage(item interface{}) (*Message, error) {
 				partType = "input_text"
 			}
 			if partType == "input_text" || partType == "output_text" || partType == "text" {
-				text := strings.TrimSpace(toString(partObj["text"]))
-				if text == "" {
+				text := toString(partObj["text"])
+				if strings.TrimSpace(text) == "" {
 					continue
 				}
 				parts = append(parts, map[string]interface{}{"type": "text", "text": text})
 				continue
+			}
+			if partType == "input_image" {
+				imageURL := strings.TrimSpace(toString(partObj["image_url"]))
+				if imageURL != "" {
+					image := map[string]interface{}{"url": imageURL}
+					if detail := strings.TrimSpace(toString(partObj["detail"])); detail != "" {
+						image["detail"] = detail
+					}
+					parts = append(parts, map[string]interface{}{"type": "image_url", "image_url": image})
+					continue
+				}
 			}
 			parts = append(parts, partObj)
 		}
@@ -367,7 +573,12 @@ func responsesInputItemToMessage(item interface{}) (*Message, error) {
 
 		allText := true
 		var b strings.Builder
-		for _, p := range parts {
+		for _, rawPart := range parts {
+			p, ok := rawPart.(map[string]interface{})
+			if !ok {
+				allText = false
+				break
+			}
 			t, ok := p["type"].(string)
 			if !ok || t != "text" {
 				allText = false
@@ -447,6 +658,12 @@ func responsesToolsToUnified(tools []ResponsesTool) ([]Tool, error) {
 		}
 		if fn.Parameters == nil {
 			fn.Parameters = t.Parameters
+		}
+		if fn.Strict != nil && t.Strict != nil && *fn.Strict != *t.Strict {
+			return nil, fmt.Errorf("tools[%d].strict conflicts with tools[%d].function.strict", i, i)
+		}
+		if fn.Strict == nil {
+			fn.Strict = t.Strict
 		}
 
 		if strings.TrimSpace(fn.Name) == "" {

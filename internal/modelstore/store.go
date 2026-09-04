@@ -2,9 +2,9 @@ package modelstore
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -14,20 +14,28 @@ import (
 	"github.com/lunargate-ai/gateway/internal/config"
 	"github.com/lunargate-ai/gateway/internal/modelid"
 	"github.com/lunargate-ai/gateway/internal/providers"
+	"github.com/lunargate-ai/gateway/internal/safeurl"
 	"github.com/lunargate-ai/gateway/pkg/models"
 	"github.com/rs/zerolog/log"
 )
 
 type cacheEntry struct {
-	models    []string
-	expiresAt time.Time
+	generation uint64
+	models     []string
+	expiresAt  time.Time
+}
+
+type providerConfigSnapshot struct {
+	generation uint64
+	providers  map[string]config.ProviderConfig
 }
 
 type Store struct {
 	registry *providers.Registry
 	client   *http.Client
 
-	cfg atomic.Value
+	cfg            atomic.Value
+	nextGeneration atomic.Uint64
 
 	mu    sync.RWMutex
 	cache map[string]cacheEntry
@@ -36,7 +44,12 @@ type Store struct {
 func NewStore(reg *providers.Registry, providersCfg map[string]config.ProviderConfig) *Store {
 	s := &Store{
 		registry: reg,
-		client: &http.Client{Timeout: 15 * time.Second},
+		client: &http.Client{
+			Timeout: 15 * time.Second,
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 		cache: make(map[string]cacheEntry),
 	}
 	s.UpdateProvidersConfig(providersCfg)
@@ -44,20 +57,87 @@ func NewStore(reg *providers.Registry, providersCfg map[string]config.ProviderCo
 }
 
 func (s *Store) UpdateProvidersConfig(cfg map[string]config.ProviderConfig) {
-	copyMap := make(map[string]config.ProviderConfig, len(cfg))
-	for k, v := range cfg {
-		copyMap[k] = v
+	copyMap := cloneProviderConfigs(cfg)
+	current, _ := s.cfg.Load().(providerConfigSnapshot)
+	if reflect.DeepEqual(current.providers, copyMap) {
+		return
 	}
-	s.cfg.Store(copyMap)
-
 	s.mu.Lock()
+	current, _ = s.cfg.Load().(providerConfigSnapshot)
+	if reflect.DeepEqual(current.providers, copyMap) {
+		s.mu.Unlock()
+		return
+	}
+	s.cfg.Store(providerConfigSnapshot{
+		generation: s.nextGeneration.Add(1),
+		providers:  copyMap,
+	})
 	s.cache = make(map[string]cacheEntry)
 	s.mu.Unlock()
 }
 
+func cloneProviderConfigs(cfg map[string]config.ProviderConfig) map[string]config.ProviderConfig {
+	cloned := make(map[string]config.ProviderConfig, len(cfg))
+	for provider, providerCfg := range cfg {
+		if providerCfg.Temperature != nil {
+			value := *providerCfg.Temperature
+			providerCfg.Temperature = &value
+		}
+		if providerCfg.TopP != nil {
+			value := *providerCfg.TopP
+			providerCfg.TopP = &value
+		}
+		if providerCfg.TopK != nil {
+			value := *providerCfg.TopK
+			providerCfg.TopK = &value
+		}
+		if len(providerCfg.Extra) > 0 {
+			extra := providerCfg.Extra
+			providerCfg.Extra = make(map[string]string, len(extra))
+			for key, value := range extra {
+				providerCfg.Extra[key] = value
+			}
+		} else {
+			providerCfg.Extra = nil
+		}
+		providerCfg.Models.Static = append([]string(nil), providerCfg.Models.Static...)
+		providerCfg.Capabilities.HostedTools = append([]string(nil), providerCfg.Capabilities.HostedTools...)
+		providerCfg.Capabilities.ReasoningEffortLevels = append([]string(nil), providerCfg.Capabilities.ReasoningEffortLevels...)
+		cloned[provider] = providerCfg
+	}
+	return cloned
+}
+
 func (s *Store) AllModels(ctx context.Context) []models.ModelInfo {
-	cfgAny := s.cfg.Load()
-	providersCfg, _ := cfgAny.(map[string]config.ProviderConfig)
+	snapshot := s.providerConfigSnapshot()
+	modelsList := s.collectModels(snapshot.providers, func(providerID string, pcfg config.ProviderConfig) []string {
+		return s.modelsForProvider(ctx, snapshot.generation, providerID, pcfg)
+	})
+	if s.providerConfigSnapshot().generation != snapshot.generation {
+		return s.AllModelsSnapshot()
+	}
+	return modelsList
+}
+
+// AllModelsSnapshot returns the model inventory that is already available in
+// memory. It never performs provider I/O: fetch-mode providers use a valid
+// cached result or their local translator/default-model fallback.
+func (s *Store) AllModelsSnapshot() []models.ModelInfo {
+	snapshot := s.providerConfigSnapshot()
+	return s.collectModels(snapshot.providers, func(providerID string, pcfg config.ProviderConfig) []string {
+		return s.modelsForProviderSnapshot(snapshot.generation, providerID, pcfg)
+	})
+}
+
+func (s *Store) providerConfigSnapshot() providerConfigSnapshot {
+	snapshot, _ := s.cfg.Load().(providerConfigSnapshot)
+	return snapshot
+}
+
+func (s *Store) collectModels(
+	providersCfg map[string]config.ProviderConfig,
+	resolve func(string, config.ProviderConfig) []string,
+) []models.ModelInfo {
 
 	seen := make(map[string]struct{}, 128)
 	out := make([]models.ModelInfo, 0, 128)
@@ -67,7 +147,7 @@ func (s *Store) AllModels(ctx context.Context) []models.ModelInfo {
 
 	for _, providerID := range providerIDs {
 		pcfg := providersCfg[providerID]
-		ids := s.modelsForProvider(ctx, providerID, pcfg)
+		ids := resolve(providerID, pcfg)
 		for _, raw := range ids {
 			m := strings.TrimSpace(raw)
 			if m == "" {
@@ -86,12 +166,73 @@ func (s *Store) AllModels(ctx context.Context) []models.ModelInfo {
 	return out
 }
 
-func (s *Store) modelsForProvider(ctx context.Context, providerID string, pcfg config.ProviderConfig) []string {
-	mode := strings.ToLower(strings.TrimSpace(pcfg.Models.Mode))
-	if mode == "" {
-		mode = "translator"
+func (s *Store) modelsForProviderSnapshot(generation uint64, providerID string, pcfg config.ProviderConfig) []string {
+	mode := providerModelMode(pcfg)
+	if mode != "fetch" {
+		return s.localModelsForProvider(providerID, pcfg, mode)
 	}
 
+	s.mu.RLock()
+	ce, ok := s.cache[providerID]
+	s.mu.RUnlock()
+	if ok && ce.generation == generation && time.Now().Before(ce.expiresAt) {
+		return append([]string(nil), ce.models...)
+	}
+
+	return s.localModelsForProvider(providerID, pcfg, mode)
+}
+
+func (s *Store) modelsForProvider(ctx context.Context, generation uint64, providerID string, pcfg config.ProviderConfig) []string {
+	mode := providerModelMode(pcfg)
+	if mode != "fetch" {
+		return s.localModelsForProvider(providerID, pcfg, mode)
+	}
+
+	ttl := pcfg.Models.Fetch.TTL
+	if ttl <= 0 {
+		ttl = config.DefaultModelsFetchTTL
+	}
+
+	s.mu.RLock()
+	ce, ok := s.cache[providerID]
+	s.mu.RUnlock()
+	if ok && ce.generation == generation && time.Now().Before(ce.expiresAt) {
+		return append([]string(nil), ce.models...)
+	}
+
+	modelsList, err := s.fetchModels(ctx, providerID, pcfg)
+	cacheResult := ctx.Err() == nil
+	if err != nil {
+		log.Warn().Err(err).Str("provider", providerID).Msg("failed to fetch models")
+		modelsList = s.localModelsForProvider(providerID, pcfg, mode)
+		cacheResult = ctx.Err() == nil
+	}
+	modelsList = uniqueStrings(modelsList)
+
+	if cacheResult {
+		s.mu.Lock()
+		current := s.providerConfigSnapshot()
+		if current.generation == generation {
+			s.cache[providerID] = cacheEntry{
+				generation: generation,
+				models:     append([]string(nil), modelsList...),
+				expiresAt:  time.Now().Add(ttl),
+			}
+		}
+		s.mu.Unlock()
+	}
+	return modelsList
+}
+
+func providerModelMode(pcfg config.ProviderConfig) string {
+	mode := strings.ToLower(strings.TrimSpace(pcfg.Models.Mode))
+	if mode == "" {
+		return "translator"
+	}
+	return mode
+}
+
+func (s *Store) localModelsForProvider(providerID string, pcfg config.ProviderConfig, mode string) []string {
 	switch mode {
 	case "static":
 		modelsList := make([]string, 0, len(pcfg.Models.Static)+1)
@@ -107,35 +248,7 @@ func (s *Store) modelsForProvider(ctx context.Context, providerID string, pcfg c
 		return uniqueStrings(modelsList)
 
 	case "fetch":
-		ttl := pcfg.Models.Fetch.TTL
-		if ttl <= 0 {
-			ttl = 10 * time.Minute
-		}
-
-		s.mu.RLock()
-		ce, ok := s.cache[providerID]
-		s.mu.RUnlock()
-		if ok && time.Now().Before(ce.expiresAt) {
-			return ce.models
-		}
-
-		modelsList, err := s.fetchModels(ctx, providerID, pcfg)
-		if err != nil {
-			log.Warn().Err(err).Str("provider", providerID).Msg("failed to fetch models")
-			modelsList = s.modelsFromTranslator(providerID)
-			if len(modelsList) == 0 {
-				if dm := strings.TrimSpace(pcfg.DefaultModel); dm != "" {
-					modelsList = append(modelsList, dm)
-				}
-			}
-		}
-		modelsList = uniqueStrings(modelsList)
-
-		s.mu.Lock()
-		s.cache[providerID] = cacheEntry{models: modelsList, expiresAt: time.Now().Add(ttl)}
-		s.mu.Unlock()
-		return modelsList
-
+		fallthrough
 	case "translator":
 		fallthrough
 	default:
@@ -179,22 +292,32 @@ type ollamaTagsResponse struct {
 }
 
 func (s *Store) fetchModels(ctx context.Context, providerID string, pcfg config.ProviderConfig) ([]string, error) {
-	providerType, _ := s.registry.Type(providerID)
-	providerType = strings.ToLower(strings.TrimSpace(providerType))
+	providerSnapshot, ok := s.registry.Snapshot(providerID)
+	if !ok || providerSnapshot.Translator == nil {
+		return nil, fmt.Errorf("provider is not registered")
+	}
+	providerType := strings.ToLower(strings.TrimSpace(providerSnapshot.ProviderType))
 
-	baseURL := strings.TrimRight(strings.TrimSpace(pcfg.BaseURL), "/")
+	baseURL := strings.TrimSpace(pcfg.BaseURL)
 	if baseURL == "" {
-		return nil, fmt.Errorf("provider base_url is empty")
+		baseURL = strings.TrimSpace(providerSnapshot.Translator.BaseURL())
+	}
+	if baseURL == "" {
+		return nil, fmt.Errorf("provider has no effective base_url")
 	}
 
 	if providerType == "ollama" {
-		url := baseURL + "/api/tags"
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		endpoint, err := safeurl.JoinHTTPPath(baseURL, "api/tags")
+		if err != nil {
+			return nil, fmt.Errorf("failed to build ollama tags endpoint: %w", err)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create ollama tags request: %w", err)
 		}
 		resp, err := s.client.Do(req)
 		if err != nil {
+			err = safeurl.RedactTransportError(err, req.URL)
 			return nil, fmt.Errorf("failed to call ollama tags: %w", err)
 		}
 		defer resp.Body.Close()
@@ -202,7 +325,7 @@ func (s *Store) fetchModels(ctx context.Context, providerID string, pcfg config.
 			return nil, fmt.Errorf("ollama tags returned status=%d", resp.StatusCode)
 		}
 		var tr ollamaTagsResponse
-		if err := json.NewDecoder(resp.Body).Decode(&tr); err != nil {
+		if err := decodeModelsResponse(resp.Body, &tr); err != nil {
 			return nil, fmt.Errorf("failed to decode ollama tags response: %w", err)
 		}
 		out := make([]string, 0, len(tr.Models))
@@ -215,8 +338,11 @@ func (s *Store) fetchModels(ctx context.Context, providerID string, pcfg config.
 	}
 
 	if providerType == "openai" {
-		url := baseURL + "/models"
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		endpoint, err := safeurl.JoinHTTPPath(baseURL, "models")
+		if err != nil {
+			return nil, fmt.Errorf("failed to build openai models endpoint: %w", err)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create openai models request: %w", err)
 		}
@@ -228,6 +354,7 @@ func (s *Store) fetchModels(ctx context.Context, providerID string, pcfg config.
 		}
 		resp, err := s.client.Do(req)
 		if err != nil {
+			err = safeurl.RedactTransportError(err, req.URL)
 			return nil, fmt.Errorf("failed to call openai models: %w", err)
 		}
 		defer resp.Body.Close()
@@ -235,7 +362,7 @@ func (s *Store) fetchModels(ctx context.Context, providerID string, pcfg config.
 			return nil, fmt.Errorf("openai models returned status=%d", resp.StatusCode)
 		}
 		var ml openAIModelsList
-		if err := json.NewDecoder(resp.Body).Decode(&ml); err != nil {
+		if err := decodeModelsResponse(resp.Body, &ml); err != nil {
 			return nil, fmt.Errorf("failed to decode openai models response: %w", err)
 		}
 		out := make([]string, 0, len(ml.Data))

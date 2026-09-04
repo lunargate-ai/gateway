@@ -11,29 +11,39 @@ import (
 // UnifiedRequest represents an OpenAI-compatible chat completion request.
 // All provider translators convert FROM this format to their native format.
 type UnifiedRequest struct {
-	Model              string          `json:"model"`
-	Messages           []Message       `json:"messages"`
-	Temperature        *float64        `json:"temperature,omitempty"`
-	TopP               *float64        `json:"top_p,omitempty"`
-	TopK               *int            `json:"top_k,omitempty"`
-	N                  *int            `json:"n,omitempty"`
-	Stream             bool            `json:"stream,omitempty"`
-	StreamOptions      *StreamOptions  `json:"stream_options,omitempty"`
-	Stop               interface{}     `json:"stop,omitempty"`
-	MaxTokens          *int            `json:"max_tokens,omitempty"`
-	PresencePenalty    *float64        `json:"presence_penalty,omitempty"`
-	FrequencyPenalty   *float64        `json:"frequency_penalty,omitempty"`
-	LogitBias          map[string]int  `json:"logit_bias,omitempty"`
-	User               string          `json:"user,omitempty"`
-	Tools              []Tool          `json:"tools,omitempty"`
-	ToolChoice         interface{}     `json:"tool_choice,omitempty"`
-	Functions          []ToolFunction  `json:"functions,omitempty"`
-	FunctionCall       interface{}     `json:"function_call,omitempty"`
-	ResponseFormat     *ResponseFormat `json:"response_format,omitempty"`
-	ReasoningEffort    string          `json:"reasoning_effort,omitempty"`
-	Reasoning          *Reasoning      `json:"reasoning,omitempty"`
-	Seed               *int            `json:"seed,omitempty"`
-	PreviousResponseID string          `json:"previous_response_id,omitempty"`
+	// RawJSON preserves the complete client document for native-compatible
+	// forwarding and exact cache semantics. It is never serialized by the
+	// typed compatibility model itself.
+	RawJSON json.RawMessage `json:"-"`
+	// SourceRequestType identifies the client API contract represented by
+	// RawJSON. Translators must only replay RawJSON when the upstream contract
+	// matches this value.
+	SourceRequestType   string          `json:"-"`
+	Model               string          `json:"model"`
+	Messages            []Message       `json:"messages"`
+	Temperature         *float64        `json:"temperature,omitempty"`
+	TopP                *float64        `json:"top_p,omitempty"`
+	TopK                *int            `json:"top_k,omitempty"`
+	N                   *int            `json:"n,omitempty"`
+	Stream              bool            `json:"stream,omitempty"`
+	StreamOptions       *StreamOptions  `json:"stream_options,omitempty"`
+	Stop                interface{}     `json:"stop,omitempty"`
+	MaxTokens           *int            `json:"max_tokens,omitempty"`
+	MaxCompletionTokens *int            `json:"max_completion_tokens,omitempty"`
+	PresencePenalty     *float64        `json:"presence_penalty,omitempty"`
+	FrequencyPenalty    *float64        `json:"frequency_penalty,omitempty"`
+	LogitBias           map[string]int  `json:"logit_bias,omitempty"`
+	User                string          `json:"user,omitempty"`
+	Tools               []Tool          `json:"tools,omitempty"`
+	ToolChoice          interface{}     `json:"tool_choice,omitempty"`
+	Functions           []ToolFunction  `json:"functions,omitempty"`
+	FunctionCall        interface{}     `json:"function_call,omitempty"`
+	ResponseFormat      *ResponseFormat `json:"response_format,omitempty"`
+	ReasoningEffort     string          `json:"reasoning_effort,omitempty"`
+	Reasoning           *Reasoning      `json:"reasoning,omitempty"`
+	Seed                *int            `json:"seed,omitempty"`
+	Store               *bool           `json:"store,omitempty"`
+	PreviousResponseID  string          `json:"previous_response_id,omitempty"`
 }
 
 type StreamOptions struct {
@@ -47,6 +57,7 @@ type Reasoning struct {
 type Message struct {
 	Role             string        `json:"role,omitempty"`
 	Content          interface{}   `json:"content,omitempty"`
+	Refusal          string        `json:"refusal,omitempty"`
 	ReasoningContent string        `json:"reasoning_content,omitempty"`
 	Name             string        `json:"name,omitempty"`
 	ToolCalls        []ToolCall    `json:"tool_calls,omitempty"`
@@ -76,6 +87,7 @@ type ToolFunction struct {
 	Name        string      `json:"name"`
 	Description string      `json:"description,omitempty"`
 	Parameters  interface{} `json:"parameters,omitempty"`
+	Strict      *bool       `json:"strict,omitempty"`
 }
 
 type ToolCall struct {
@@ -96,7 +108,15 @@ type FunctionCall struct {
 }
 
 type ResponseFormat struct {
-	Type string `json:"type"`
+	Type       string                    `json:"type"`
+	JSONSchema *JSONSchemaResponseFormat `json:"json_schema,omitempty"`
+}
+
+type JSONSchemaResponseFormat struct {
+	Name        string      `json:"name"`
+	Description string      `json:"description,omitempty"`
+	Schema      interface{} `json:"schema"`
+	Strict      *bool       `json:"strict,omitempty"`
 }
 
 func NormalizeUnifiedRequest(req *UnifiedRequest) error {
@@ -110,6 +130,14 @@ func NormalizeUnifiedRequest(req *UnifiedRequest) error {
 		}
 		// Keep a single canonical field in unified request payloads.
 		req.Reasoning = nil
+	}
+
+	// max_completion_tokens is the current Chat Completions spelling. Keep a
+	// single canonical value for translated providers while RawJSON preserves
+	// the original field for native OpenAI-compatible forwarding.
+	if req.MaxCompletionTokens != nil {
+		req.MaxTokens = req.MaxCompletionTokens
+		req.MaxCompletionTokens = nil
 	}
 
 	// Reject conflicting modes.

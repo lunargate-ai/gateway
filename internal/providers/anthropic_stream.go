@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/lunargate-ai/gateway/pkg/models"
@@ -18,12 +19,12 @@ type anthropicStreamTranslator struct {
 	model string
 
 	toolCallIndexByContentBlockIndex map[int]int
-	nextToolCallIndex               int
+	nextToolCallIndex                int
 }
 
 func NewAnthropicStreamTranslator(base *AnthropicTranslator) models.ProviderTranslator {
 	return &anthropicStreamTranslator{
-		base:                            base,
+		base:                             base,
 		toolCallIndexByContentBlockIndex: make(map[int]int, 8),
 	}
 }
@@ -63,10 +64,11 @@ type anthropicStreamEvent struct {
 }
 
 type anthropicStreamDelta struct {
-	Type        string  `json:"type,omitempty"`
-	Text        string  `json:"text,omitempty"`
-	PartialJSON string  `json:"partial_json,omitempty"`
-	StopReason  *string `json:"stop_reason,omitempty"`
+	Type        string                `json:"type,omitempty"`
+	Text        string                `json:"text,omitempty"`
+	PartialJSON string                `json:"partial_json,omitempty"`
+	StopReason  *string               `json:"stop_reason,omitempty"`
+	StopDetails *anthropicStopDetails `json:"stop_details,omitempty"`
 }
 
 func (t *anthropicStreamTranslator) ParseStreamChunk(data []byte) (*models.StreamChunk, error) {
@@ -82,10 +84,21 @@ func (t *anthropicStreamTranslator) ParseStreamChunk(data []byte) (*models.Strea
 
 	if event.Type == "error" {
 		msg := "anthropic stream error"
-		if event.Error != nil && event.Error.Message != "" {
-			msg = event.Error.Message
+		errorType := "upstream_error"
+		if event.Error != nil {
+			if upstreamMessage := strings.TrimSpace(event.Error.Message); upstreamMessage != "" {
+				msg = upstreamMessage
+			}
+			if upstreamType := strings.TrimSpace(event.Error.Type); upstreamType != "" {
+				errorType = upstreamType
+			}
 		}
-		return nil, fmt.Errorf("%s", msg)
+		return nil, &ProviderError{
+			StatusCode: http.StatusBadGateway,
+			Message:    msg,
+			Type:       errorType,
+			Provider:   "anthropic",
+		}
 	}
 
 	switch event.Type {
@@ -103,12 +116,8 @@ func (t *anthropicStreamTranslator) ParseStreamChunk(data []byte) (*models.Strea
 		t.model = event.Message.Model
 
 		var usage *models.Usage
-		if event.Message.Usage.InputTokens > 0 {
-			usage = &models.Usage{
-				PromptTokens:     event.Message.Usage.InputTokens,
-				CompletionTokens: 0,
-				TotalTokens:      event.Message.Usage.InputTokens,
-			}
+		if anthropicUsageHasTokens(event.Message.Usage) {
+			usage = anthropicUsageToUnified(event.Message.Usage)
 		}
 
 		return &models.StreamChunk{
@@ -117,8 +126,8 @@ func (t *anthropicStreamTranslator) ParseStreamChunk(data []byte) (*models.Strea
 			Created: time.Now().Unix(),
 			Model:   t.model,
 			Choices: []models.Choice{{
-				Index: 0,
-				Delta: &models.Message{Role: "assistant"},
+				Index:        0,
+				Delta:        &models.Message{Role: "assistant"},
 				FinishReason: nil,
 			}},
 			Usage: usage,
@@ -140,8 +149,8 @@ func (t *anthropicStreamTranslator) ParseStreamChunk(data []byte) (*models.Strea
 				Created: time.Now().Unix(),
 				Model:   t.model,
 				Choices: []models.Choice{{
-					Index: 0,
-					Delta: &models.Message{Content: event.ContentBlock.Text},
+					Index:        0,
+					Delta:        &models.Message{Content: event.ContentBlock.Text},
 					FinishReason: nil,
 				}},
 			}, nil
@@ -195,8 +204,8 @@ func (t *anthropicStreamTranslator) ParseStreamChunk(data []byte) (*models.Strea
 				Created: time.Now().Unix(),
 				Model:   t.model,
 				Choices: []models.Choice{{
-					Index: 0,
-					Delta: &models.Message{Content: event.Delta.Text},
+					Index:        0,
+					Delta:        &models.Message{Content: event.Delta.Text},
 					FinishReason: nil,
 				}},
 			}, nil
@@ -239,10 +248,11 @@ func (t *anthropicStreamTranslator) ParseStreamChunk(data []byte) (*models.Strea
 			return nil, nil
 		}
 
-		fr := mapAnthropicStopReason(event.Delta.StopReason)
+		fr := mapAnthropicStopReason(event.Delta.StopReason, event.Delta.StopDetails)
+		refusal := anthropicRefusalExplanation(event.Delta.StopReason, event.Delta.StopDetails)
 		var usage *models.Usage
-		if event.Usage != nil {
-			usage = &models.Usage{CompletionTokens: event.Usage.OutputTokens}
+		if event.Usage != nil && anthropicUsageHasTokens(*event.Usage) {
+			usage = anthropicUsageToUnified(*event.Usage)
 		}
 
 		return &models.StreamChunk{
@@ -252,7 +262,7 @@ func (t *anthropicStreamTranslator) ParseStreamChunk(data []byte) (*models.Strea
 			Model:   t.model,
 			Choices: []models.Choice{{
 				Index:        0,
-				Delta:        &models.Message{},
+				Delta:        &models.Message{Refusal: refusal},
 				FinishReason: fr,
 			}},
 			Usage: usage,

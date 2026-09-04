@@ -7,14 +7,23 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lunargate-ai/gateway/internal/config"
+	"github.com/lunargate-ai/gateway/internal/safeurl"
 	"github.com/rs/zerolog/log"
+)
+
+const (
+	defaultCollectorQueueCapacity   = 1000
+	defaultCollectorMaxPayloadBytes = 16 << 20
+	defaultCollectorMaxQueueBytes   = 64 << 20
+	defaultCollectorStopTimeout     = 5 * time.Second
+	defaultCollectorCancelWait      = 500 * time.Millisecond
 )
 
 type Event struct {
@@ -31,31 +40,71 @@ type CollectorRequest struct {
 }
 
 type MetricEventData struct {
-	RequestID            string            `json:"request_id"`
-	Timestamp            time.Time         `json:"timestamp"`
-	RequestType          string            `json:"request_type,omitempty"`
-	DurationMS           int64             `json:"duration_ms"`
-	GatewayPreUpstreamMS *int64            `json:"gateway_pre_upstream_ms,omitempty"`
-	TtftMS               *int64            `json:"ttft_ms,omitempty"`
-	TtltMS               *int64            `json:"ttlt_ms,omitempty"`
-	Provider             string            `json:"provider"`
-	Model                string            `json:"model"`
-	User                 *string           `json:"user,omitempty"`
-	SessionID            *string           `json:"session_id,omitempty"`
-	TokensInput          int               `json:"tokens_input"`
-	TokensOutput         int               `json:"tokens_output"`
-	CostUSD              float64           `json:"cost_usd"`
-	StatusCode           int               `json:"status_code"`
-	ErrorCode            *string           `json:"error_code,omitempty"`
-	ErrorMessage         *string           `json:"error_message,omitempty"`
-	CacheHit             bool              `json:"cache_hit"`
-	CacheKey             *string           `json:"cache_key,omitempty"`
-	RouteUsed            *string           `json:"route_used,omitempty"`
-	TargetIndex          *int              `json:"target_index,omitempty"`
-	FallbackUsed         bool              `json:"fallback_used"`
-	RetryCount           int               `json:"retry_count"`
-	CircuitBreakerState  *string           `json:"circuit_breaker_state,omitempty"`
-	Tags                 map[string]string `json:"tags,omitempty"`
+	RequestID               string            `json:"request_id"`
+	Timestamp               time.Time         `json:"timestamp"`
+	RequestType             string            `json:"request_type,omitempty"`
+	UpstreamRequestType     string            `json:"upstream_request_type,omitempty"`
+	DurationMS              int64             `json:"duration_ms"`
+	GatewayPreUpstreamMS    *int64            `json:"gateway_pre_upstream_ms,omitempty"`
+	TtftMS                  *int64            `json:"ttft_ms,omitempty"`
+	TtltMS                  *int64            `json:"ttlt_ms,omitempty"`
+	Provider                string            `json:"provider"`
+	Model                   string            `json:"model"`
+	User                    *string           `json:"user,omitempty"`
+	SessionID               *string           `json:"session_id,omitempty"`
+	TokensInput             int               `json:"tokens_input"`
+	TokensOutput            int               `json:"tokens_output"`
+	TokensInputCached       int               `json:"tokens_input_cached,omitempty"`
+	TokensInputCacheWrite   int               `json:"tokens_input_cache_write,omitempty"`
+	TokensInputCacheWrite5m int               `json:"tokens_input_cache_write_5m,omitempty"`
+	TokensInputCacheWrite1h int               `json:"tokens_input_cache_write_1h,omitempty"`
+	CostUSD                 float64           `json:"cost_usd"`
+	StatusCode              int               `json:"status_code"`
+	ErrorCode               *string           `json:"error_code,omitempty"`
+	CacheHit                bool              `json:"cache_hit"`
+	CacheKey                *string           `json:"cache_key,omitempty"`
+	RouteUsed               *string           `json:"route_used,omitempty"`
+	TargetIndex             *int              `json:"target_index,omitempty"`
+	FallbackUsed            bool              `json:"fallback_used"`
+	RetryCount              int               `json:"retry_count"`
+	CircuitBreakerState     *string           `json:"circuit_breaker_state,omitempty"`
+	Tags                    map[string]string `json:"tags,omitempty"`
+}
+
+// MetricErrorClass reduces failures to a finite, non-content-bearing label.
+// Provider error types and messages are untrusted and may contain request
+// content or credentials, so they belong only in explicitly enabled request
+// logs, never in metrics-only events.
+func MetricErrorClass(statusCode int, failed bool) *string {
+	if !failed && statusCode < http.StatusBadRequest {
+		return nil
+	}
+	class := "request_error"
+	switch statusCode {
+	case 499:
+		class = "client_cancelled"
+	case http.StatusBadRequest, http.StatusMethodNotAllowed, http.StatusUnprocessableEntity:
+		class = "invalid_request"
+	case http.StatusUnauthorized:
+		class = "authentication"
+	case http.StatusForbidden:
+		class = "permission"
+	case http.StatusNotFound:
+		class = "not_found"
+	case http.StatusConflict:
+		class = "conflict"
+	case http.StatusRequestEntityTooLarge:
+		class = "request_too_large"
+	case http.StatusRequestTimeout, http.StatusGatewayTimeout:
+		class = "timeout"
+	case http.StatusTooManyRequests:
+		class = "rate_limited"
+	default:
+		if statusCode >= http.StatusInternalServerError || statusCode < http.StatusBadRequest {
+			class = "upstream_error"
+		}
+	}
+	return &class
 }
 
 type TraceEventData struct {
@@ -66,30 +115,48 @@ type TraceEventData struct {
 }
 
 type RequestLogEventData struct {
-	RequestID    string            `json:"request_id"`
-	Timestamp    time.Time         `json:"timestamp"`
-	GatewayID    string            `json:"gateway_id,omitempty"`
-	RequestType  string            `json:"request_type,omitempty"`
-	User         *string           `json:"user,omitempty"`
-	SessionID    *string           `json:"session_id,omitempty"`
-	Provider     string            `json:"provider"`
-	Model        string            `json:"model"`
-	StatusCode   int               `json:"status_code"`
-	DurationMS   int64             `json:"duration_ms"`
-	RouteUsed    *string           `json:"route_used,omitempty"`
-	CacheHit     bool              `json:"cache_hit"`
-	FallbackUsed bool              `json:"fallback_used"`
-	RetryCount   int               `json:"retry_count"`
-	ErrorCode    *string           `json:"error_code,omitempty"`
-	ErrorMessage *string           `json:"error_message,omitempty"`
-	Tags         map[string]string `json:"tags,omitempty"`
-	Request      interface{}       `json:"request,omitempty"`
-	Response     interface{}       `json:"response,omitempty"`
+	RequestID           string            `json:"request_id"`
+	Timestamp           time.Time         `json:"timestamp"`
+	GatewayID           string            `json:"gateway_id,omitempty"`
+	RequestType         string            `json:"request_type,omitempty"`
+	UpstreamRequestType string            `json:"upstream_request_type,omitempty"`
+	User                *string           `json:"user,omitempty"`
+	SessionID           *string           `json:"session_id,omitempty"`
+	Provider            string            `json:"provider"`
+	Model               string            `json:"model"`
+	StatusCode          int               `json:"status_code"`
+	DurationMS          int64             `json:"duration_ms"`
+	RouteUsed           *string           `json:"route_used,omitempty"`
+	CacheHit            bool              `json:"cache_hit"`
+	FallbackUsed        bool              `json:"fallback_used"`
+	RetryCount          int               `json:"retry_count"`
+	ErrorCode           *string           `json:"error_code,omitempty"`
+	ErrorMessage        *string           `json:"error_message,omitempty"`
+	Tags                map[string]string `json:"tags,omitempty"`
+	Request             interface{}       `json:"request,omitempty"`
+	Response            interface{}       `json:"response,omitempty"`
 }
 
 type collectorItem struct {
-	requestID string
-	payload   []byte
+	requestID     string
+	payload       []byte
+	identity      collectorIdentity
+	accountedSize int64
+}
+
+type collectorEnqueueStatus uint8
+
+const (
+	collectorEnqueueAccepted collectorEnqueueStatus = iota
+	collectorEnqueueStopped
+	collectorEnqueuePayloadTooLarge
+	collectorEnqueueBudgetExceeded
+	collectorEnqueueQueueFull
+)
+
+type collectorIdentity struct {
+	backendURL string
+	apiKey     string
 }
 
 type collectorRuntimeConfig struct {
@@ -105,39 +172,56 @@ type collectorRuntimeConfig struct {
 type CollectorClient struct {
 	gatewayVersion string
 
-	httpClient *http.Client
-	queue      chan collectorItem
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
-	stopOnce   sync.Once
-	mu         sync.RWMutex
-	cfg        collectorRuntimeConfig
-	lastLogKey string
-	lastLogAt  time.Time
+	httpClient      *http.Client
+	queue           chan collectorItem
+	ctx             context.Context
+	cancel          context.CancelFunc
+	done            chan struct{}
+	stopOnce        sync.Once
+	mu              sync.RWMutex
+	cfg             collectorRuntimeConfig
+	queueMu         sync.Mutex
+	queueBytes      int64
+	stopped         bool
+	maxPayloadBytes int64
+	maxQueueBytes   int64
+	stopTimeout     time.Duration
+	inflightMu      sync.Mutex
+	inflight        bool
+	inflightBytes   int64
+	inflightDropped bool
+	stopDropItems   atomic.Int64
+	stopDropBytes   atomic.Int64
+	lastLogKey      string
+	lastLogAt       time.Time
 }
 
-func NewCollectorClient(cfg config.DataSharingConfig, gatewayVersion string) *CollectorClient {
+func NewCollectorClient(general config.GeneralConfig, cfg config.DataSharingConfig, gatewayVersion string) *CollectorClient {
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &CollectorClient{
 		gatewayVersion: gatewayVersion,
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
-		queue:  make(chan collectorItem, 1000),
-		ctx:    ctx,
-		cancel: cancel,
-		cfg:    normalizeCollectorConfig(cfg),
+		queue:           make(chan collectorItem, defaultCollectorQueueCapacity),
+		ctx:             ctx,
+		cancel:          cancel,
+		done:            make(chan struct{}),
+		cfg:             normalizeCollectorConfig(general, cfg),
+		maxPayloadBytes: defaultCollectorMaxPayloadBytes,
+		maxQueueBytes:   defaultCollectorMaxQueueBytes,
 	}
 
-	c.wg.Add(1)
 	go c.worker()
 	return c
 }
 
-func normalizeCollectorConfig(cfg config.DataSharingConfig) collectorRuntimeConfig {
-	backendURL := strings.TrimSpace(cfg.BackendURL)
-	apiKey := strings.TrimSpace(cfg.APIKey)
+func normalizeCollectorConfig(general config.GeneralConfig, cfg config.DataSharingConfig) collectorRuntimeConfig {
+	backendURL := strings.TrimSpace(general.BackendURL)
+	apiKey := strings.TrimSpace(general.APIKey)
 
 	return collectorRuntimeConfig{
 		enabled:        cfg.Enabled && backendURL != "" && apiKey != "",
@@ -157,12 +241,12 @@ func (c *CollectorClient) snapshot() collectorRuntimeConfig {
 }
 
 // UpdateConfig hot-reloads collector behavior without restarting the process.
-func (c *CollectorClient) UpdateConfig(cfg config.DataSharingConfig) {
+func (c *CollectorClient) UpdateConfig(general config.GeneralConfig, cfg config.DataSharingConfig) {
 	if c == nil {
 		return
 	}
 	c.mu.Lock()
-	c.cfg = normalizeCollectorConfig(cfg)
+	c.cfg = normalizeCollectorConfig(general, cfg)
 	c.mu.Unlock()
 	log.Info().Bool("enabled", c.Enabled()).Msg("collector config updated")
 }
@@ -226,13 +310,119 @@ func (c *CollectorClient) Enqueue(ctx context.Context, requestID string, events 
 		return
 	}
 
-	item := collectorItem{requestID: requestID, payload: b}
-	select {
-	case <-c.ctx.Done():
+	item := collectorItem{
+		requestID: requestID,
+		payload:   b,
+		identity: collectorIdentity{
+			backendURL: cfg.backendURL,
+			apiKey:     cfg.apiKey,
+		},
+	}
+	status, queuedBytes := c.tryEnqueue(item)
+	switch status {
+	case collectorEnqueueAccepted, collectorEnqueueStopped:
 		return
-	case c.queue <- item:
-	default:
+	case collectorEnqueuePayloadTooLarge:
+		log.Warn().
+			Str("request_id", requestID).
+			Int("payload_bytes", len(b)).
+			Int64("max_payload_bytes", c.payloadByteLimit()).
+			Msg("collector payload too large, dropping event")
+	case collectorEnqueueBudgetExceeded:
+		log.Warn().
+			Str("request_id", requestID).
+			Int("payload_bytes", len(b)).
+			Int64("queued_bytes", queuedBytes).
+			Int64("max_queue_bytes", c.queueByteLimit()).
+			Msg("collector queue byte limit reached, dropping event")
+	case collectorEnqueueQueueFull:
 		log.Warn().Str("request_id", requestID).Msg("collector queue full, dropping event")
+	}
+}
+
+func (c *CollectorClient) tryEnqueue(item collectorItem) (collectorEnqueueStatus, int64) {
+	payloadBytes := int64(len(item.payload))
+	if payloadBytes > c.payloadByteLimit() {
+		return collectorEnqueuePayloadTooLarge, c.queuedPayloadBytes()
+	}
+
+	c.queueMu.Lock()
+	defer c.queueMu.Unlock()
+
+	if c.stopped || (c.ctx != nil && c.ctx.Err() != nil) {
+		return collectorEnqueueStopped, c.queueBytes
+	}
+	queueLimit := c.queueByteLimit()
+	if payloadBytes > queueLimit || c.queueBytes > queueLimit-payloadBytes {
+		return collectorEnqueueBudgetExceeded, c.queueBytes
+	}
+
+	item.accountedSize = payloadBytes
+	select {
+	case c.queue <- item:
+		c.queueBytes += payloadBytes
+		return collectorEnqueueAccepted, c.queueBytes
+	default:
+		return collectorEnqueueQueueFull, c.queueBytes
+	}
+}
+
+func (c *CollectorClient) payloadByteLimit() int64 {
+	if c.maxPayloadBytes > 0 {
+		return c.maxPayloadBytes
+	}
+	return defaultCollectorMaxPayloadBytes
+}
+
+func (c *CollectorClient) queueByteLimit() int64 {
+	if c.maxQueueBytes > 0 {
+		return c.maxQueueBytes
+	}
+	return defaultCollectorMaxQueueBytes
+}
+
+func (c *CollectorClient) queuedPayloadBytes() int64 {
+	c.queueMu.Lock()
+	defer c.queueMu.Unlock()
+	return c.queueBytes
+}
+
+func (c *CollectorClient) releaseQueuedPayload(item collectorItem) {
+	if item.accountedSize <= 0 {
+		return
+	}
+	c.queueMu.Lock()
+	c.queueBytes -= item.accountedSize
+	if c.queueBytes < 0 {
+		c.queueBytes = 0
+	}
+	c.queueMu.Unlock()
+}
+
+func (c *CollectorClient) drainQueue() (int64, int64) {
+	c.queueMu.Lock()
+	defer c.queueMu.Unlock()
+
+	var droppedItems int64
+	var droppedBytes int64
+	for {
+		select {
+		case item, ok := <-c.queue:
+			if !ok {
+				if c.queueBytes < 0 {
+					c.queueBytes = 0
+				}
+				return droppedItems, droppedBytes
+			}
+			c.queueBytes -= item.accountedSize
+			droppedItems++
+			droppedBytes += item.accountedSize
+		default:
+			if c.queueBytes < 0 {
+				c.queueBytes = 0
+			}
+			return droppedItems, droppedBytes
+		}
 	}
 }
 
@@ -242,41 +432,163 @@ func (c *CollectorClient) Stop() {
 		return
 	}
 	c.stopOnce.Do(func() {
-		c.cancel()
-		c.wg.Wait()
+		c.queueMu.Lock()
+		c.stopped = true
+		if c.queue != nil {
+			close(c.queue)
+		}
+		c.queueMu.Unlock()
+
+		workerDone := c.done
+		if workerDone == nil {
+			alreadyDone := make(chan struct{})
+			close(alreadyDone)
+			workerDone = alreadyDone
+		}
+
+		timedOut := false
+		timer := time.NewTimer(c.collectorStopTimeout())
+		select {
+		case <-workerDone:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		case <-timer.C:
+			timedOut = true
+			c.recordInflightDrop()
+			if c.cancel != nil {
+				c.cancel()
+			}
+
+			cancelTimer := time.NewTimer(defaultCollectorCancelWait)
+			select {
+			case <-workerDone:
+				if !cancelTimer.Stop() {
+					select {
+					case <-cancelTimer.C:
+					default:
+					}
+				}
+			case <-cancelTimer.C:
+				c.recordInflightDrop()
+			}
+		}
+
+		if !timedOut && c.cancel != nil {
+			c.cancel()
+		}
+		droppedItems, droppedBytes := c.drainQueue()
+		c.stopDropItems.Add(droppedItems)
+		c.stopDropBytes.Add(droppedBytes)
+
+		if totalDropped := c.stopDropItems.Load(); totalDropped > 0 {
+			event := log.Warn().
+				Int64("payloads_dropped", totalDropped).
+				Int64("payload_bytes_dropped", c.stopDropBytes.Load())
+			if timedOut {
+				event.Msg("collector shutdown deadline reached, dropping pending payloads")
+			} else {
+				event.Msg("collector stopped with undelivered payloads")
+			}
+		}
 	})
 }
 
+func (c *CollectorClient) collectorStopTimeout() time.Duration {
+	if c.stopTimeout > 0 {
+		return c.stopTimeout
+	}
+	return defaultCollectorStopTimeout
+}
+
+func (c *CollectorClient) beginInflight(item collectorItem) {
+	c.inflightMu.Lock()
+	c.inflightBytes = item.accountedSize
+	c.inflightDropped = false
+	c.inflight = true
+	c.inflightMu.Unlock()
+}
+
+func (c *CollectorClient) finishInflight() {
+	c.inflightMu.Lock()
+	c.inflight = false
+	c.inflightBytes = 0
+	c.inflightMu.Unlock()
+}
+
+func (c *CollectorClient) recordInflightDrop() {
+	c.inflightMu.Lock()
+	if !c.inflight || c.inflightDropped {
+		c.inflightMu.Unlock()
+		return
+	}
+	c.inflightDropped = true
+	droppedBytes := c.inflightBytes
+	c.inflightMu.Unlock()
+
+	c.stopDropItems.Add(1)
+	c.stopDropBytes.Add(droppedBytes)
+}
+
 func (c *CollectorClient) worker() {
-	defer c.wg.Done()
+	if c.done != nil {
+		defer close(c.done)
+	}
 	for {
+		if c.ctx.Err() != nil {
+			return
+		}
 		select {
 		case <-c.ctx.Done():
 			return
-		case item := <-c.queue:
-			c.sendWithRetry(c.ctx, item)
+		case item, ok := <-c.queue:
+			if !ok {
+				return
+			}
+			c.releaseQueuedPayload(item)
+			if c.ctx.Err() != nil {
+				c.beginInflight(item)
+				c.recordInflightDrop()
+				c.finishInflight()
+				return
+			}
+			c.beginInflight(item)
+			completed := c.sendWithRetry(c.ctx, item)
+			if !completed {
+				c.recordInflightDrop()
+			}
+			c.finishInflight()
+			if c.ctx.Err() != nil {
+				return
+			}
 		}
 	}
 }
 
-func (c *CollectorClient) sendWithRetry(ctx context.Context, item collectorItem) {
+func (c *CollectorClient) sendWithRetry(ctx context.Context, item collectorItem) bool {
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		if ctx.Err() != nil {
-			return
+			return false
 		}
-		if err := c.send(ctx, item.payload); err == nil {
-			return
+		if err := c.send(ctx, item); err == nil {
+			return true
 		} else {
 			lastErr = err
 			if !isRetryableSendError(err) {
 				break
 			}
+			if ctx.Err() != nil {
+				return false
+			}
 			timer := time.NewTimer(time.Duration(attempt+1) * 500 * time.Millisecond)
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				return
+				return false
 			case <-timer.C:
 			}
 		}
@@ -285,30 +597,35 @@ func (c *CollectorClient) sendWithRetry(ctx context.Context, item collectorItem)
 	if lastErr != nil {
 		c.logSendError(item.requestID, lastErr)
 	}
+	return ctx.Err() == nil
 }
 
-func (c *CollectorClient) send(ctx context.Context, payload []byte) error {
+func (c *CollectorClient) send(ctx context.Context, item collectorItem) error {
 	cfg := c.snapshot()
 	if !cfg.enabled {
 		return nil
 	}
+	if cfg.backendURL != item.identity.backendURL || cfg.apiKey != item.identity.apiKey {
+		log.Debug().Str("request_id", item.requestID).Msg("collector target changed, dropping queued payload")
+		return nil
+	}
 
-	collectorURL, err := url.JoinPath(cfg.backendURL, "collector")
+	collectorURL, err := safeurl.JoinHTTPPath(item.identity.backendURL, "collector")
 	if err != nil {
 		return err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", collectorURL, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, "POST", collectorURL, bytes.NewReader(item.payload))
 	if err != nil {
 		return err
 	}
 
-	req.Header.Set("Authorization", "Bearer "+cfg.apiKey)
+	req.Header.Set("Authorization", "Bearer "+item.identity.apiKey)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return err
+		return safeurl.RedactTransportError(err, req.URL)
 	}
 	defer resp.Body.Close()
 
@@ -317,33 +634,15 @@ func (c *CollectorClient) send(ctx context.Context, payload []byte) error {
 		return nil
 	}
 
-	return &httpStatusError{
-		statusCode: resp.StatusCode,
-		detail:     readResponseSnippet(resp.Body),
-	}
+	return &httpStatusError{statusCode: resp.StatusCode}
 }
 
 type httpStatusError struct {
 	statusCode int
-	detail     string
 }
 
 func (e *httpStatusError) Error() string {
-	if e.detail == "" {
-		return "unexpected status code: " + strconv.Itoa(e.statusCode) + " (" + http.StatusText(e.statusCode) + ")"
-	}
-	return "unexpected status code: " + strconv.Itoa(e.statusCode) + " (" + http.StatusText(e.statusCode) + "): " + e.detail
-}
-
-func readResponseSnippet(r io.Reader) string {
-	if r == nil {
-		return ""
-	}
-	body, err := io.ReadAll(io.LimitReader(r, 2048))
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(body))
+	return "unexpected status code: " + strconv.Itoa(e.statusCode) + " (" + http.StatusText(e.statusCode) + ")"
 }
 
 func isRetryableSendError(err error) bool {
@@ -369,14 +668,11 @@ func (c *CollectorClient) logSendError(requestID string, err error) {
 
 	var statusErr *httpStatusError
 	if errors.As(err, &statusErr) && (statusErr.statusCode == http.StatusUnauthorized || statusErr.statusCode == http.StatusForbidden) {
-		event := log.Warn().
+		log.Warn().
 			Str("request_id", requestID).
 			Int("status_code", statusErr.statusCode).
-			Str("status_text", http.StatusText(statusErr.statusCode))
-		if statusErr.detail != "" {
-			event = event.Str("detail", statusErr.detail)
-		}
-		event.Msg("collector authentication rejected by lunargate.ai; go to app.lunargate.ai and check data_sharing.api_key")
+			Str("status_text", http.StatusText(statusErr.statusCode)).
+			Msg("collector authentication rejected by lunargate.ai; go to app.lunargate.ai and check general.api_key")
 		return
 	}
 

@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,6 +10,95 @@ import (
 
 	"github.com/lunargate-ai/gateway/pkg/models"
 )
+
+func TestResponsesStreamProxy_EmitsFailedInsteadOfCompletedAfterStreamError(t *testing.T) {
+	rec := httptest.NewRecorder()
+	proxy := newResponsesStreamProxy(rec)
+	partial := "data: {\"id\":\"resp_partial\",\"object\":\"chat.completion.chunk\",\"created\":123,\"model\":\"gpt\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n"
+	if _, err := proxy.Write([]byte(partial)); err != nil {
+		t.Fatalf("write partial chunk: %v", err)
+	}
+	proxy.RecordStreamError(errors.New("upstream closed early"))
+	if err := proxy.finalize(); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+
+	events := decodeSSEEvents(t, rec.Body.String())
+	foundFailed := false
+	for _, event := range events {
+		switch event["type"] {
+		case "response.completed":
+			t.Fatal("truncated stream must not emit response.completed")
+		case "response.failed":
+			foundFailed = true
+			response, _ := event["response"].(map[string]interface{})
+			if response["status"] != "failed" {
+				t.Fatalf("failed response status = %#v", response["status"])
+			}
+		}
+	}
+	if !foundFailed {
+		t.Fatal("expected response.failed event")
+	}
+}
+
+func TestResponsesStreamProxy_ReplacesChatCompletionID(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	proxy := newResponsesStreamProxy(recorder)
+	chunk := "data: {\"id\":\"chatcmpl-upstream\",\"object\":\"chat.completion.chunk\",\"created\":123,\"model\":\"gpt\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n"
+	if _, err := proxy.Write([]byte(chunk)); err != nil {
+		t.Fatalf("write stream chunk: %v", err)
+	}
+	if err := proxy.finalize(); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	if !strings.HasPrefix(proxy.responseID, "resp_") {
+		t.Fatalf("translated response ID = %q, want resp_ prefix", proxy.responseID)
+	}
+	if strings.Contains(recorder.Body.String(), "chatcmpl-upstream") {
+		t.Fatalf("upstream Chat Completions ID leaked into Responses stream: %s", recorder.Body.String())
+	}
+	for _, event := range decodeSSEEvents(t, recorder.Body.String()) {
+		if responseID, ok := event["response_id"].(string); ok && responseID != proxy.responseID {
+			t.Fatalf("event response_id = %q, want stable %q", responseID, proxy.responseID)
+		}
+		if response, ok := event["response"].(map[string]interface{}); ok {
+			if id, ok := response["id"].(string); ok && id != proxy.responseID {
+				t.Fatalf("response id = %q, want stable %q", id, proxy.responseID)
+			}
+		}
+	}
+}
+
+func TestResponsesStreamProxy_ReturnsDownstreamFlushError(t *testing.T) {
+	writer := &responsesFlushErrorWriter{header: make(http.Header)}
+	proxy := newResponsesStreamProxy(writer)
+
+	err := proxy.ensureStarted()
+	if !errors.Is(err, errResponsesDownstreamFlush) {
+		t.Fatalf("ensureStarted error = %v, want downstream flush error", err)
+	}
+}
+
+var errResponsesDownstreamFlush = errors.New("injected responses downstream flush failure")
+
+type responsesFlushErrorWriter struct {
+	header http.Header
+}
+
+func (w *responsesFlushErrorWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *responsesFlushErrorWriter) WriteHeader(int) {}
+
+func (w *responsesFlushErrorWriter) Write(payload []byte) (int, error) {
+	return len(payload), nil
+}
+
+func (w *responsesFlushErrorWriter) FlushError() error {
+	return errResponsesDownstreamFlush
+}
 
 func TestResponsesStreamProxy_ToolCallIDsStayStableAcrossCallAndFC(t *testing.T) {
 	rec := httptest.NewRecorder()
@@ -80,24 +170,70 @@ func TestResponsesStreamProxy_ToolCallIDsStayStableAcrossCallAndFC(t *testing.T)
 	}
 }
 
-func TestResponsesStreamProxy_MergeTextDelta_DeduplicatesDoneSnapshots(t *testing.T) {
+func TestResponsesStreamProxy_MergeTextDelta_PreservesRepeatedDeltas(t *testing.T) {
 	proxy := newResponsesStreamProxy(httptest.NewRecorder())
 
-	if got := proxy.mergeTextDelta("Hello"); got != "Hello" {
+	if got, err := proxy.mergeTextDelta("ha"); err != nil || got != "ha" {
 		t.Fatalf("expected first delta to pass through, got %q", got)
 	}
-	if got := proxy.mergeTextDelta("Hello"); got != "" {
-		t.Fatalf("expected exact duplicate to be dropped, got %q", got)
+	if got, err := proxy.mergeTextDelta("ha"); err != nil || got != "ha" {
+		t.Fatalf("expected repeated delta to pass through, got %q", got)
 	}
-	if got := proxy.mergeTextDelta("Hello world"); got != " world" {
-		t.Fatalf("expected snapshot delta tail, got %q", got)
+	if got, err := proxy.mergeReasoningDelta("think"); err != nil || got != "think" {
+		t.Fatalf("expected first reasoning delta to pass through, got %q", got)
 	}
-	if got := proxy.mergeTextDelta(" world"); got != "" {
-		t.Fatalf("expected overlapping suffix to be dropped, got %q", got)
+	if got, err := proxy.mergeReasoningDelta("think"); err != nil || got != "think" {
+		t.Fatalf("expected repeated reasoning delta to pass through, got %q", got)
 	}
-	if final := proxy.text.String(); final != "Hello world" {
-		t.Fatalf("expected merged text to be %q, got %q", "Hello world", final)
+	if final := proxy.text.String(); final != "haha" {
+		t.Fatalf("expected merged text to be %q, got %q", "haha", final)
 	}
+	if final := proxy.reasoningText.String(); final != "thinkthink" {
+		t.Fatalf("expected merged reasoning to be %q, got %q", "thinkthink", final)
+	}
+}
+
+func TestResponsesStreamProxy_ToolCallIDIsExactAndOpaque(t *testing.T) {
+	t.Run("internal whitespace is preserved", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		proxy := newResponsesStreamProxy(recorder)
+		index := 0
+		if err := proxy.processToolCallDelta(models.ToolCall{
+			Index: &index,
+			ID:    "opaque call id",
+			Type:  "function",
+			Function: models.ToolCallFunction{
+				Name:      "lookup",
+				Arguments: "{}",
+			},
+		}); err != nil {
+			t.Fatalf("process exact tool id: %v", err)
+		}
+		if err := proxy.emitCompleted(); err != nil {
+			t.Fatalf("emit completed: %v", err)
+		}
+		for _, event := range decodeSSEEvents(t, recorder.Body.String()) {
+			if event["type"] != "response.output_item.added" {
+				continue
+			}
+			item, _ := event["item"].(map[string]interface{})
+			if item != nil && item["type"] == "function_call" && item["call_id"] != "opaque call id" {
+				t.Fatalf("call_id = %#v, want exact opaque value", item["call_id"])
+			}
+		}
+	})
+
+	t.Run("surrounding whitespace fails closed", func(t *testing.T) {
+		proxy := newResponsesStreamProxy(httptest.NewRecorder())
+		index := 0
+		err := proxy.processToolCallDelta(models.ToolCall{Index: &index, ID: " call_1 "})
+		if !errors.Is(err, errResponsesStreamInvalidToolID) {
+			t.Fatalf("error = %v, want %v", err, errResponsesStreamInvalidToolID)
+		}
+		if len(proxy.toolCalls) != 0 {
+			t.Fatalf("invalid id mutated tool state: %#v", proxy.toolCalls)
+		}
+	})
 }
 
 func TestResponsesStreamProxy_ToolOnlyTurnDoesNotEmitEmptyAssistantMessage(t *testing.T) {
@@ -183,6 +319,72 @@ func TestResponsesStreamProxy_ErrorPassthroughKeepsContentType(t *testing.T) {
 	if !strings.Contains(body, `"invalid_request_error"`) {
 		t.Fatalf("expected passthrough error payload, got %q", body)
 	}
+}
+
+func TestResponsesStreamProxy_IncludesUsageInCompletedResponse(t *testing.T) {
+	rec := httptest.NewRecorder()
+	proxy := newResponsesStreamProxy(rec)
+
+	chunk := "data: {\"id\":\"resp_usage\",\"object\":\"chat.completion.chunk\",\"created\":123,\"model\":\"gpt-5.3-codex\",\"choices\":[],\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":9,\"total_tokens\":26}}\n\n"
+	if _, err := proxy.Write([]byte(chunk)); err != nil {
+		t.Fatalf("write usage chunk: %v", err)
+	}
+	if _, err := proxy.Write([]byte("data: [DONE]\n\n")); err != nil {
+		t.Fatalf("write done chunk: %v", err)
+	}
+	if err := proxy.finalize(); err != nil {
+		t.Fatalf("finalize error: %v", err)
+	}
+
+	events := decodeSSEEvents(t, rec.Body.String())
+	for _, event := range events {
+		if event["type"] != "response.completed" {
+			continue
+		}
+		response, _ := event["response"].(map[string]interface{})
+		usage, _ := response["usage"].(map[string]interface{})
+		if usage == nil {
+			t.Fatal("expected response.completed usage")
+		}
+		if usage["input_tokens"] != float64(17) || usage["output_tokens"] != float64(9) || usage["total_tokens"] != float64(26) {
+			t.Fatalf("unexpected usage: %#v", usage)
+		}
+		return
+	}
+	t.Fatal("expected response.completed event")
+}
+
+func TestResponsesStreamProxy_MergesSplitUsageAcrossChunks(t *testing.T) {
+	rec := httptest.NewRecorder()
+	proxy := newResponsesStreamProxy(rec)
+
+	chunks := []string{
+		"data: {\"id\":\"resp_usage\",\"object\":\"chat.completion.chunk\",\"created\":123,\"model\":\"claude\",\"choices\":[],\"usage\":{\"prompt_tokens\":17,\"completion_tokens\":0,\"total_tokens\":17}}\n\n",
+		"data: {\"id\":\"resp_usage\",\"object\":\"chat.completion.chunk\",\"created\":123,\"model\":\"claude\",\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":9,\"total_tokens\":0}}\n\n",
+		"data: [DONE]\n\n",
+	}
+	for _, chunk := range chunks {
+		if _, err := proxy.Write([]byte(chunk)); err != nil {
+			t.Fatalf("write chunk: %v", err)
+		}
+	}
+	if err := proxy.finalize(); err != nil {
+		t.Fatalf("finalize error: %v", err)
+	}
+
+	events := decodeSSEEvents(t, rec.Body.String())
+	for _, event := range events {
+		if event["type"] != "response.completed" {
+			continue
+		}
+		response, _ := event["response"].(map[string]interface{})
+		usage, _ := response["usage"].(map[string]interface{})
+		if usage["input_tokens"] != float64(17) || usage["output_tokens"] != float64(9) || usage["total_tokens"] != float64(26) {
+			t.Fatalf("unexpected merged usage: %#v", usage)
+		}
+		return
+	}
+	t.Fatal("expected response.completed event")
 }
 
 func TestResponsesStreamProxy_EventOrderingWithTextAndToolCall(t *testing.T) {
@@ -400,9 +602,8 @@ func TestResponsesStreamProxy_ReasoningLifecycleAndCompletedSummary(t *testing.T
 	if reasoningObj == nil {
 		t.Fatalf("expected response.completed to include reasoning object")
 	}
-	completedSummary, _ := reasoningObj["summary"].([]interface{})
-	if len(completedSummary) == 0 {
-		t.Fatalf("expected response.completed reasoning summary")
+	if reasoningObj["summary"] != nil {
+		t.Fatalf("response reasoning config must not duplicate generated summary: %#v", reasoningObj)
 	}
 }
 
@@ -451,6 +652,31 @@ func TestResponsesStreamProxy_FunctionArgumentsDoneIncludesName(t *testing.T) {
 	}
 }
 
+func TestResponsesStreamProxyWritesNamedSSEEvents(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	proxy := newResponsesStreamProxy(recorder)
+
+	if err := proxy.writeEvent(map[string]interface{}{
+		"type": "response.created",
+		"response": map[string]interface{}{
+			"id":     "resp_named",
+			"object": "response",
+			"status": "in_progress",
+		},
+	}); err != nil {
+		t.Fatalf("write event: %v", err)
+	}
+
+	body := recorder.Body.String()
+	if !strings.HasPrefix(body, "event: response.created\ndata: ") {
+		t.Fatalf("named SSE event missing: %q", body)
+	}
+	events := decodeSSEEvents(t, body)
+	if len(events) != 1 || events[0]["type"] != "response.created" {
+		t.Fatalf("decoded events = %#v", events)
+	}
+}
+
 func decodeSSEEvents(t *testing.T, body string) []map[string]interface{} {
 	t.Helper()
 	frames := strings.Split(body, "\n\n")
@@ -460,10 +686,14 @@ func decodeSSEEvents(t *testing.T, body string) []map[string]interface{} {
 		if frame == "" {
 			continue
 		}
-		if !strings.HasPrefix(frame, "data:") {
-			continue
+		var dataLines []string
+		for _, line := range strings.Split(frame, "\n") {
+			line = strings.TrimSuffix(line, "\r")
+			if strings.HasPrefix(line, "data:") {
+				dataLines = append(dataLines, strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " "))
+			}
 		}
-		payload := strings.TrimSpace(strings.TrimPrefix(frame, "data:"))
+		payload := strings.TrimSpace(strings.Join(dataLines, "\n"))
 		if payload == "" || payload == "[DONE]" {
 			continue
 		}
@@ -487,7 +717,7 @@ func containsEventType(events []map[string]interface{}, targetType string) bool 
 
 func assertSequenceNumbersMonotonic(t *testing.T, events []map[string]interface{}) {
 	t.Helper()
-	prev := 0
+	prev := -1
 	for i, evt := range events {
 		raw, ok := evt["sequence_number"]
 		if !ok {

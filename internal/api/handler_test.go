@@ -2,7 +2,10 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -157,15 +160,23 @@ func TestChatCompletions_RetryExhausted429PreservesUpstreamStatus(t *testing.T) 
 	if resp.Error.Type != "rate_limit_error" {
 		t.Fatalf("expected error type %q, got %q", "rate_limit_error", resp.Error.Type)
 	}
-	if resp.Error.Message != "provider returned status 429" {
-		t.Fatalf("expected error message %q, got %q", "provider returned status 429", resp.Error.Message)
+	if resp.Error.Message != "too many requests" {
+		t.Fatalf("expected error message %q, got %q", "too many requests", resp.Error.Message)
 	}
 }
 
 func TestChatCompletions_NoRetryDisablesPerTargetRetriesAndStillFallsBack(t *testing.T) {
 	primaryCalls := 0
+	primaryModel := ""
 	primaryUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		primaryCalls++
+		var payload struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode primary request: %v", err)
+		}
+		primaryModel = payload.Model
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write([]byte(`{"error":{"message":"try fallback","type":"server_error"}}`))
@@ -173,8 +184,16 @@ func TestChatCompletions_NoRetryDisablesPerTargetRetriesAndStillFallsBack(t *tes
 	defer primaryUpstream.Close()
 
 	fallbackCalls := 0
+	fallbackModel := ""
 	fallbackUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fallbackCalls++
+		var payload struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode fallback request: %v", err)
+		}
+		fallbackModel = payload.Model
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"chatcmpl-fallback","object":"chat.completion","created":1,"model":"fallback-gpt","choices":[{"index":0,"message":{"role":"assistant","content":"ok-from-fallback"},"finish_reason":"stop"}]}`))
 	}))
@@ -208,7 +227,7 @@ func TestChatCompletions_NoRetryDisablesPerTargetRetriesAndStillFallsBack(t *tes
 	metrics := observability.NewMetricsWithRegisterer(prometheus.NewRegistry())
 	h := NewHandler(reg, router, fb, cache, streamer, metrics, nil, nil, nil)
 
-	payload := models.UnifiedRequest{Model: "gpt-primary", Messages: []models.Message{{Role: "user", Content: "hi"}}}
+	payload := models.UnifiedRequest{Messages: []models.Message{{Role: "user", Content: "hi"}}}
 	b, err := json.Marshal(payload)
 	if err != nil {
 		t.Fatalf("failed to marshal payload: %v", err)
@@ -228,11 +247,197 @@ func TestChatCompletions_NoRetryDisablesPerTargetRetriesAndStillFallsBack(t *tes
 	if fallbackCalls != 1 {
 		t.Fatalf("expected fallback to run after the single primary failure, got %d calls", fallbackCalls)
 	}
+	if primaryModel != "gpt-primary" {
+		t.Fatalf("primary upstream model = %q, want %q", primaryModel, "gpt-primary")
+	}
+	if fallbackModel != "gpt-fallback" {
+		t.Fatalf("fallback upstream model = %q, want %q", fallbackModel, "gpt-fallback")
+	}
 	if got := rec.Header().Get("X-LunarGate-Provider"); got != "fallback" {
 		t.Fatalf("expected fallback provider in response header, got %q", got)
 	}
 	if gauge := testutil.ToFloat64(metrics.CircuitBreakerState.WithLabelValues("fallback")); gauge != 0 {
 		t.Fatalf("expected fallback circuit breaker gauge to remain closed, got %v", gauge)
+	}
+}
+
+func TestCallEmbeddingsProviderBindsTargetModel(t *testing.T) {
+	upstreamModel := ""
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode embeddings request: %v", err)
+		}
+		upstreamModel = payload.Model
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[],"model":"embedding-fallback","usage":{"prompt_tokens":1,"total_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	reg := providers.NewRegistry(map[string]config.ProviderConfig{
+		"fallback": {Type: "openai", APIKey: "dummy", BaseURL: upstream.URL},
+	})
+	h := &Handler{registry: reg, providerClients: newProviderClientRegistry(nil)}
+	req := &models.EmbeddingsRequest{Model: "primary/embedding-primary", Input: "hello"}
+	resp, err := h.callEmbeddingsProvider(context.Background(), routing.Target{
+		Provider: "fallback",
+		Model:    "embedding-fallback",
+	}, req, nil)
+	if err != nil {
+		t.Fatalf("callEmbeddingsProvider returned error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if upstreamModel != "embedding-fallback" {
+		t.Fatalf("fallback upstream model = %q, want %q", upstreamModel, "embedding-fallback")
+	}
+}
+
+func TestChatCompletionsRejectsUnavailableBareModel(t *testing.T) {
+	h := newUnavailableModelTestHandler(t)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(
+		`{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}`,
+	))
+	rec := httptest.NewRecorder()
+
+	h.ChatCompletions(rec, req)
+	assertModelNotFoundError(t, rec)
+}
+
+func TestChatCompletionsNormalizesAutoModelHeader(t *testing.T) {
+	upstreamModel := ""
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		upstreamModel = payload.Model
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-auto","object":"chat.completion","created":1,"model":"mock-gpt","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer upstream.Close()
+
+	reg := providers.NewRegistry(map[string]config.ProviderConfig{
+		"openai": {Type: "openai", APIKey: "dummy", BaseURL: upstream.URL},
+	})
+	router := routing.NewEngine(config.RoutingConfig{
+		DefaultStrategy: "weighted",
+		Routes: []config.RouteConfig{{
+			Name:    "default",
+			Match:   config.MatchConfig{Path: "*"},
+			Targets: []config.TargetConfig{{Provider: "openai", Model: "mock-gpt", Weight: 1}},
+		}},
+	})
+	h := NewHandler(
+		reg,
+		router,
+		resilience.NewFallbackExecutor(
+			resilience.NewRetrier(config.RetryConfig{Enabled: false}),
+			resilience.NewCircuitBreakerManager(),
+		),
+		middleware.NewCache(config.CacheConfig{Enabled: false}),
+		streaming.NewHandler(),
+		observability.NewMetricsWithRegisterer(prometheus.NewRegistry()),
+		nil,
+		nil,
+		nil,
+	)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(
+		`{"model":"client-placeholder","messages":[{"role":"user","content":"hello"}]}`,
+	))
+	req.Header.Set("X-LunarGate-Model", "lunargate/auto")
+	rec := httptest.NewRecorder()
+
+	h.ChatCompletions(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if upstreamModel != "mock-gpt" {
+		t.Fatalf("upstream model = %q, want route-selected model", upstreamModel)
+	}
+}
+
+func TestEmbeddingsRejectsUnavailableBareModel(t *testing.T) {
+	h := newUnavailableModelTestHandler(t)
+	req := httptest.NewRequest(http.MethodPost, "/v1/embeddings", strings.NewReader(
+		`{"model":"text-embedding-ada-002","input":"hello"}`,
+	))
+	rec := httptest.NewRecorder()
+
+	h.Embeddings(rec, req)
+	assertModelNotFoundError(t, rec)
+}
+
+func TestResolveEmbeddingsRouteDoesNotBypassTargetPolicy(t *testing.T) {
+	reg := providers.NewRegistry(map[string]config.ProviderConfig{
+		"allowed": {Type: "openai", APIKey: "dummy", BaseURL: "http://127.0.0.1:1"},
+		"blocked": {Type: "openai", APIKey: "dummy", BaseURL: "http://127.0.0.1:2"},
+	})
+	router := routing.NewEngine(config.RoutingConfig{
+		DefaultStrategy: "weighted",
+		Routes: []config.RouteConfig{{
+			Name:    "embeddings-policy",
+			Match:   config.MatchConfig{Path: "/v1/embeddings"},
+			Targets: []config.TargetConfig{{Provider: "allowed", Model: "text-embedding-3-small", Weight: 1}},
+		}},
+	})
+	h := &Handler{registry: reg, router: router}
+
+	_, err := h.resolveEmbeddingsRoute(context.Background(), "/v1/embeddings", map[string]string{
+		"x-lunargate-provider": "blocked",
+		"x-lunargate-model":    "blocked/text-embedding-3-small",
+	}, "blocked")
+	var unavailable *routing.RequestedTargetUnavailableError
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("error = %T %v, want RequestedTargetUnavailableError", err, err)
+	}
+}
+
+func newUnavailableModelTestHandler(t *testing.T) *Handler {
+	t.Helper()
+	reg := providers.NewRegistry(map[string]config.ProviderConfig{
+		"openai": {Type: "openai", APIKey: "dummy", BaseURL: "http://127.0.0.1:1"},
+	})
+	router := routing.NewEngine(config.RoutingConfig{
+		DefaultStrategy: "weighted",
+		Routes: []config.RouteConfig{{
+			Name:    "default",
+			Match:   config.MatchConfig{Path: "*"},
+			Targets: []config.TargetConfig{{Provider: "openai", Model: "gpt-5.4", Weight: 1}},
+		}},
+	})
+	retrier := resilience.NewRetrier(config.RetryConfig{Enabled: false})
+	return NewHandler(
+		reg,
+		router,
+		resilience.NewFallbackExecutor(retrier, resilience.NewCircuitBreakerManager()),
+		middleware.NewCache(config.CacheConfig{Enabled: false}),
+		streaming.NewHandler(),
+		observability.NewMetricsWithRegisterer(prometheus.NewRegistry()),
+		nil,
+		nil,
+		nil,
+	)
+}
+
+func assertModelNotFoundError(t *testing.T, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	var response models.ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.Error.Param == nil || *response.Error.Param != "model" {
+		t.Fatalf("param = %#v, want model", response.Error.Param)
+	}
+	if response.Error.Code == nil || *response.Error.Code != "model_not_found" {
+		t.Fatalf("code = %#v, want model_not_found", response.Error.Code)
 	}
 }
 
@@ -517,8 +722,8 @@ func TestResponses_MapsToChatCompletions(t *testing.T) {
 	if out.Object != "response" {
 		t.Fatalf("expected response object, got %q", out.Object)
 	}
-	if out.OutputText != "ok" {
-		t.Fatalf("expected output_text %q, got %q", "ok", out.OutputText)
+	if got := responsesTextFromTypedResponseForTest(&out); got != "ok" {
+		t.Fatalf("expected output text %q, got %q", "ok", got)
 	}
 	if rec.Header().Get("X-LunarGate-Provider") == "" {
 		t.Fatalf("expected X-LunarGate-Provider header to be set")
@@ -574,8 +779,8 @@ func TestResponses_RoutesViaChatPathWhenOnlyChatRouteConfigured(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 		t.Fatalf("failed to unmarshal responses payload: %v", err)
 	}
-	if out.OutputText != "ok" {
-		t.Fatalf("expected output_text %q, got %q", "ok", out.OutputText)
+	if got := responsesTextFromTypedResponseForTest(&out); got != "ok" {
+		t.Fatalf("expected output text %q, got %q", "ok", got)
 	}
 }
 
@@ -628,8 +833,8 @@ func TestResponses_RoutesViaResponsesPathWhenResponsesRouteConfigured(t *testing
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 		t.Fatalf("failed to unmarshal responses payload: %v", err)
 	}
-	if out.OutputText != "ok-responses-route" {
-		t.Fatalf("expected output_text %q, got %q", "ok-responses-route", out.OutputText)
+	if got := responsesTextFromTypedResponseForTest(&out); got != "ok-responses-route" {
+		t.Fatalf("expected output text %q, got %q", "ok-responses-route", got)
 	}
 }
 
@@ -966,6 +1171,7 @@ func TestResponses_PreviousResponseIDResolvedLocallyForNonStreamFollowUp(t *test
 	streamer := streaming.NewHandler()
 	metrics := observability.NewMetricsWithRegisterer(prometheus.NewRegistry())
 	h := NewHandler(reg, router, fb, cache, streamer, metrics, nil, nil, nil)
+	h.UpdateProviderConfigs(cfgProviders)
 
 	firstPayload := []byte(`{"model":"lunargate/auto","input":"Call get_current_time once and then answer with a short sentence that includes the returned timestamp.","tools":[{"type":"function","name":"get_current_time","description":"Return the current UTC time in ISO 8601 format.","parameters":{"type":"object","properties":{"format":{"type":"string"}}}}],"tool_choice":"auto"}`)
 	firstReq := httptest.NewRequest(http.MethodPost, "http://example.com/v1/responses", bytes.NewReader(firstPayload))
@@ -979,8 +1185,11 @@ func TestResponses_PreviousResponseIDResolvedLocallyForNonStreamFollowUp(t *test
 	if err := json.Unmarshal(firstRec.Body.Bytes(), &firstResp); err != nil {
 		t.Fatalf("failed to unmarshal first responses payload: %v", err)
 	}
+	if !strings.HasPrefix(firstResp.ID, "resp_") {
+		t.Fatalf("translated response ID = %q, want resp_ prefix", firstResp.ID)
+	}
 
-	secondPayload := []byte(`{"model":"lunargate/auto","previous_response_id":"chatcmpl-tool-1","input":[{"type":"function_call_output","call_id":"call_time_1","output":"{\"iso\":\"2026-04-09T16:51:50Z\"}"}],"tools":[{"type":"function","name":"get_current_time","description":"Return the current UTC time in ISO 8601 format.","parameters":{"type":"object","properties":{"format":{"type":"string"}}}}],"tool_choice":"auto"}`)
+	secondPayload := []byte(fmt.Sprintf(`{"model":"lunargate/auto","previous_response_id":%q,"input":[{"type":"function_call_output","call_id":"call_time_1","output":"{\"iso\":\"2026-04-09T16:51:50Z\"}"}],"tools":[{"type":"function","name":"get_current_time","description":"Return the current UTC time in ISO 8601 format.","parameters":{"type":"object","properties":{"format":{"type":"string"}}}}],"tool_choice":"auto"}`, firstResp.ID))
 	secondReq := httptest.NewRequest(http.MethodPost, "http://example.com/v1/responses", bytes.NewReader(secondPayload))
 	secondRec := httptest.NewRecorder()
 	h.Responses(secondRec, secondReq)
@@ -992,8 +1201,8 @@ func TestResponses_PreviousResponseIDResolvedLocallyForNonStreamFollowUp(t *test
 	if err := json.Unmarshal(secondRec.Body.Bytes(), &secondResp); err != nil {
 		t.Fatalf("failed to unmarshal second responses payload: %v", err)
 	}
-	if secondResp.OutputText != "The current time is 2026-04-09T16:51:50Z." {
-		t.Fatalf("expected final assistant text, got %q", secondResp.OutputText)
+	if got := responsesTextFromTypedResponseForTest(&secondResp); got != "The current time is 2026-04-09T16:51:50Z." {
+		t.Fatalf("expected final assistant text, got %q", got)
 	}
 
 	if len(capturedBodies) != 2 {
@@ -1068,6 +1277,7 @@ func TestResponses_PreviousResponseIDResolvedLocallyForStreamFollowUp(t *testing
 	streamer := streaming.NewHandler()
 	metrics := observability.NewMetricsWithRegisterer(prometheus.NewRegistry())
 	h := NewHandler(reg, router, fb, cache, streamer, metrics, nil, nil, nil)
+	h.UpdateProviderConfigs(cfgProviders)
 
 	firstPayload := []byte(`{"model":"lunargate/auto","stream":true,"input":"Call get_current_time once and then answer with a short sentence that includes the returned timestamp.","tools":[{"type":"function","name":"get_current_time","description":"Return the current UTC time in ISO 8601 format.","parameters":{"type":"object","properties":{"format":{"type":"string"}}}}],"tool_choice":"auto"}`)
 	firstReq := httptest.NewRequest(http.MethodPost, "http://example.com/v1/responses", bytes.NewReader(firstPayload))
@@ -1086,11 +1296,11 @@ func TestResponses_PreviousResponseIDResolvedLocallyForStreamFollowUp(t *testing
 		responseObj, _ := evt["response"].(map[string]interface{})
 		firstResponseID, _ = responseObj["id"].(string)
 	}
-	if firstResponseID != "chatcmpl-stream-tool-1" {
-		t.Fatalf("expected cached first response id, got %q", firstResponseID)
+	if !strings.HasPrefix(firstResponseID, "resp_") {
+		t.Fatalf("translated streaming response ID = %q, want resp_ prefix", firstResponseID)
 	}
 
-	secondPayload := []byte(`{"model":"lunargate/auto","stream":true,"previous_response_id":"chatcmpl-stream-tool-1","input":[{"type":"function_call_output","call_id":"call_time_stream_1","output":"{\"iso\":\"2026-04-09T16:51:50Z\"}"}],"tools":[{"type":"function","name":"get_current_time","description":"Return the current UTC time in ISO 8601 format.","parameters":{"type":"object","properties":{"format":{"type":"string"}}}}],"tool_choice":"auto"}`)
+	secondPayload := []byte(fmt.Sprintf(`{"model":"lunargate/auto","stream":true,"previous_response_id":%q,"input":[{"type":"function_call_output","call_id":"call_time_stream_1","output":"{\"iso\":\"2026-04-09T16:51:50Z\"}"}],"tools":[{"type":"function","name":"get_current_time","description":"Return the current UTC time in ISO 8601 format.","parameters":{"type":"object","properties":{"format":{"type":"string"}}}}],"tool_choice":"auto"}`, firstResponseID))
 	secondReq := httptest.NewRequest(http.MethodPost, "http://example.com/v1/responses", bytes.NewReader(secondPayload))
 	secondRec := httptest.NewRecorder()
 	h.Responses(secondRec, secondReq)
@@ -1125,6 +1335,10 @@ func TestCopyHeaders_PreservesExistingDestinationHeaders(t *testing.T) {
 	src.Set("X-Keep", "replace")
 	src.Set("X-New", "new-value")
 	src.Set("Content-Length", "123")
+	src.Set("Content-Encoding", "gzip")
+	src.Set("Set-Cookie", "session=secret")
+	src.Set("Connection", "X-Hop")
+	src.Set("X-Hop", "private")
 
 	copyHeaders(dst, src)
 
@@ -1136,6 +1350,11 @@ func TestCopyHeaders_PreservesExistingDestinationHeaders(t *testing.T) {
 	}
 	if got := dst.Get("Content-Length"); got != "" {
 		t.Fatalf("expected Content-Length to be skipped, got %q", got)
+	}
+	for _, key := range []string{"Content-Encoding", "Set-Cookie", "Connection", "X-Hop"} {
+		if got := dst.Get(key); got != "" {
+			t.Fatalf("expected unsafe header %s to be skipped, got %q", key, got)
+		}
 	}
 }
 
@@ -1204,5 +1423,84 @@ func TestChatCompletions_UpstreamRequestTypeResponses_UsesResponsesEndpoint(t *t
 	}
 	if choice, _ := capturedBody["tool_choice"].(string); choice != "auto" {
 		t.Fatalf("expected responses upstream tool_choice=auto to be preserved, got %q", choice)
+	}
+}
+
+func TestResponses_NativeResponsesStreamPreservesRepeatedDeltasWithoutSnapshots(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			t.Fatalf("expected upstream path /v1/responses, got %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		events := []string{
+			`{"type":"response.created","sequence_number":0,"response":{"id":"resp_native","object":"response","created_at":123,"status":"in_progress","model":"gpt-native","output":[]}}`,
+			`{"type":"response.output_text.delta","sequence_number":1,"response_id":"resp_native","item_id":"msg_native","output_index":0,"content_index":0,"delta":"ha"}`,
+			`{"type":"response.output_text.delta","sequence_number":2,"response_id":"resp_native","item_id":"msg_native","output_index":0,"content_index":0,"delta":"ha"}`,
+			`{"type":"response.output_text.done","sequence_number":3,"response_id":"resp_native","item_id":"msg_native","output_index":0,"content_index":0,"text":"haha"}`,
+			`{"type":"response.content_part.done","sequence_number":4,"response_id":"resp_native","item_id":"msg_native","output_index":0,"content_index":0,"part":{"type":"output_text","text":"haha"}}`,
+			`{"type":"response.output_item.done","sequence_number":5,"response_id":"resp_native","output_index":0,"item":{"id":"msg_native","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"haha"}]}}`,
+			`{"type":"response.completed","sequence_number":6,"response":{"id":"resp_native","object":"response","created_at":123,"status":"completed","model":"gpt-native","output":[{"id":"msg_native","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"haha"}]}],"output_text":"haha","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`,
+		}
+		for _, event := range events {
+			_, _ = w.Write([]byte("data: " + event + "\n\n"))
+		}
+	}))
+	defer upstream.Close()
+
+	providerID := "openai"
+	reg := providers.NewRegistry(map[string]config.ProviderConfig{
+		providerID: {Type: "openai", APIKey: "dummy", BaseURL: upstream.URL + "/v1"},
+	})
+	router := routing.NewEngine(config.RoutingConfig{
+		DefaultStrategy: "weighted",
+		Routes: []config.RouteConfig{{
+			Name:  "native-responses-stream",
+			Match: config.MatchConfig{Path: "/v1/responses"},
+			Targets: []config.TargetConfig{{
+				Provider:            providerID,
+				Model:               "gpt-native",
+				Weight:              1,
+				UpstreamRequestType: "responses",
+			}},
+		}},
+	})
+	retrier := resilience.NewRetrier(config.RetryConfig{Enabled: false})
+	cbm := resilience.NewCircuitBreakerManager()
+	fb := resilience.NewFallbackExecutor(retrier, cbm)
+	cache := middleware.NewCache(config.CacheConfig{Enabled: false})
+	streamer := streaming.NewHandler()
+	metrics := observability.NewMetricsWithRegisterer(prometheus.NewRegistry())
+	h := NewHandler(reg, router, fb, cache, streamer, metrics, nil, nil, nil)
+
+	payload := []byte(`{"model":"lunargate/auto","stream":true,"input":"laugh"}`)
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/v1/responses", bytes.NewReader(payload))
+	rec := httptest.NewRecorder()
+	h.Responses(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	events := decodeSSEEvents(t, rec.Body.String())
+	var deltas []string
+	var completed map[string]interface{}
+	for _, event := range events {
+		switch event["type"] {
+		case "response.output_text.delta":
+			if delta, _ := event["delta"].(string); delta != "" {
+				deltas = append(deltas, delta)
+			}
+		case "response.completed":
+			completed, _ = event["response"].(map[string]interface{})
+		}
+	}
+	if len(deltas) != 2 || deltas[0] != "ha" || deltas[1] != "ha" {
+		t.Fatalf("text deltas = %#v, want two repeated true deltas", deltas)
+	}
+	if completed == nil || completed["output_text"] != "haha" {
+		t.Fatalf("completed response = %#v, want output_text haha", completed)
+	}
+	usage, _ := completed["usage"].(map[string]interface{})
+	if usage == nil || usage["input_tokens"] != float64(3) || usage["output_tokens"] != float64(2) {
+		t.Fatalf("completed usage = %#v", usage)
 	}
 }

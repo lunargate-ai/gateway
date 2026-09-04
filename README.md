@@ -29,10 +29,21 @@ LunarGate is a Go-based AI gateway that lets you expose one stable endpoint to y
 
 ## Supported endpoints
 
-- `POST /v1/chat/completions`
-- `POST /v1/responses`
+- Chat Completions: create, stored list/retrieve/update/delete, and message listing under `/v1/chat/completions`
+- Responses: JSON/SSE `POST /v1/responses`, WebSocket `GET /v1/responses`, retrieve/delete/cancel/input-items, compaction, and input-token counting
+- Conversations: create/retrieve/update/delete and item create/list/retrieve/delete under `/v1/conversations`
 - `POST /v1/embeddings`
-- `GET /v1/models`
+- `GET /v1/models` and `GET /v1/models/{model}`
+- Operational endpoints: `GET /health`, `GET /ready`, and `GET /metrics`
+
+Stored Chat Completions lifecycle routes are fail-closed. Enable
+`providers.<id>.capabilities.chat_completions_lifecycle` only for an exact
+OpenAI-compatible upstream account that implements those routes.
+
+Native Responses lifecycle, cancellation, compaction, input-token counting,
+and Conversations require the matching provider capability. Responses sent
+to a native upstream also require a route target with
+`upstream_request_type: responses`.
 
 ## Provider support
 
@@ -92,14 +103,15 @@ providers:
   openai:
     api_key: "${OPENAI_API_KEY}"
     base_url: "https://api.openai.com/v1"
-    default_model: "gpt-5.2"
+    default_model: "gpt-5.6-terra"
 
 routing:
   routes:
     - name: "default"
       targets:
         - provider: openai
-          model: "gpt-5.2"
+          model: "gpt-5.6-terra"
+          weight: 100
 ```
 
 If you use environment placeholders such as `${OPENAI_API_KEY}`, either export them in your shell or place them in a local `.env` file:
@@ -128,7 +140,14 @@ For a runnable client example, see [`gateway-examples/`](https://github.com/luna
 
 ## Observability
 
-By default, LunarGate does not forward prompts or responses outside your infrastructure.
+By default, LunarGate does not connect to the Dashboard collector or remote-control channel, so ordinary client prompts and responses stay inside your infrastructure.
+
+LunarGate does perform a separate automatic release check. Its JSON payload contains only the running version and CPU architecture and has no installation identifier. Disable requests to `https://get.lunargate.ai/latest` completely with:
+
+```yaml
+update_check:
+  enabled: false
+```
 
 If you want to connect the gateway to LunarGate observability, create a gateway in the `Gateways` section of [app.lunargate.ai](https://app.lunargate.ai) and add the generated gateway API key to your environment:
 
@@ -136,18 +155,20 @@ If you want to connect the gateway to LunarGate observability, create a gateway 
 LUNARGATE_GATEWAY_API_KEY=lgw_your_gateway_api_key
 ```
 
-Then enable `data_sharing` in `config.yaml`:
+Then configure the shared Dashboard connection and enable `data_sharing` in `config.yaml`:
 
 ```yaml
+general:
+  api_key: "${LUNARGATE_GATEWAY_API_KEY}"
+
 data_sharing:
   enabled: true
   share_prompts: true
   share_responses: true
   remote_control: true
-  api_key: "${LUNARGATE_GATEWAY_API_KEY}"
 ```
 
-You can keep `share_prompts` and `share_responses` off if you want metrics-only forwarding.
+Keep `share_prompts` and `share_responses` off for metrics-only collector export. `remote_control` is a separate privacy boundary: each Dashboard sandbox command carries its complete request to the gateway and returns the complete bounded response through the control channel, regardless of those two collector flags. Leave `remote_control: false` unless you want that feature.
 
 ## Security
 

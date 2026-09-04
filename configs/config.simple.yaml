@@ -7,7 +7,8 @@ routing:
     - name: "default"
       targets:
         - provider: openai
-          model: gpt-5.2
+          model: gpt-5.6-terra
+          weight: 100
 
 # Optional: enable inbound API-key auth for /v1/*
 # security:
@@ -17,10 +18,14 @@ routing:
 #     keys:
 #       - value: "${LUNARGATE_CLIENT_API_KEY}"
 
+# Optional: shared gateway identity for Dashboard integrations
+# general:
+#   api_key: "${LUNARGATE_GATEWAY_API_KEY}"
+#   backend_url: "${LUNARGATE_BACKEND_URL}"
+
 # Optional: connect to LunarGate Dashboard observability
 # data_sharing:
 #   enabled: true
 #   share_prompts: true
 #   share_responses: true
-#   # Create this key in the "Gateways" section of https://app.lunargate.ai
-#   api_key: "${LUNARGATE_GATEWAY_API_KEY}"
+#   remote_control: false  # Sandbox traffic is separate from collector share flags

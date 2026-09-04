@@ -33,15 +33,18 @@ type ExecuteFunc func(ctx context.Context, target routing.Target) (*http.Respons
 func (f *FallbackExecutor) Execute(ctx context.Context, primary routing.Target, fallbacks []routing.Target, fn ExecuteFunc) (*http.Response, routing.Target, bool, int, string, error) {
 	// Try primary target with retries
 	resp, retryCount, cbState, err := f.executeWithCircuitBreaker(ctx, primary, fn)
-	lastRetryCount := retryCount
+	totalRetryCount := retryCount
 	lastCBState := cbState
 	lastTarget := primary
 	fallbackAttempted := false
 	if err == nil {
-		return resp, primary, false, retryCount, cbState, nil
+		return resp, primary, false, totalRetryCount, cbState, nil
 	}
-	if errors.Is(err, context.Canceled) || ctx.Err() != nil {
-		return nil, primary, false, retryCount, cbState, err
+	if isTerminalFallbackError(ctx, err) {
+		return nil, primary, false, totalRetryCount, cbState, err
+	}
+	if fallbackDisabled(ctx) {
+		return nil, primary, false, totalRetryCount, cbState, err
 	}
 
 	log.Warn().
@@ -60,11 +63,14 @@ func (f *FallbackExecutor) Execute(ctx context.Context, primary routing.Target, 
 			Msg("attempting fallback")
 
 		resp, retryCount, cbState, err = f.executeWithCircuitBreaker(ctx, fb, fn)
-		lastRetryCount = retryCount
+		totalRetryCount += retryCount
 		lastCBState = cbState
 		lastTarget = fb
 		if err == nil {
-			return resp, fb, true, retryCount, cbState, nil
+			return resp, fb, true, totalRetryCount, cbState, nil
+		}
+		if isTerminalFallbackError(ctx, err) {
+			return nil, fb, true, totalRetryCount, cbState, err
 		}
 
 		log.Warn().
@@ -75,7 +81,14 @@ func (f *FallbackExecutor) Execute(ctx context.Context, primary routing.Target, 
 			Msg("fallback target failed")
 	}
 
-	return nil, lastTarget, fallbackAttempted, lastRetryCount, lastCBState, fmt.Errorf("all targets failed (primary + %d fallbacks): %w", len(fallbacks), err)
+	return nil, lastTarget, fallbackAttempted, totalRetryCount, lastCBState, fmt.Errorf("all targets failed (primary + %d fallbacks): %w", len(fallbacks), err)
+}
+
+func isTerminalFallbackError(ctx context.Context, err error) bool {
+	return IsRequestError(err) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		ctx.Err() != nil
 }
 
 type execResult struct {
@@ -85,7 +98,8 @@ type execResult struct {
 
 func (f *FallbackExecutor) executeWithCircuitBreaker(ctx context.Context, target routing.Target, fn ExecuteFunc) (*http.Response, int, string, error) {
 	lastRetryCount := 0
-	result, err := f.cbm.Execute(target.Provider, func() (interface{}, error) {
+	breakerKey := target.CircuitBreakerKey()
+	result, state, err := f.cbm.executeForKeyWithState(breakerKey, target.Provider, func() (interface{}, error) {
 		resp, retryCount, err := f.retrier.Do(ctx, func(ctx context.Context) (*http.Response, error) {
 			return fn(ctx, target)
 		})
@@ -95,7 +109,7 @@ func (f *FallbackExecutor) executeWithCircuitBreaker(ctx context.Context, target
 		}
 		return &execResult{resp: resp, retryCount: retryCount}, nil
 	})
-	cbState := f.cbm.State(target.Provider).String()
+	cbState := state.String()
 
 	if err != nil {
 		return nil, lastRetryCount, cbState, err

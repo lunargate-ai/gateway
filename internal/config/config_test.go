@@ -3,7 +3,9 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
+	"time"
 )
 
 func TestNewManagerExpandsEnvAcrossConfig(t *testing.T) {
@@ -32,8 +34,9 @@ routing:
           weight: 100
 data_sharing:
   enabled: true
-  backend_url: "${BACKEND_URL}/collector"
   api_key: "${GATEWAY_API_KEY}"
+general:
+  backend_url: "${BACKEND_URL}/collector"
 `
 	if err := os.WriteFile(configPath, []byte(configBody), 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -61,11 +64,206 @@ data_sharing:
 		t.Fatalf("route fallback model = %q, want %q", route.Fallback[0].Model, "gpt-5.2")
 	}
 
-	if cfg.DataSharing.BackendURL != "https://api.lunargate.ai/v1" {
-		t.Fatalf("data_sharing backend_url = %q, want %q", cfg.DataSharing.BackendURL, "https://api.lunargate.ai/v1")
+	if cfg.General.BackendURL != "https://api.lunargate.ai/v1" {
+		t.Fatalf("general.backend_url = %q, want %q", cfg.General.BackendURL, "https://api.lunargate.ai/v1")
 	}
 	if cfg.DataSharing.APIKey != "lgw_test" {
 		t.Fatalf("data_sharing api_key = %q, want %q", cfg.DataSharing.APIKey, "lgw_test")
+	}
+	if cfg.General.APIKey != "lgw_test" {
+		t.Fatalf("general.api_key = %q, want %q", cfg.General.APIKey, "lgw_test")
+	}
+}
+
+func TestValidateConfigRejectsInvalidUpstreamRequestTypes(t *testing.T) {
+	tests := []struct {
+		name         string
+		providerID   string
+		providerType string
+		requestType  string
+		fallback     bool
+		wantErr      bool
+	}{
+		{name: "openai responses", providerID: "custom", providerType: "openai", requestType: "responses"},
+		{name: "built-in openai responses", providerID: "openai", requestType: "responses"},
+		{name: "anthropic responses", providerID: "anthropic", providerType: "anthropic", requestType: "responses", wantErr: true},
+		{name: "ollama fallback responses", providerID: "ollama", providerType: "ollama", requestType: "responses", fallback: true, wantErr: true},
+		{name: "unknown protocol", providerID: "custom", providerType: "openai", requestType: "messages", wantErr: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			target := TargetConfig{Provider: test.providerID, Weight: 1, UpstreamRequestType: test.requestType}
+			route := RouteConfig{Name: "test"}
+			if test.fallback {
+				route.Targets = []TargetConfig{{Provider: test.providerID, Weight: 1}}
+				route.Fallback = []TargetConfig{target}
+			} else {
+				route.Targets = []TargetConfig{target}
+			}
+			cfg := &Config{
+				Server: ServerConfig{Port: 8080},
+				Providers: map[string]ProviderConfig{
+					test.providerID: {Type: test.providerType},
+				},
+				Routing: RoutingConfig{Routes: []RouteConfig{route}},
+			}
+			err := validateConfig(cfg)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("validateConfig() error = %v, wantErr %v", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestNewManager_DefaultsUpdateChecksOn(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	configBody := `providers:
+  openai:
+    api_key: "test-key"
+routing:
+  routes:
+    - name: "default"
+      targets:
+        - provider: openai
+          weight: 100
+`
+	if err := os.WriteFile(configPath, []byte(configBody), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	manager, err := NewManager(configPath)
+	if err != nil {
+		t.Fatalf("NewManager returned error: %v", err)
+	}
+
+	updateCheck := manager.Get().UpdateCheck
+	if !updateCheck.Enabled {
+		t.Fatal("update_check.enabled = false, want true")
+	}
+	if updateCheck.Endpoint != defaultUpdateCheckURL {
+		t.Fatalf("update_check.endpoint = %q, want %q", updateCheck.Endpoint, defaultUpdateCheckURL)
+	}
+	if updateCheck.Interval != defaultUpdateCheckPeriod {
+		t.Fatalf("update_check.interval = %s, want %s", updateCheck.Interval, defaultUpdateCheckPeriod)
+	}
+	if updateCheck.Timeout != defaultUpdateCheckTimeout {
+		t.Fatalf("update_check.timeout = %s, want %s", updateCheck.Timeout, defaultUpdateCheckTimeout)
+	}
+}
+
+func TestNewManager_CanDisableAndOverrideUpdateCheck(t *testing.T) {
+	t.Setenv("UPDATE_URL", "https://updates.example/latest")
+
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	configBody := `providers:
+  openai:
+    api_key: "test-key"
+routing:
+  routes:
+    - name: "default"
+      targets:
+        - provider: openai
+          weight: 100
+update_check:
+  enabled: false
+  endpoint: "${UPDATE_URL}"
+  interval: 12h
+  timeout: 2s
+`
+	if err := os.WriteFile(configPath, []byte(configBody), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	manager, err := NewManager(configPath)
+	if err != nil {
+		t.Fatalf("NewManager returned error: %v", err)
+	}
+
+	updateCheck := manager.Get().UpdateCheck
+	if updateCheck.Enabled {
+		t.Fatal("update_check.enabled = true, want false")
+	}
+	if updateCheck.Endpoint != "https://updates.example/latest" {
+		t.Fatalf("update_check.endpoint = %q", updateCheck.Endpoint)
+	}
+	if updateCheck.Interval != 12*time.Hour {
+		t.Fatalf("update_check.interval = %s, want 12h", updateCheck.Interval)
+	}
+	if updateCheck.Timeout != 2*time.Second {
+		t.Fatalf("update_check.timeout = %s, want 2s", updateCheck.Timeout)
+	}
+}
+
+func TestNewManager_UsesGeneralAPIKeyWhenBothGeneralAndLegacyConfigured(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	configBody := `providers:
+  openai:
+    api_key: "test-openai-key"
+routing:
+  routes:
+    - name: "default"
+      targets:
+        - provider: openai
+          weight: 100
+general:
+  api_key: "lgw_from_general"
+data_sharing:
+  enabled: true
+  api_key: "lgw_from_legacy"
+`
+	if err := os.WriteFile(configPath, []byte(configBody), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	manager, err := NewManager(configPath)
+	if err != nil {
+		t.Fatalf("NewManager returned error: %v", err)
+	}
+
+	cfg := manager.Get()
+	if cfg.General.APIKey != "lgw_from_general" {
+		t.Fatalf("general.api_key = %q, want %q", cfg.General.APIKey, "lgw_from_general")
+	}
+	if cfg.DataSharing.APIKey != "lgw_from_general" {
+		t.Fatalf("data_sharing.api_key = %q, want %q", cfg.DataSharing.APIKey, "lgw_from_general")
+	}
+}
+
+func TestNewManager_FallsBackToLegacyDataSharingConfig(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	configBody := `providers:
+  openai:
+    api_key: "test-openai-key"
+routing:
+  routes:
+    - name: "default"
+      targets:
+        - provider: openai
+          weight: 100
+data_sharing:
+  enabled: true
+  api_key: "lgw_from_legacy"
+  backend_url: "https://legacy.example/v1/collector"
+`
+	if err := os.WriteFile(configPath, []byte(configBody), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	manager, err := NewManager(configPath)
+	if err != nil {
+		t.Fatalf("NewManager returned error: %v", err)
+	}
+
+	cfg := manager.Get()
+	if cfg.General.APIKey != "lgw_from_legacy" {
+		t.Fatalf("general.api_key = %q, want %q", cfg.General.APIKey, "lgw_from_legacy")
+	}
+	if cfg.DataSharing.APIKey != "lgw_from_legacy" {
+		t.Fatalf("data_sharing.api_key = %q, want %q", cfg.DataSharing.APIKey, "lgw_from_legacy")
+	}
+	if cfg.General.BackendURL != "https://legacy.example/v1" {
+		t.Fatalf("general.backend_url = %q, want %q", cfg.General.BackendURL, "https://legacy.example/v1")
 	}
 }
 
@@ -78,11 +276,13 @@ func TestNewManager_ParsesProviderCompatibilityFields(t *testing.T) {
     base_url: "https://api.deepseek.com/v1"
     compatibility_profile: "deepseek"
     normalize_developer_role: true
+    extract_reasoning_tags: true
 routing:
   routes:
     - name: "default"
       targets:
         - provider: deepseek
+          weight: 100
 `
 	if err := os.WriteFile(configPath, []byte(configBody), 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -99,6 +299,88 @@ routing:
 	}
 	if !provider.NormalizeDeveloperRole {
 		t.Fatalf("provider normalize_developer_role = false, want true")
+	}
+	if !provider.ExtractReasoningTags {
+		t.Fatalf("provider extract_reasoning_tags = false, want true")
+	}
+}
+
+func TestNewManager_ParsesAndNormalizesProviderCapabilities(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	configBody := `providers:
+  openai:
+    api_key: "test-key"
+    capabilities:
+      chat_completions_lifecycle: true
+      responses_lifecycle: true
+      conversations: true
+      background_responses: true
+      response_cancellation: true
+      response_compaction: true
+      response_input_tokens: true
+      embeddings_base64: true
+      structured_outputs: true
+      reasoning_effort: true
+      reasoning_effort_levels: [" LOW ", "xhigh", "low", ""]
+      adaptive_thinking: true
+      hosted_tools: [" Web_Search ", "file_search", "web_search", ""]
+routing:
+  routes:
+    - name: "default"
+      targets:
+        - provider: openai
+          weight: 100
+`
+	if err := os.WriteFile(configPath, []byte(configBody), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	manager, err := NewManager(configPath)
+	if err != nil {
+		t.Fatalf("NewManager returned error: %v", err)
+	}
+
+	capabilities := manager.Get().Providers["openai"].Capabilities
+	if !capabilities.ChatCompletionsLifecycle || !capabilities.ResponsesLifecycle || !capabilities.Conversations ||
+		!capabilities.BackgroundResponses || !capabilities.ResponseCancellation ||
+		!capabilities.ResponseCompaction || !capabilities.ResponseInputTokens ||
+		!capabilities.EmbeddingsBase64 || !capabilities.StructuredOutputs ||
+		!capabilities.ReasoningEffort || !capabilities.AdaptiveThinking {
+		t.Fatalf("capability flags were not preserved: %#v", capabilities)
+	}
+	wantEffortLevels := []string{"low", "xhigh"}
+	if !reflect.DeepEqual(capabilities.ReasoningEffortLevels, wantEffortLevels) {
+		t.Fatalf("reasoning_effort_levels = %#v, want %#v", capabilities.ReasoningEffortLevels, wantEffortLevels)
+	}
+	wantTools := []string{"web_search", "file_search"}
+	if !reflect.DeepEqual(capabilities.HostedTools, wantTools) {
+		t.Fatalf("hosted_tools = %#v, want %#v", capabilities.HostedTools, wantTools)
+	}
+}
+
+func TestNewManager_ProviderCapabilitiesDefaultDisabled(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	configBody := `providers:
+  openai:
+    api_key: "test-key"
+routing:
+  routes:
+    - name: "default"
+      targets:
+        - provider: openai
+          weight: 100
+`
+	if err := os.WriteFile(configPath, []byte(configBody), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	manager, err := NewManager(configPath)
+	if err != nil {
+		t.Fatalf("NewManager returned error: %v", err)
+	}
+
+	if got := manager.Get().Providers["openai"].Capabilities; !reflect.DeepEqual(got, ProviderCapabilities{}) {
+		t.Fatalf("capabilities default = %#v, want all disabled", got)
 	}
 }
 
@@ -117,6 +399,7 @@ routing:
     - name: "default"
       targets:
         - provider: ollama
+          weight: 100
 `
 	if err := os.WriteFile(configPath, []byte(configBody), 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -151,6 +434,7 @@ routing:
     - name: "default"
       targets:
         - provider: openai
+          weight: 100
 security:
   enabled: true
   provider: "api_key"
@@ -201,6 +485,7 @@ routing:
     - name: "default"
       targets:
         - provider: openai
+          weight: 100
 security:
   api_keys_enabled: true
   api_keys:
