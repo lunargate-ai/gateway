@@ -25,7 +25,7 @@ LunarGate is a Go-based AI gateway that lets you expose one stable endpoint to y
 - Supports streaming and tool-calling flows
 - Keeps a small footprint: the standalone binary is typically around 10-12 MB depending on platform, and the container image is around 12 MB
 - Keeps data local by default, with optional prompt/response sharing for observability
-- Works with providers such as OpenAI, Anthropic, Ollama, and other OpenAI-compatible local backends
+- Works with providers such as OpenAI, Anthropic, DeepSeek, Ollama, and other OpenAI-compatible backends
 
 ## Supported endpoints
 
@@ -52,9 +52,19 @@ LunarGate exposes an OpenAI-compatible client-facing API, but it can route to mu
 - OpenAI
 - Anthropic
 - Ollama
+- DeepSeek through the OpenAI-compatible adapter
 - other OpenAI-compatible backends
 
 That means your app can keep one stable client integration while the gateway talks to the upstream provider in the format it expects.
+
+For DeepSeek, use provider ID `deepseek` with `type: "openai"` and
+`compatibility_profile: "deepseek"`; no additional provider type is needed.
+See the [provider configuration example](https://docs.lunargate.ai/reference/configuration-providers/#openai-compatible-custom-upstream).
+
+Circuit breakers use fixed settings in 0.4.0: five consecutive failed target
+executions open the circuit, followed by a 30-second recovery timeout. These
+settings are not configurable in YAML. See [Circuit breakers](https://docs.lunargate.ai/reference/configuration-retry/#circuit-breakers)
+for half-open behavior and how failures are counted.
 
 ## Documentation
 
