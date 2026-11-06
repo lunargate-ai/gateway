@@ -19,6 +19,7 @@ type UnifiedRequest struct {
 	// RawJSON. Translators must only replay RawJSON when the upstream contract
 	// matches this value.
 	SourceRequestType   string          `json:"-"`
+	ServiceTier         *string         `json:"service_tier,omitempty"`
 	Model               string          `json:"model"`
 	Messages            []Message       `json:"messages"`
 	Temperature         *float64        `json:"temperature,omitempty"`

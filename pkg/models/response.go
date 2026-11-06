@@ -6,6 +6,7 @@ import "encoding/json"
 // All provider translators convert their native responses TO this format.
 type UnifiedResponse struct {
 	RawJSON           json.RawMessage `json:"-"`
+	ServiceTier       *string         `json:"service_tier,omitempty"`
 	ID                string          `json:"id"`
 	Object            string          `json:"object"`
 	Created           int64           `json:"created"`
@@ -68,6 +69,7 @@ type StreamChunk struct {
 	// chunk. The streaming layer overlays normalized typed fields onto this
 	// document before sending it to the client.
 	RawJSON           json.RawMessage `json:"-"`
+	ServiceTier       *string         `json:"service_tier,omitempty"`
 	ID                string          `json:"id"`
 	Object            string          `json:"object"`
 	Created           int64           `json:"created"`

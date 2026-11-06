@@ -219,6 +219,9 @@ func (t *OllamaTranslator) validateRequestFields(providerID string, req *models.
 	if err := validateTranslatedChatRawControls(providerID, req); err != nil {
 		return err
 	}
+	if models.RequestServiceTier(req) != nil {
+		return ollamaCompatibilityError(providerID, "service_tier", "Ollama has no service tier equivalent")
+	}
 	if req.N != nil && *req.N != 1 {
 		return ollamaCompatibilityError(providerID, "n", "Ollama returns exactly one choice")
 	}

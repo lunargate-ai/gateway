@@ -9,6 +9,7 @@ import (
 
 	"github.com/lunargate-ai/gateway/internal/observability"
 	"github.com/lunargate-ai/gateway/internal/routing"
+	"github.com/lunargate-ai/gateway/pkg/models"
 )
 
 const dynamicModelMetricLabel = "_dynamic"
@@ -32,21 +33,23 @@ func boundedProviderErrorMetricType(status int, candidate string) string {
 }
 
 type cacheHitObservation struct {
-	requestID    string
-	startTime    time.Time
-	requestTypes apiRequestTypes
-	provider     string
-	model        string
-	metricsModel string
-	route        string
-	targetIndex  int
-	user         *string
-	sessionID    *string
-	tags         map[string]string
-	tokensInput  int
-	tokensOutput int
-	request      interface{}
-	response     interface{}
+	requestID            string
+	startTime            time.Time
+	requestTypes         apiRequestTypes
+	provider             string
+	model                string
+	metricsModel         string
+	route                string
+	targetIndex          int
+	user                 *string
+	sessionID            *string
+	tags                 map[string]string
+	tokensInput          int
+	tokensOutput         int
+	requestedServiceTier *string
+	effectiveServiceTier *string
+	request              interface{}
+	response             interface{}
 }
 
 func (h *Handler) recordCacheHit(ctx context.Context, observation cacheHitObservation) time.Duration {
@@ -66,10 +69,11 @@ func (h *Handler) recordCacheHit(ctx context.Context, observation cacheHitObserv
 	h.collector.Enqueue(ctx, observation.requestID, []observability.Event{{
 		Type: "trace",
 		Data: observability.TraceEventData{
-			RequestID: observation.requestID,
-			Timestamp: observation.startTime.UTC(),
-			Phase:     "request_start",
-			Tags:      observation.tags,
+			RequestedServiceTier: models.KnownServiceTier(observation.requestedServiceTier),
+			RequestID:            observation.requestID,
+			Timestamp:            observation.startTime.UTC(),
+			Phase:                "request_start",
+			Tags:                 observation.tags,
 		},
 	}})
 
@@ -78,25 +82,27 @@ func (h *Handler) recordCacheHit(ctx context.Context, observation cacheHitObserv
 	events := []observability.Event{{
 		Type: "metric",
 		Data: observability.MetricEventData{
-			RequestID:           observation.requestID,
-			Timestamp:           observation.startTime.UTC(),
-			RequestType:         observation.requestTypes.client,
-			UpstreamRequestType: observation.requestTypes.upstream,
-			DurationMS:          duration.Milliseconds(),
-			Provider:            observation.provider,
-			Model:               observation.model,
-			User:                observation.user,
-			SessionID:           observation.sessionID,
-			TokensInput:         observation.tokensInput,
-			TokensOutput:        observation.tokensOutput,
-			CostUSD:             0,
-			StatusCode:          http.StatusOK,
-			CacheHit:            true,
-			RouteUsed:           &routeUsed,
-			TargetIndex:         &targetIndex,
-			FallbackUsed:        false,
-			RetryCount:          0,
-			Tags:                observation.tags,
+			RequestedServiceTier: models.KnownServiceTier(observation.requestedServiceTier),
+			EffectiveServiceTier: models.KnownServiceTier(observation.effectiveServiceTier),
+			RequestID:            observation.requestID,
+			Timestamp:            observation.startTime.UTC(),
+			RequestType:          observation.requestTypes.client,
+			UpstreamRequestType:  observation.requestTypes.upstream,
+			DurationMS:           duration.Milliseconds(),
+			Provider:             observation.provider,
+			Model:                observation.model,
+			User:                 observation.user,
+			SessionID:            observation.sessionID,
+			TokensInput:          observation.tokensInput,
+			TokensOutput:         observation.tokensOutput,
+			CostUSD:              0,
+			StatusCode:           http.StatusOK,
+			CacheHit:             true,
+			RouteUsed:            &routeUsed,
+			TargetIndex:          &targetIndex,
+			FallbackUsed:         false,
+			RetryCount:           0,
+			Tags:                 observation.tags,
 		},
 	}}
 
@@ -112,23 +118,25 @@ func (h *Handler) recordCacheHit(ctx context.Context, observation cacheHitObserv
 		events = append(events, observability.Event{
 			Type: "request_log",
 			Data: observability.RequestLogEventData{
-				RequestID:           observation.requestID,
-				Timestamp:           observation.startTime.UTC(),
-				RequestType:         observation.requestTypes.client,
-				UpstreamRequestType: observation.requestTypes.upstream,
-				User:                observation.user,
-				SessionID:           observation.sessionID,
-				Provider:            observation.provider,
-				Model:               observation.model,
-				StatusCode:          http.StatusOK,
-				DurationMS:          duration.Milliseconds(),
-				RouteUsed:           &routeUsed,
-				CacheHit:            true,
-				FallbackUsed:        false,
-				RetryCount:          0,
-				Tags:                observation.tags,
-				Request:             request,
-				Response:            response,
+				RequestedServiceTier: models.KnownServiceTier(observation.requestedServiceTier),
+				EffectiveServiceTier: models.KnownServiceTier(observation.effectiveServiceTier),
+				RequestID:            observation.requestID,
+				Timestamp:            observation.startTime.UTC(),
+				RequestType:          observation.requestTypes.client,
+				UpstreamRequestType:  observation.requestTypes.upstream,
+				User:                 observation.user,
+				SessionID:            observation.sessionID,
+				Provider:             observation.provider,
+				Model:                observation.model,
+				StatusCode:           http.StatusOK,
+				DurationMS:           duration.Milliseconds(),
+				RouteUsed:            &routeUsed,
+				CacheHit:             true,
+				FallbackUsed:         false,
+				RetryCount:           0,
+				Tags:                 observation.tags,
+				Request:              request,
+				Response:             response,
 			},
 		})
 	}

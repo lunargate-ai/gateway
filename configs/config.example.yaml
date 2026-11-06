@@ -58,6 +58,8 @@ providers:
       reasoning_effort: true
       reasoning_effort_levels: [low, medium, high, max]
       adaptive_thinking: true
+      # Opt in only for an upstream account/model with Fast mode support.
+      fast_mode: false
 
   abacus:
     type: "openai"

@@ -564,13 +564,18 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			cachedModelCanonical := modelid.BuildCanonical(resolved.Target.Provider, cachedModelRaw)
 			userPtr, sessionIDPtr := extractUserAndSession(headers)
 			var tokensIn, tokensOut int
+			var effectiveServiceTier *string
 			switch response := cached.(type) {
 			case *models.UnifiedResponse:
+				if response != nil {
+					effectiveServiceTier = response.ServiceTier
+				}
 				if response != nil && response.Usage != nil {
 					tokensIn = response.Usage.PromptTokens
 					tokensOut = response.Usage.CompletionTokens
 				}
 			case models.UnifiedResponse:
+				effectiveServiceTier = response.ServiceTier
 				if response.Usage != nil {
 					tokensIn = response.Usage.PromptTokens
 					tokensOut = response.Usage.CompletionTokens
@@ -581,16 +586,18 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				requestPayload = buildCollectorRequestLogPayload(body, resolvedSampling)
 			}
 			duration := h.recordCacheHit(r.Context(), cacheHitObservation{
-				requestID:    requestID,
-				startTime:    startTime,
-				requestTypes: resolvedRequestTypes,
-				provider:     resolved.Target.Provider,
-				model:        cachedModelCanonical,
-				metricsModel: boundedModelMetricLabel(resolved.Target, cachedModelRaw),
-				route:        resolved.RouteName,
-				targetIndex:  resolved.Index,
-				user:         userPtr,
-				sessionID:    sessionIDPtr,
+				requestedServiceTier: models.RequestServiceTier(&req),
+				effectiveServiceTier: effectiveServiceTier,
+				requestID:            requestID,
+				startTime:            startTime,
+				requestTypes:         resolvedRequestTypes,
+				provider:             resolved.Target.Provider,
+				model:                cachedModelCanonical,
+				metricsModel:         boundedModelMetricLabel(resolved.Target, cachedModelRaw),
+				route:                resolved.RouteName,
+				targetIndex:          resolved.Index,
+				user:                 userPtr,
+				sessionID:            sessionIDPtr,
 				tags: h.enrichCollectorTagsWithInference(
 					resolvedCollectorHeaders,
 					resolved.Target.Provider,
@@ -637,10 +644,11 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		startEvt := []observability.Event{{
 			Type: "trace",
 			Data: observability.TraceEventData{
-				RequestID: requestID,
-				Timestamp: startTime.UTC(),
-				Phase:     "request_start",
-				Tags:      traceTags,
+				RequestedServiceTier: models.KnownServiceTier(models.RequestServiceTier(&req)),
+				RequestID:            requestID,
+				Timestamp:            startTime.UTC(),
+				Phase:                "request_start",
+				Tags:                 traceTags,
 			},
 		}}
 		h.collector.Enqueue(r.Context(), requestID, startEvt)
@@ -768,6 +776,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			events := []observability.Event{{
 				Type: "metric",
 				Data: observability.MetricEventData{
+					RequestedServiceTier: models.KnownServiceTier(models.RequestServiceTier(&req)),
 					RequestID:            requestID,
 					Timestamp:            startTime.UTC(),
 					RequestType:          usedRequestTypes.client,
@@ -798,24 +807,25 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				events = append(events, observability.Event{
 					Type: "request_log",
 					Data: observability.RequestLogEventData{
-						RequestID:           requestID,
-						Timestamp:           startTime.UTC(),
-						RequestType:         usedRequestTypes.client,
-						UpstreamRequestType: usedRequestTypes.upstream,
-						User:                userPtr,
-						SessionID:           sessionIDPtr,
-						Provider:            usedTarget.Provider,
-						Model:               failedModelCanonical,
-						StatusCode:          status,
-						DurationMS:          duration.Milliseconds(),
-						RouteUsed:           &routeUsed,
-						CacheHit:            cacheHit,
-						FallbackUsed:        fallbackUsed,
-						RetryCount:          retryCount,
-						ErrorCode:           &errCodeForCollector,
-						ErrorMessage:        &errMsgForCollector,
-						Tags:                h.enrichCollectorTagsWithInference(usedCollectorHeaders, usedTarget.Provider, failedModelCanonical, req.Stream, usedSampling),
-						Request:             reqAny,
+						RequestedServiceTier: models.KnownServiceTier(models.RequestServiceTier(&req)),
+						RequestID:            requestID,
+						Timestamp:            startTime.UTC(),
+						RequestType:          usedRequestTypes.client,
+						UpstreamRequestType:  usedRequestTypes.upstream,
+						User:                 userPtr,
+						SessionID:            sessionIDPtr,
+						Provider:             usedTarget.Provider,
+						Model:                failedModelCanonical,
+						StatusCode:           status,
+						DurationMS:           duration.Milliseconds(),
+						RouteUsed:            &routeUsed,
+						CacheHit:             cacheHit,
+						FallbackUsed:         fallbackUsed,
+						RetryCount:           retryCount,
+						ErrorCode:            &errCodeForCollector,
+						ErrorMessage:         &errMsgForCollector,
+						Tags:                 h.enrichCollectorTagsWithInference(usedCollectorHeaders, usedTarget.Provider, failedModelCanonical, req.Stream, usedSampling),
+						Request:              reqAny,
 					},
 				})
 			}
@@ -893,6 +903,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		tokensIn := 0
 		tokensOut := 0
 		streamTokenUsage := models.TokenUsage{}
+		var effectiveServiceTier *string
 		var ttftMS int64 = -1
 		var ttltMS int64 = -1
 		var nativeTerminal *nativeResponsesStreamTerminal
@@ -900,6 +911,9 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		streamObserver := func(chunk *models.StreamChunk) {
 			if chunk == nil {
 				return
+			}
+			if tier := models.KnownServiceTier(chunk.ServiceTier); tier != nil {
+				effectiveServiceTier = tier
 			}
 			chatCompletionCandidate.observe(chunk)
 			mergeObservedTokenUsage(&streamTokenUsage, chunk.Usage)
@@ -953,6 +967,9 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 						return false
 					}
 					nativeTerminal = terminal
+					if tier, ok := terminal.response["service_tier"].(string); ok {
+						effectiveServiceTier = models.KnownServiceTier(&tier)
+					}
 					tokensIn = terminal.tokensInput
 					tokensOut = terminal.tokensOutput
 					streamTokenUsage = terminal.tokenUsage
@@ -1133,6 +1150,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			events := []observability.Event{{
 				Type: "metric",
 				Data: observability.MetricEventData{
+					RequestedServiceTier:    models.KnownServiceTier(models.RequestServiceTier(&req)),
 					RequestID:               requestID,
 					Timestamp:               startTime.UTC(),
 					RequestType:             usedRequestTypes.client,
@@ -1152,6 +1170,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 					TokensInputCacheWrite5m: streamTokenUsage.CacheWriteInputTokens5m,
 					TokensInputCacheWrite1h: streamTokenUsage.CacheWriteInputTokens1h,
 					CostUSD:                 costUSD,
+					EffectiveServiceTier:    effectiveServiceTier,
 					StatusCode:              status,
 					ErrorCode:               observability.MetricErrorClass(status, errCodePtr != nil),
 					CacheHit:                cacheHit,
@@ -1185,25 +1204,27 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				events = append(events, observability.Event{
 					Type: "request_log",
 					Data: observability.RequestLogEventData{
-						RequestID:           requestID,
-						Timestamp:           startTime.UTC(),
-						RequestType:         usedRequestTypes.client,
-						UpstreamRequestType: usedRequestTypes.upstream,
-						User:                userPtr,
-						SessionID:           sessionIDPtr,
-						Provider:            usedTarget.Provider,
-						Model:               usedModelCanonical,
-						StatusCode:          status,
-						DurationMS:          duration.Milliseconds(),
-						RouteUsed:           &routeUsed,
-						CacheHit:            cacheHit,
-						FallbackUsed:        fallbackUsed,
-						RetryCount:          retryCount,
-						ErrorCode:           errCodePtr,
-						ErrorMessage:        errMsgPtr,
-						Tags:                h.enrichCollectorTagsWithInference(usedCollectorHeaders, usedTarget.Provider, usedModelCanonical, req.Stream, usedSampling),
-						Request:             reqObj,
-						Response:            respObj,
+						EffectiveServiceTier: effectiveServiceTier,
+						RequestedServiceTier: models.KnownServiceTier(models.RequestServiceTier(&req)),
+						RequestID:            requestID,
+						Timestamp:            startTime.UTC(),
+						RequestType:          usedRequestTypes.client,
+						UpstreamRequestType:  usedRequestTypes.upstream,
+						User:                 userPtr,
+						SessionID:            sessionIDPtr,
+						Provider:             usedTarget.Provider,
+						Model:                usedModelCanonical,
+						StatusCode:           status,
+						DurationMS:           duration.Milliseconds(),
+						RouteUsed:            &routeUsed,
+						CacheHit:             cacheHit,
+						FallbackUsed:         fallbackUsed,
+						RetryCount:           retryCount,
+						ErrorCode:            errCodePtr,
+						ErrorMessage:         errMsgPtr,
+						Tags:                 h.enrichCollectorTagsWithInference(usedCollectorHeaders, usedTarget.Provider, usedModelCanonical, req.Stream, usedSampling),
+						Request:              reqObj,
+						Response:             respObj,
 					},
 				})
 			}
@@ -1308,6 +1329,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			events := []observability.Event{{
 				Type: "metric",
 				Data: observability.MetricEventData{
+					RequestedServiceTier: models.KnownServiceTier(models.RequestServiceTier(&req)),
 					RequestID:            requestID,
 					Timestamp:            startTime.UTC(),
 					RequestType:          usedRequestTypes.client,
@@ -1338,24 +1360,25 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				events = append(events, observability.Event{
 					Type: "request_log",
 					Data: observability.RequestLogEventData{
-						RequestID:           requestID,
-						Timestamp:           startTime.UTC(),
-						RequestType:         usedRequestTypes.client,
-						UpstreamRequestType: usedRequestTypes.upstream,
-						User:                userPtr,
-						SessionID:           sessionIDPtr,
-						Provider:            usedTarget.Provider,
-						Model:               usedModelCanonical,
-						StatusCode:          status,
-						DurationMS:          duration.Milliseconds(),
-						RouteUsed:           &routeUsed,
-						CacheHit:            cacheHit,
-						FallbackUsed:        fallbackUsed,
-						RetryCount:          retryCount,
-						ErrorCode:           &errCode,
-						ErrorMessage:        &errMsg,
-						Tags:                h.enrichCollectorTagsWithInference(usedCollectorHeaders, usedTarget.Provider, usedModelCanonical, req.Stream, usedSampling),
-						Request:             reqAny,
+						RequestedServiceTier: models.KnownServiceTier(models.RequestServiceTier(&req)),
+						RequestID:            requestID,
+						Timestamp:            startTime.UTC(),
+						RequestType:          usedRequestTypes.client,
+						UpstreamRequestType:  usedRequestTypes.upstream,
+						User:                 userPtr,
+						SessionID:            sessionIDPtr,
+						Provider:             usedTarget.Provider,
+						Model:                usedModelCanonical,
+						StatusCode:           status,
+						DurationMS:           duration.Milliseconds(),
+						RouteUsed:            &routeUsed,
+						CacheHit:             cacheHit,
+						FallbackUsed:         fallbackUsed,
+						RetryCount:           retryCount,
+						ErrorCode:            &errCode,
+						ErrorMessage:         &errMsg,
+						Tags:                 h.enrichCollectorTagsWithInference(usedCollectorHeaders, usedTarget.Provider, usedModelCanonical, req.Stream, usedSampling),
+						Request:              reqAny,
 					},
 				})
 			}
@@ -1419,6 +1442,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		status := responseStatus
 		tokensIn := tokenUsage.InputTokens
 		tokensOut := tokenUsage.OutputTokens
+		effectiveServiceTier := models.KnownServiceTier(unified.ServiceTier)
 		costUSD := observability.EstimateTokenUsageCostUSD(usedTarget.Provider, usedProviderType, usedModelRaw, tokenUsage)
 		var upstreamPtr *int64
 		if upstreamStartMS >= 0 {
@@ -1429,6 +1453,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		events := []observability.Event{{
 			Type: "metric",
 			Data: observability.MetricEventData{
+				RequestedServiceTier:    models.KnownServiceTier(models.RequestServiceTier(&req)),
 				RequestID:               requestID,
 				Timestamp:               startTime.UTC(),
 				RequestType:             usedRequestTypes.client,
@@ -1446,6 +1471,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				TokensInputCacheWrite5m: tokenUsage.CacheWriteInputTokens5m,
 				TokensInputCacheWrite1h: tokenUsage.CacheWriteInputTokens1h,
 				CostUSD:                 costUSD,
+				EffectiveServiceTier:    effectiveServiceTier,
 				StatusCode:              status,
 				CacheHit:                cacheHit,
 				RouteUsed:               &routeUsed,
@@ -1475,23 +1501,25 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			events = append(events, observability.Event{
 				Type: "request_log",
 				Data: observability.RequestLogEventData{
-					RequestID:           requestID,
-					Timestamp:           startTime.UTC(),
-					RequestType:         usedRequestTypes.client,
-					UpstreamRequestType: usedRequestTypes.upstream,
-					User:                userPtr,
-					SessionID:           sessionIDPtr,
-					Provider:            usedTarget.Provider,
-					Model:               req.Model,
-					StatusCode:          status,
-					DurationMS:          duration.Milliseconds(),
-					RouteUsed:           &routeUsed,
-					CacheHit:            cacheHit,
-					FallbackUsed:        fallbackUsed,
-					RetryCount:          retryCount,
-					Tags:                h.enrichCollectorTagsWithInference(usedCollectorHeaders, usedTarget.Provider, req.Model, req.Stream, usedSampling),
-					Request:             reqObj,
-					Response:            respObj,
+					EffectiveServiceTier: effectiveServiceTier,
+					RequestedServiceTier: models.KnownServiceTier(models.RequestServiceTier(&req)),
+					RequestID:            requestID,
+					Timestamp:            startTime.UTC(),
+					RequestType:          usedRequestTypes.client,
+					UpstreamRequestType:  usedRequestTypes.upstream,
+					User:                 userPtr,
+					SessionID:            sessionIDPtr,
+					Provider:             usedTarget.Provider,
+					Model:                req.Model,
+					StatusCode:           status,
+					DurationMS:           duration.Milliseconds(),
+					RouteUsed:            &routeUsed,
+					CacheHit:             cacheHit,
+					FallbackUsed:         fallbackUsed,
+					RetryCount:           retryCount,
+					Tags:                 h.enrichCollectorTagsWithInference(usedCollectorHeaders, usedTarget.Provider, req.Model, req.Stream, usedSampling),
+					Request:              reqObj,
+					Response:             respObj,
 				},
 			})
 		}

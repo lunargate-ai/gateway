@@ -9,6 +9,7 @@ import (
 
 type ResponsesRequest struct {
 	RawJSON            json.RawMessage `json:"-"`
+	ServiceTier        *string         `json:"service_tier,omitempty"`
 	Model              string          `json:"model"`
 	Input              interface{}     `json:"input"`
 	PreviousResponseID string          `json:"previous_response_id,omitempty"`
@@ -48,6 +49,7 @@ type ResponsesTool struct {
 }
 
 type ResponsesResponse struct {
+	ServiceTier       *string                     `json:"service_tier,omitempty"`
 	ID                string                      `json:"id"`
 	Object            string                      `json:"object"`
 	CreatedAt         int64                       `json:"created_at"`
@@ -203,6 +205,7 @@ func ResponsesToUnifiedRequest(req *ResponsesRequest) (*UnifiedRequest, error) {
 	unified := &UnifiedRequest{
 		RawJSON:            append(json.RawMessage(nil), req.RawJSON...),
 		SourceRequestType:  "responses",
+		ServiceTier:        req.ServiceTier,
 		Model:              strings.TrimSpace(req.Model),
 		Messages:           messages,
 		Tools:              tools,
@@ -333,13 +336,14 @@ func UnifiedResponseToResponses(resp *UnifiedResponse) *ResponsesResponse {
 	}
 
 	out := &ResponsesResponse{
-		ID:         resp.ID,
-		Object:     "response",
-		CreatedAt:  resp.Created,
-		Status:     status,
-		Model:      resp.Model,
-		Output:     output,
-		OutputText: strings.Join(outputText, "\n"),
+		ServiceTier: resp.ServiceTier,
+		ID:          resp.ID,
+		Object:      "response",
+		CreatedAt:   resp.Created,
+		Status:      status,
+		Model:       resp.Model,
+		Output:      output,
+		OutputText:  strings.Join(outputText, "\n"),
 	}
 	if incompleteReason != "" {
 		out.IncompleteDetails = &ResponsesIncompleteDetails{Reason: incompleteReason}

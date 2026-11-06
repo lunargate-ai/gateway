@@ -22,6 +22,7 @@ const (
 // handled outside this type so reaching an observation limit can never affect
 // the client-facing stream.
 type chatStreamObservation struct {
+	serviceTier    *string
 	shareResponses bool
 	maxBodyBytes   int
 	maxToolCalls   int
@@ -86,6 +87,9 @@ func (o *chatStreamObservation) observe(chunk *models.StreamChunk) bool {
 		return false
 	}
 
+	if o != nil && chunk.ServiceTier != nil {
+		o.serviceTier = chunk.ServiceTier
+	}
 	hasContent := false
 	for _, choice := range chunk.Choices {
 		if o != nil && o.canCapture() && choice.FinishReason != nil {
@@ -286,10 +290,11 @@ func (o *chatStreamObservation) collectorResponse(requestID, model string, token
 	}
 
 	response := models.UnifiedResponse{
-		ID:      requestID,
-		Object:  "chat.completion",
-		Created: time.Now().Unix(),
-		Model:   model,
+		ServiceTier: o.serviceTier,
+		ID:          requestID,
+		Object:      "chat.completion",
+		Created:     time.Now().Unix(),
+		Model:       model,
 		Choices: []models.Choice{{
 			Index: 0,
 			Message: &models.Message{

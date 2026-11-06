@@ -36,9 +36,10 @@ var (
 type openAIStreamTranslator struct {
 	base *OpenAITranslator
 
-	id      string
-	model   string
-	created int64
+	id          string
+	model       string
+	created     int64
+	serviceTier *string
 
 	textParts      map[openAIStreamPartKey]*openAIStreamPartState
 	refusalParts   map[openAIStreamPartKey]*openAIStreamPartState
@@ -169,6 +170,11 @@ func (t *openAIStreamTranslator) Models() []models.ModelInfo {
 }
 
 func (t *openAIStreamTranslator) updateResponseMetadata(raw map[string]interface{}) error {
+	if response, ok := raw["response"].(map[string]interface{}); ok {
+		if value, ok := response["service_tier"].(string); ok {
+			t.serviceTier = models.KnownServiceTier(&value)
+		}
+	}
 	responseID, err := responsesEventResponseID(raw)
 	if err != nil {
 		return err
@@ -194,6 +200,9 @@ func (t *openAIStreamTranslator) decorateChunk(chunk *models.StreamChunk) *model
 	if chunk == nil {
 		return nil
 	}
+	if chunk.ServiceTier == nil {
+		chunk.ServiceTier = t.serviceTier
+	}
 	if chunk.ID == "" {
 		chunk.ID = t.id
 	}
@@ -211,10 +220,11 @@ func (t *openAIStreamTranslator) messageChunk(message *models.Message) *models.S
 		return nil
 	}
 	return &models.StreamChunk{
-		ID:      t.id,
-		Object:  "chat.completion.chunk",
-		Created: t.created,
-		Model:   t.model,
+		ID:          t.id,
+		Object:      "chat.completion.chunk",
+		Created:     t.created,
+		Model:       t.model,
+		ServiceTier: t.serviceTier,
 		Choices: []models.Choice{{
 			Index: 0,
 			Delta: message,

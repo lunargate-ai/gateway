@@ -11,6 +11,7 @@ import (
 )
 
 var openAIChatToResponsesTopLevelFields = map[string]struct{}{
+	"service_tier":          {},
 	"max_completion_tokens": {},
 	"max_tokens":            {},
 	"messages":              {},

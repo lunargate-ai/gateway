@@ -9,6 +9,7 @@ import (
 )
 
 type streamUsageAccumulator struct {
+	serviceTier          *string
 	id                   string
 	object               string
 	created              int64
@@ -37,6 +38,9 @@ func (a *streamUsageAccumulator) add(chunk *models.StreamChunk) {
 	}
 	if chunk.Model != "" {
 		a.model = chunk.Model
+	}
+	if chunk.ServiceTier != nil {
+		a.serviceTier = chunk.ServiceTier
 	}
 	usage := chunk.Usage
 	if usage == nil {
@@ -117,11 +121,12 @@ func writeCanonicalUsageTrailer(
 		completionDetails = models.CloneCompletionTokensDetails(&usage.completionDetails)
 	}
 	chunk := envelope.normalize(&models.StreamChunk{
-		ID:      usage.id,
-		Object:  usage.object,
-		Created: usage.created,
-		Model:   usage.model,
-		Choices: []models.Choice{},
+		ID:          usage.id,
+		Object:      usage.object,
+		Created:     usage.created,
+		Model:       usage.model,
+		ServiceTier: usage.serviceTier,
+		Choices:     []models.Choice{},
 		Usage: &models.Usage{
 			PromptTokens:            usage.promptTokens,
 			CompletionTokens:        usage.completionTokens,

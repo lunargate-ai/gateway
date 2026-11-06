@@ -66,6 +66,26 @@ executions open the circuit, followed by a 30-second recovery timeout. These
 settings are not configurable in YAML. See [Circuit breakers](https://docs.lunargate.ai/reference/configuration-retry/#circuit-breakers)
 for half-open behavior and how failures are counted.
 
+## Fast and Ultrafast requests (0.4.1)
+
+Set `service_tier` per request: `fast` (or the OpenAI alias `priority`) requests
+Fast mode; `ultrafast` requests OpenAI Ultrafast through a native Responses target.
+Omitting the parameter preserves provider defaults. Both HTTP JSON and SSE work,
+including Chat Completions routed to an upstream Responses API.
+
+```json
+{"model":"openai/gpt-6.1-sol","input":"Hello","service_tier":"ultrafast"}
+```
+
+For Anthropic, enable `providers.<id>.capabilities.fast_mode: true` for a
+supported model/account. LunarGate maps `fast`/`priority` to `speed: "fast"`,
+`default` to `speed: "standard"`, and leaves speed unset for omitted/`auto`.
+Required Fast beta headers are merged with existing `Anthropic-Beta` values.
+Anthropic does not support `ultrafast`, `flex`, or `scale` speed translation.
+Retries and fallback targets preserve the requested tier. Provider-side changes
+are reported separately as `effective_service_tier`; missing confirmation stays
+unknown. The new metadata is available without sharing prompt/response content.
+
 ## Documentation
 
 Full documentation lives at [docs.lunargate.ai](https://docs.lunargate.ai).

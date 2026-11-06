@@ -15,6 +15,7 @@ import (
 // only current Responses create fields that the gateway maps to its unified
 // Chat Completions contract or resolves locally before target selection.
 var translatedResponsesTopLevelFields = map[string]struct{}{
+	"service_tier":         {},
 	"conversation":         {},
 	"input":                {},
 	"instructions":         {},

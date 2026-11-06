@@ -34,7 +34,6 @@ func TestTranslatedResponsesRejectsUnmappedFieldsPerTarget(t *testing.T) {
 		{name: "prompt cache retention", raw: `{"model":"gpt-5","input":"hi","prompt_cache_retention":"24h"}`, wantField: "prompt_cache_retention"},
 		{name: "context management", raw: `{"model":"gpt-5","input":"hi","context_management":[{"type":"compact","compact_threshold":1000}]}`, wantField: "context_management"},
 		{name: "safety", raw: `{"model":"gpt-5","input":"hi","safety_identifier":"user_hash"}`, wantField: "safety_identifier"},
-		{name: "service tier", raw: `{"model":"gpt-5","input":"hi","service_tier":"priority"}`, wantField: "service_tier"},
 		{name: "stream options", raw: `{"model":"gpt-5","input":"hi","stream":true,"stream_options":{"include_obfuscation":false}}`, wantField: "stream_options"},
 		{name: "background", raw: `{"model":"gpt-5","input":"hi","background":true}`, wantField: "background"},
 		{name: "max tool calls", raw: `{"model":"gpt-5","input":"hi","max_tool_calls":2}`, wantField: "max_tool_calls"},
