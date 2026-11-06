@@ -6,10 +6,72 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/lunargate-ai/gateway/internal/config"
 )
+
+func TestCachedServiceTiersRemainIndependentOfContentSharing(t *testing.T) {
+	for _, sharing := range []bool{false, true} {
+		for _, effective := range []string{"default", ""} {
+			t.Run(fmt.Sprintf("sharing=%v/effective=%s", sharing, effective), func(t *testing.T) {
+				var calls atomic.Int32
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					calls.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					tier := ""
+					if effective != "" {
+						tier = `,"service_tier":"` + effective + `"`
+					}
+					fmt.Fprint(w, `{"id":"chatcmpl_cache_tier","object":"chat.completion","model":"gpt-6.1-sol","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}`+tier+`}`)
+				}))
+				defer upstream.Close()
+				capture := newCollectorCapture(t, sharing, sharing)
+				handler, _ := newObservedOpenAIHandler(t, upstream.URL, config.TargetConfig{Provider: "openai", Model: "gpt-6.1-sol", Weight: 1}, capture.client, enabledTestCacheConfig())
+				for i, tier := range []string{"fast", "fast", "default"} {
+					payload := fmt.Sprintf(`{"model":"gpt-6.1-sol","service_tier":%q,"messages":[{"role":"user","content":"hi"}]}`, tier)
+					w := httptest.NewRecorder()
+					handler.ChatCompletions(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(payload)))
+					if w.Code != http.StatusOK {
+						t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+					}
+					trace, metric, requestLog := capture.waitForEvents(t, sharing)
+					if i != 1 {
+						if w.Header().Get("X-LunarGate-Cache-Status") != "MISS" {
+							t.Fatal("different requested tiers must use different cache entries")
+						}
+						continue
+					}
+					if w.Header().Get("X-LunarGate-Cache-Status") != "HIT" || calls.Load() != 1 {
+						t.Fatal("identical request must hit cache")
+					}
+					if trace["requested_service_tier"] != "fast" {
+						t.Fatalf("cached trace tier = %#v", trace["requested_service_tier"])
+					}
+					for _, event := range []map[string]interface{}{metric, requestLog} {
+						if event == nil {
+							continue
+						}
+						if event["requested_service_tier"] != "fast" || (effective == "" && event["effective_service_tier"] != nil) || (effective != "" && event["effective_service_tier"] != effective) {
+							t.Fatalf("cached tiers lost: %#v", event)
+						}
+						assertCapturedCacheHit(t, event)
+					}
+					if metric["cost_usd"] != float64(0) {
+						t.Fatalf("cache hit cost = %#v", metric["cost_usd"])
+					}
+					if !sharing && requestLog != nil {
+						t.Fatal("content sharing disabled but request log present")
+					}
+				}
+				if calls.Load() != 2 {
+					t.Fatalf("upstream calls = %d, want 2", calls.Load())
+				}
+			})
+		}
+	}
+}
 
 func TestServiceTierForwardingAndMetricsWithoutContentSharing(t *testing.T) {
 	for _, upstreamType := range []string{"chat_completions", "responses"} {

@@ -564,13 +564,18 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 			cachedModelCanonical := modelid.BuildCanonical(resolved.Target.Provider, cachedModelRaw)
 			userPtr, sessionIDPtr := extractUserAndSession(headers)
 			var tokensIn, tokensOut int
+			var effectiveServiceTier *string
 			switch response := cached.(type) {
 			case *models.UnifiedResponse:
+				if response != nil {
+					effectiveServiceTier = response.ServiceTier
+				}
 				if response != nil && response.Usage != nil {
 					tokensIn = response.Usage.PromptTokens
 					tokensOut = response.Usage.CompletionTokens
 				}
 			case models.UnifiedResponse:
+				effectiveServiceTier = response.ServiceTier
 				if response.Usage != nil {
 					tokensIn = response.Usage.PromptTokens
 					tokensOut = response.Usage.CompletionTokens
@@ -581,16 +586,18 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 				requestPayload = buildCollectorRequestLogPayload(body, resolvedSampling)
 			}
 			duration := h.recordCacheHit(r.Context(), cacheHitObservation{
-				requestID:    requestID,
-				startTime:    startTime,
-				requestTypes: resolvedRequestTypes,
-				provider:     resolved.Target.Provider,
-				model:        cachedModelCanonical,
-				metricsModel: boundedModelMetricLabel(resolved.Target, cachedModelRaw),
-				route:        resolved.RouteName,
-				targetIndex:  resolved.Index,
-				user:         userPtr,
-				sessionID:    sessionIDPtr,
+				requestedServiceTier: models.RequestServiceTier(&req),
+				effectiveServiceTier: effectiveServiceTier,
+				requestID:            requestID,
+				startTime:            startTime,
+				requestTypes:         resolvedRequestTypes,
+				provider:             resolved.Target.Provider,
+				model:                cachedModelCanonical,
+				metricsModel:         boundedModelMetricLabel(resolved.Target, cachedModelRaw),
+				route:                resolved.RouteName,
+				targetIndex:          resolved.Index,
+				user:                 userPtr,
+				sessionID:            sessionIDPtr,
 				tags: h.enrichCollectorTagsWithInference(
 					resolvedCollectorHeaders,
 					resolved.Target.Provider,
