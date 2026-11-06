@@ -31,6 +31,9 @@ providers:
     # Extended APIs are opt-in. Enable only contracts implemented by the
     # exact upstream behind base_url.
     capabilities:
+      # Native Decisions, never emulated through Chat or Responses.
+      decisions: true
+      decision_models: [gpt-6-luna]
       chat_completions_lifecycle: true
       responses_lifecycle: true
       conversations: true
@@ -67,11 +70,33 @@ providers:
     base_url: "https://routellm.abacus.ai/v1"
     default_model: "claude-sonnet-4-5"
 
+  typesafe:
+    type: "typesafe"
+    api_key: "${TYPESAFE_API_KEY}"
+    default_model: "jev-latest"
+    models:
+      mode: fetch
+    capabilities:
+      decisions: true
+      decision_models: [jev-latest, jev-preview, jev-1.14.0]
+      # Experimental Jev images: inline base64 PNG/JPEG only.
+      decision_images: false
+
 # Routing Configuration
 routing:
   default_strategy: "weighted"
 
   routes:
+    - name: "native-decisions"
+      match:
+        path: "/v1/decisions"
+      targets:
+        - provider: openai
+          model: gpt-6-luna
+          weight: 100
+        - provider: typesafe
+          model: jev-latest
+          weight: 100
     - name: "openai-native-responses"
       match:
         path: "/v1/responses"

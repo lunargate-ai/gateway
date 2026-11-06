@@ -217,6 +217,12 @@ func (e *Engine) FirstMatchingRouteTargetAvailable(
 
 // Resolve finds the best route and target for the given request context.
 func (e *Engine) Resolve(ctx context.Context, path string, headers map[string]string) (*ResolvedRoute, error) {
+	return e.ResolveEligible(ctx, path, headers, nil)
+}
+
+// ResolveEligible filters effective endpoint capabilities before advancing the
+// load balancer. Existing callers retain precisely the original behavior.
+func (e *Engine) ResolveEligible(ctx context.Context, path string, headers map[string]string, eligible func(config.TargetConfig) bool) (*ResolvedRoute, error) {
 	cfg := e.config.Load().(*config.RoutingConfig)
 	requestedProvider := strings.TrimSpace(headers["x-lunargate-provider"])
 	requestedModel := modelNameFromHeader(strings.TrimSpace(headers["x-lunargate-model"]))
@@ -242,6 +248,21 @@ func (e *Engine) Resolve(ctx context.Context, path string, headers map[string]st
 				continue
 			}
 			selectedTargets, indexMap := filterTargets(route.Targets, requestedProvider, requestedModel, requestedUpstreamRequestType)
+			if eligible != nil {
+				filtered := make([]config.TargetConfig, 0, len(selectedTargets))
+				indices := make([]int, 0, len(selectedTargets))
+				for i, target := range selectedTargets {
+					if eligible(target) {
+						filtered = append(filtered, target)
+						original := i
+						if indexMap != nil {
+							original = indexMap[i]
+						}
+						indices = append(indices, original)
+					}
+				}
+				selectedTargets, indexMap = filtered, indices
+			}
 			if len(selectedTargets) == 0 {
 				return nil, &RequestedTargetUnavailableError{Provider: requestedProvider, Model: requestedModel}
 			}
@@ -254,6 +275,9 @@ func (e *Engine) Resolve(ctx context.Context, path string, headers map[string]st
 			fallbackConfigs, _ := filterTargets(route.Fallback, requestedProvider, requestedModel, requestedUpstreamRequestType)
 			var fallbacks []Target
 			for _, fb := range fallbackConfigs {
+				if eligible != nil && !eligible(fb) {
+					continue
+				}
 				fallbacks = append(fallbacks, Target{
 					Provider:            fb.Provider,
 					Model:               fb.Model,

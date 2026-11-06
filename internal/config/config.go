@@ -102,17 +102,20 @@ type ProviderConfig struct {
 // ProviderCapabilities declares optional API contracts that must never be
 // inferred from a provider's type or URL. Zero values are deliberately safe.
 type ProviderCapabilities struct {
-	FastMode                 bool `mapstructure:"fast_mode"`
-	ChatCompletionsLifecycle bool `mapstructure:"chat_completions_lifecycle"`
-	ResponsesLifecycle       bool `mapstructure:"responses_lifecycle"`
-	Conversations            bool `mapstructure:"conversations"`
-	BackgroundResponses      bool `mapstructure:"background_responses"`
-	ResponseCancellation     bool `mapstructure:"response_cancellation"`
-	ResponseCompaction       bool `mapstructure:"response_compaction"`
-	ResponseInputTokens      bool `mapstructure:"response_input_tokens"`
-	EmbeddingsBase64         bool `mapstructure:"embeddings_base64"`
-	StructuredOutputs        bool `mapstructure:"structured_outputs"`
-	ReasoningEffort          bool `mapstructure:"reasoning_effort"`
+	Decisions                bool     `mapstructure:"decisions"`
+	DecisionModels           []string `mapstructure:"decision_models"`
+	DecisionImages           bool     `mapstructure:"decision_images"`
+	FastMode                 bool     `mapstructure:"fast_mode"`
+	ChatCompletionsLifecycle bool     `mapstructure:"chat_completions_lifecycle"`
+	ResponsesLifecycle       bool     `mapstructure:"responses_lifecycle"`
+	Conversations            bool     `mapstructure:"conversations"`
+	BackgroundResponses      bool     `mapstructure:"background_responses"`
+	ResponseCancellation     bool     `mapstructure:"response_cancellation"`
+	ResponseCompaction       bool     `mapstructure:"response_compaction"`
+	ResponseInputTokens      bool     `mapstructure:"response_input_tokens"`
+	EmbeddingsBase64         bool     `mapstructure:"embeddings_base64"`
+	StructuredOutputs        bool     `mapstructure:"structured_outputs"`
+	ReasoningEffort          bool     `mapstructure:"reasoning_effort"`
 	// ReasoningEffortLevels narrows model-dependent levels. An empty list
 	// enables only the common low, medium, and high levels.
 	ReasoningEffortLevels []string `mapstructure:"reasoning_effort_levels"`
@@ -502,6 +505,9 @@ func normalizeProviderCapabilities(cfg *Config) {
 		return
 	}
 	for providerID, providerCfg := range cfg.Providers {
+		if len(providerCfg.Capabilities.DecisionModels) > 0 {
+			providerCfg.Capabilities.DecisionModels = normalizeCapabilityValues(providerCfg.Capabilities.DecisionModels)
+		}
 		if len(providerCfg.Capabilities.HostedTools) > 0 {
 			providerCfg.Capabilities.HostedTools = normalizeCapabilityValues(providerCfg.Capabilities.HostedTools)
 		}
@@ -871,20 +877,33 @@ func validateProviderConfigs(providers map[string]ProviderConfig) (map[string]st
 		providerType := strings.ToLower(strings.TrimSpace(providerCfg.Type))
 		if providerType == "" {
 			switch providerID {
-			case "openai", "anthropic", "ollama":
+			case "openai", "anthropic", "ollama", "typesafe":
 				providerType = providerID
 			default:
 				return nil, fmt.Errorf("providers[%q].type is required for a custom provider", providerID)
 			}
 		}
 		switch providerType {
-		case "openai", "anthropic", "ollama":
+		case "openai", "anthropic", "ollama", "typesafe":
 		default:
 			return nil, fmt.Errorf("providers[%q].type %q is not supported", providerID, providerCfg.Type)
 		}
 		if strings.TrimSpace(providerCfg.BaseURL) != "" {
 			if _, err := safeurl.ParseHTTPBaseURL(providerCfg.BaseURL); err != nil {
 				return nil, fmt.Errorf("providers[%q].base_url must be an absolute HTTP or HTTPS URL", providerID)
+			}
+		}
+		if providerCfg.Capabilities.Decisions {
+			if providerType != "openai" && providerType != "typesafe" {
+				return nil, fmt.Errorf("providers[%q].capabilities.decisions requires openai or typesafe", providerID)
+			}
+			if len(providerCfg.Capabilities.DecisionModels) == 0 {
+				return nil, fmt.Errorf("providers[%q].capabilities.decision_models must explicitly list native decision models", providerID)
+			}
+			for _, model := range providerCfg.Capabilities.DecisionModels {
+				if (providerType == "openai" && model != "gpt-6-luna") || (providerType == "typesafe" && !strings.HasPrefix(model, "jev-")) {
+					return nil, fmt.Errorf("providers[%q].capabilities.decision_models contains an unsupported native decision model", providerID)
+				}
 			}
 		}
 		if providerCfg.Timeout < 0 {
@@ -910,7 +929,7 @@ func validateProviderConfigs(providers map[string]ProviderConfig) (map[string]st
 		}
 		if modelMode == "fetch" {
 			switch providerType {
-			case "openai", "ollama":
+			case "openai", "ollama", "typesafe":
 			default:
 				return nil, fmt.Errorf("providers[%q].models.mode=fetch is not supported for provider type %q", providerID, providerType)
 			}

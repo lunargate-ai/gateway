@@ -66,8 +66,8 @@ func (h *Handler) providerSupportsResponseCapability(provider string, capability
 	if h == nil || h.registry == nil {
 		return false
 	}
-	capabilities, ok := h.registry.Capabilities(strings.TrimSpace(provider))
-	return ok && providerHasResponseCapability(capabilities, capability)
+	snapshot, ok := h.registry.Snapshot(strings.TrimSpace(provider))
+	return ok && snapshot.ProviderType != "typesafe" && providerHasResponseCapability(snapshot.Capabilities, capability)
 }
 
 func responseBindingFromHeaders(headers http.Header) responseBinding {

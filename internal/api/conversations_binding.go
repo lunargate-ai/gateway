@@ -281,8 +281,8 @@ func (h *Handler) providerSupportsConversations(provider string) bool {
 	if h == nil || h.registry == nil {
 		return false
 	}
-	capabilities, ok := h.registry.Capabilities(strings.TrimSpace(provider))
-	return ok && capabilities.Conversations
+	snapshot, ok := h.registry.Snapshot(strings.TrimSpace(provider))
+	return ok && snapshot.ProviderType != "typesafe" && snapshot.Capabilities.Conversations
 }
 
 func (h *Handler) validateConversationProvider(provider string) (conversationBinding, error) {

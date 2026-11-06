@@ -8,12 +8,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/lunargate-ai/gateway/internal/config"
+	"github.com/lunargate-ai/gateway/pkg/models"
 )
 
 func TestLocalInstanceIDFormatAndUniqueness(t *testing.T) {
@@ -371,5 +373,28 @@ func awaitHello(t *testing.T, hellos <-chan helloMessage) helloMessage {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for remote control hello")
 		return helloMessage{}
+	}
+}
+
+func TestDecisionsHelloAndSandboxEndpoint(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/decisions" || r.Header.Get("X-LunarGate-Route") != "native" {
+			t.Errorf("incorrect native sandbox dispatch: %s", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"answers":[]}`))
+	}))
+	defer server.Close()
+	caps := models.DecisionCapabilities{Models: []string{"typesafe/jev-latest"}, Routes: []string{"native"}, OnlyModels: []string{"typesafe/jev-latest"}, OnlyRoutes: []string{"native"}}
+	client := NewClient(config.GeneralConfig{APIKey: "synthetic", BackendURL: "https://api.staging.lunargate.ai/v1"}, config.DataSharingConfig{Enabled: true, RemoteControl: true}, config.SecurityConfig{}, "test", server.URL, nil, nil, nil, func() models.DecisionCapabilities { return caps })
+	hello := client.buildSnapshotHello()
+	if !reflect.DeepEqual(hello.DecisionCapabilities, caps) || len(hello.Models) != 0 {
+		t.Fatalf("missing capability fields or overwritten base inventory: %#v", hello)
+	}
+	status, _, _, err := client.executeSandbox(context.Background(), sandboxExecuteMessage{RequestType: "decisions", Target: sandboxTarget{Mode: "route", Value: "native"}, Request: map[string]interface{}{"input": "synthetic"}})
+	if err != nil || status != 200 {
+		t.Fatalf("native sandbox failed: status=%d err=%v", status, err)
+	}
+	if _, err := sandboxEndpointPath("systemone"); err == nil {
+		t.Fatal("upstream transport accepted as a public Sandbox API")
 	}
 }

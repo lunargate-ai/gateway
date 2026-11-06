@@ -385,6 +385,7 @@ func cloneProviderConfigs(providerConfigs map[string]config.ProviderConfig) map[
 		providerCfg.Models.Static = append([]string(nil), providerCfg.Models.Static...)
 		providerCfg.Capabilities.HostedTools = append([]string(nil), providerCfg.Capabilities.HostedTools...)
 		providerCfg.Capabilities.ReasoningEffortLevels = append([]string(nil), providerCfg.Capabilities.ReasoningEffortLevels...)
+		providerCfg.Capabilities.DecisionModels = append([]string(nil), providerCfg.Capabilities.DecisionModels...)
 		out[providerID] = providerCfg
 	}
 	return out

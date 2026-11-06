@@ -242,3 +242,30 @@ func hasModel(items []models.ModelInfo, id string) bool {
 	}
 	return false
 }
+
+func TestTypeSafeDiscoveryPreservesNativeCapabilitiesAndPinnedModels(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if r.URL.Path != "/v1/models" || r.Header.Get("Authorization") != "Bearer synthetic" {
+			t.Errorf("unexpected discovery request: %s", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"models":[{"name":"jev-latest"},{"name":"jev-preview"}]}`))
+	}))
+	defer server.Close()
+	configs := map[string]config.ProviderConfig{"native": {
+		Type: "typesafe", APIKey: "synthetic", BaseURL: server.URL + "/v1",
+		Models:       config.ProviderModelsConfig{Mode: "fetch"},
+		Capabilities: config.ProviderCapabilities{Decisions: true, DecisionModels: []string{"jev-latest", "jev-1.14.0"}},
+	}}
+	store := NewStore(providers.NewRegistry(configs), configs)
+	items := store.AllModels(context.Background())
+	if requests.Load() != 1 || !hasModel(items, "native/jev-preview") || !hasModel(items, "native/jev-1.14.0") {
+		t.Fatalf("discovery omitted aliases or configured pinned model: %#v", items)
+	}
+	for _, item := range items {
+		if item.Capabilities == nil || !item.Capabilities.DecisionsOnly || item.Capabilities.Decisions != (item.ID != "native/jev-preview") {
+			t.Fatalf("incorrect native capabilities: %#v", item)
+		}
+	}
+}

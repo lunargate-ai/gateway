@@ -101,6 +101,7 @@ func cloneProviderConfigs(cfg map[string]config.ProviderConfig) map[string]confi
 			providerCfg.Extra = nil
 		}
 		providerCfg.Models.Static = append([]string(nil), providerCfg.Models.Static...)
+		providerCfg.Capabilities.DecisionModels = append([]string(nil), providerCfg.Capabilities.DecisionModels...)
 		providerCfg.Capabilities.HostedTools = append([]string(nil), providerCfg.Capabilities.HostedTools...)
 		providerCfg.Capabilities.ReasoningEffortLevels = append([]string(nil), providerCfg.Capabilities.ReasoningEffortLevels...)
 		cloned[provider] = providerCfg
@@ -147,7 +148,13 @@ func (s *Store) collectModels(
 
 	for _, providerID := range providerIDs {
 		pcfg := providersCfg[providerID]
+		if resolvedType, ok := s.registry.Type(providerID); ok {
+			pcfg.Type = resolvedType
+		}
 		ids := resolve(providerID, pcfg)
+		if pcfg.Capabilities.Decisions {
+			ids = append(append([]string(nil), ids...), pcfg.Capabilities.DecisionModels...)
+		}
 		for _, raw := range ids {
 			m := strings.TrimSpace(raw)
 			if m == "" {
@@ -158,7 +165,7 @@ func (s *Store) collectModels(
 				continue
 			}
 			seen[canonical] = struct{}{}
-			out = append(out, models.ModelInfo{ID: canonical, Object: "model", Created: time.Now().Unix(), OwnedBy: providerID})
+			out = append(out, models.ModelInfo{ID: canonical, Object: "model", Created: time.Now().Unix(), OwnedBy: providerID, Capabilities: providers.DecisionModelCapabilities(pcfg, m)})
 		}
 	}
 
@@ -332,6 +339,40 @@ func (s *Store) fetchModels(ctx context.Context, providerID string, pcfg config.
 		for _, m := range tr.Models {
 			if ss := strings.TrimSpace(m.Name); ss != "" {
 				out = append(out, ss)
+			}
+		}
+		return out, nil
+	}
+	if providerType == "typesafe" {
+		endpoint, err := safeurl.JoinHTTPPath(baseURL, "models")
+		if err != nil {
+			return nil, fmt.Errorf("failed to build typesafe models endpoint: %w", err)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create typesafe models request: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+pcfg.APIKey)
+		resp, err := s.client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch typesafe models: %w", safeurl.RedactTransportError(err, req.URL))
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("typesafe models returned status=%d", resp.StatusCode)
+		}
+		var body struct {
+			Models []struct {
+				Name string `json:"name"`
+			} `json:"models"`
+		}
+		if err := decodeModelsResponse(resp.Body, &body); err != nil {
+			return nil, fmt.Errorf("failed to decode typesafe models: %w", err)
+		}
+		out := make([]string, 0, len(body.Models))
+		for _, model := range body.Models {
+			if strings.TrimSpace(model.Name) != "" {
+				out = append(out, model.Name)
 			}
 		}
 		return out, nil
