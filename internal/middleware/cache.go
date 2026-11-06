@@ -165,6 +165,15 @@ type cacheKeyMaterial struct {
 	ProviderHeaders     http.Header `json:"provider_headers,omitempty"`
 }
 
+func GenerateDecisionsKey(req *models.DecisionsRequest, provider, model, upstream string, headers http.Header) string {
+	data, err := json.Marshal(cacheKeyMaterial{Raw: canonicalJSONDocument(req.RawJSON), Normalized: req, Provider: provider, ResolvedModel: model, UpstreamRequestType: upstream, ProviderHeaders: canonicalProviderControlHeaders(headers)})
+	if err != nil {
+		return ""
+	}
+	hash := sha256.Sum256(data)
+	return fmt.Sprintf("decisions-v1-%x", hash[:16])
+}
+
 var cacheProviderControlHeaders = []string{
 	"Anthropic-Beta",
 	"Idempotency-Key",

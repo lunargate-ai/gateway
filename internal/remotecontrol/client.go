@@ -19,6 +19,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/lunargate-ai/gateway/internal/config"
 	"github.com/lunargate-ai/gateway/internal/safeurl"
+	"github.com/lunargate-ai/gateway/pkg/models"
 	"github.com/rs/zerolog/log"
 )
 
@@ -47,6 +48,7 @@ type Client struct {
 	routeNames            func() []string
 	modelSnapshotIDs      ModelSnapshotFunc
 	modelIDs              ModelListFunc
+	decisionCapabilities  func() models.DecisionCapabilities
 	httpClient            *http.Client
 	refreshCh             chan struct{}
 	heartbeatInterval     time.Duration
@@ -62,6 +64,7 @@ type Client struct {
 }
 
 type helloMessage struct {
+	models.DecisionCapabilities
 	Type       string   `json:"type"`
 	InstanceID string   `json:"instance_id"`
 	Version    string   `json:"version,omitempty"`
@@ -110,6 +113,7 @@ func NewClient(
 	routeNames func() []string,
 	modelSnapshotIDs ModelSnapshotFunc,
 	modelIDs ModelListFunc,
+	decisionCapabilities ...func() models.DecisionCapabilities,
 ) *Client {
 	if !dataSharing.Enabled {
 		return nil
@@ -138,17 +142,22 @@ func NewClient(
 		return nil
 	}
 	localAuthHeader, localAuthValue := loopbackCredential(security)
+	var decisions func() models.DecisionCapabilities
+	if len(decisionCapabilities) > 0 {
+		decisions = decisionCapabilities[0]
+	}
 	return &Client{
-		backendURL:       backendURL,
-		apiKey:           apiKey,
-		instanceID:       instanceID,
-		version:          version,
-		localBaseURL:     localBaseURL,
-		localAuthHeader:  localAuthHeader,
-		localAuthValue:   localAuthValue,
-		routeNames:       routeNames,
-		modelSnapshotIDs: modelSnapshotIDs,
-		modelIDs:         modelIDs,
+		decisionCapabilities: decisions,
+		backendURL:           backendURL,
+		apiKey:               apiKey,
+		instanceID:           instanceID,
+		version:              version,
+		localBaseURL:         localBaseURL,
+		localAuthHeader:      localAuthHeader,
+		localAuthValue:       localAuthValue,
+		routeNames:           routeNames,
+		modelSnapshotIDs:     modelSnapshotIDs,
+		modelIDs:             modelIDs,
 		httpClient: &http.Client{
 			Timeout: 5 * time.Minute,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
@@ -668,9 +677,11 @@ func sandboxEndpointPath(requestType string) (string, error) {
 		return "/v1/responses", nil
 	case "embeddings":
 		return "/v1/embeddings", nil
+	case "decisions":
+		return "/v1/decisions", nil
 	default:
 		return "", fmt.Errorf(
-			"unsupported sandbox request_type %q: expected chat_completions, responses, or embeddings",
+			"unsupported sandbox request_type %q: expected chat_completions, responses, embeddings, or decisions",
 			requestType,
 		)
 	}
@@ -689,13 +700,17 @@ func (c *Client) buildHello(models []string) helloMessage {
 	if c.routeNames != nil {
 		routes = c.routeNames()
 	}
-	return helloMessage{
+	result := helloMessage{
 		Type:       "hello",
 		InstanceID: c.instanceID,
 		Version:    c.version,
 		Routes:     routes,
 		Models:     models,
 	}
+	if c.decisionCapabilities != nil {
+		result.DecisionCapabilities = c.decisionCapabilities()
+	}
+	return result
 }
 
 func (c *Client) websocketURL() (string, error) {

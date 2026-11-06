@@ -147,6 +147,7 @@ func buildRegistryEntries(providers map[string]config.ProviderConfig) map[string
 }
 
 func cloneProviderCapabilities(capabilities config.ProviderCapabilities) config.ProviderCapabilities {
+	capabilities.DecisionModels = append([]string(nil), capabilities.DecisionModels...)
 	capabilities.HostedTools = append([]string(nil), capabilities.HostedTools...)
 	capabilities.ReasoningEffortLevels = append([]string(nil), capabilities.ReasoningEffortLevels...)
 	return capabilities
@@ -159,7 +160,7 @@ func resolveProviderType(providerID string, cfg config.ProviderConfig) (string, 
 
 	// If type isn't explicitly set, only allow built-in provider IDs.
 	switch providerID {
-	case "openai", "anthropic", "ollama":
+	case "openai", "anthropic", "ollama", "typesafe":
 		return providerID, nil
 	default:
 		return "", fmt.Errorf("provider type is required for provider_id=%q", providerID)
@@ -174,6 +175,8 @@ func createTranslator(providerType string, cfg config.ProviderConfig) (models.Pr
 		return NewAnthropicTranslator(cfg), nil
 	case "ollama":
 		return NewOllamaTranslator(cfg), nil
+	case "typesafe":
+		return NewTypeSafeTranslator(cfg), nil
 	default:
 		return nil, fmt.Errorf("unknown provider type: %s", providerType)
 	}

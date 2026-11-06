@@ -131,6 +131,7 @@ func main() {
 				handler.RuntimeRouteNames,
 				handler.RuntimeModelSnapshotIDs,
 				handler.RuntimeModelIDs,
+				handler.RuntimeDecisionCapabilities,
 			)
 		}
 		if remoteControlClient != nil {

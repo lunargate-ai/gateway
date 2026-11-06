@@ -33,6 +33,7 @@ LunarGate is a Go-based AI gateway that lets you expose one stable endpoint to y
 - Responses: JSON/SSE `POST /v1/responses`, WebSocket `GET /v1/responses`, retrieve/delete/cancel/input-items, compaction, and input-token counting
 - Conversations: create/retrieve/update/delete and item create/list/retrieve/delete under `/v1/conversations`
 - `POST /v1/embeddings`
+- Native Decisions: JSON `POST /v1/decisions` for OpenAI Luna and TypeSafe Jev
 - `GET /v1/models` and `GET /v1/models/{model}`
 - Operational endpoints: `GET /health`, `GET /ready`, and `GET /metrics`
 

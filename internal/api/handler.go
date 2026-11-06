@@ -1573,6 +1573,22 @@ func (h *Handler) availableModels(ctx context.Context) []models.ModelInfo {
 	} else if h != nil && h.registry != nil {
 		allModels = h.registry.AllModels()
 	}
+	if h != nil && h.registry != nil {
+		configs := h.registry.ConfigSnapshot()
+		for i, item := range allModels {
+			provider, model, ok := modelid.SplitCanonical(item.ID)
+			if !ok {
+				provider = item.OwnedBy
+				model = item.ID
+			}
+			cfg, ok := configs[provider]
+			if !ok {
+				continue
+			}
+			cfg.Type, _ = h.registry.Type(provider)
+			allModels[i].Capabilities = providers.DecisionModelCapabilities(cfg, model)
+		}
+	}
 	auto := models.ModelInfo{ID: "lunargate/auto", Object: "model", Created: time.Now().Unix(), OwnedBy: "lunargate"}
 	return append(allModels, auto)
 }

@@ -98,8 +98,22 @@ type ModelList struct {
 }
 
 type ModelInfo struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	Created int64  `json:"created"`
-	OwnedBy string `json:"owned_by"`
+	ID           string             `json:"id"`
+	Object       string             `json:"object"`
+	Created      int64              `json:"created"`
+	OwnedBy      string             `json:"owned_by"`
+	Capabilities *ModelCapabilities `json:"capabilities,omitempty"`
+}
+
+type ModelCapabilities struct {
+	Decisions      bool `json:"decisions"`
+	DecisionsOnly  bool `json:"decisions_only"`
+	DecisionImages bool `json:"decision_images"`
+}
+
+type DecisionCapabilities struct {
+	Models     []string `json:"decision_models,omitempty"`
+	Routes     []string `json:"decision_routes,omitempty"`
+	OnlyModels []string `json:"decision_only_models,omitempty"`
+	OnlyRoutes []string `json:"decision_only_routes,omitempty"`
 }
