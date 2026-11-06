@@ -48,6 +48,7 @@ func (t *AnthropicTranslator) BaseURL() string {
 // --- Anthropic-specific request/response types ---
 
 type anthropicRequest struct {
+	Speed         string                  `json:"speed,omitempty"`
 	Model         string                  `json:"model"`
 	MaxTokens     int                     `json:"max_tokens"`
 	Messages      []anthropicMessage      `json:"messages"`
@@ -124,6 +125,7 @@ type anthropicTool struct {
 }
 
 type anthropicUsage struct {
+	Speed                    string                  `json:"speed,omitempty"`
 	InputTokens              int                     `json:"input_tokens"`
 	OutputTokens             int                     `json:"output_tokens"`
 	CacheCreationInputTokens int                     `json:"cache_creation_input_tokens"`
@@ -158,6 +160,10 @@ func (t *AnthropicTranslator) ValidateRequestCompatibility(providerID string, re
 		providerID = "anthropic"
 	}
 	if err := validateTranslatedChatRawControls(providerID, req); err != nil {
+		return err
+	}
+
+	if _, err := t.requestSpeed(providerID, req); err != nil {
 		return err
 	}
 
@@ -596,7 +602,12 @@ func (t *AnthropicTranslator) TranslateRequest(ctx context.Context, req *models.
 	toolChoice, _ := mapOpenAIToolChoiceToAnthropic(req.ToolChoice)
 	stopSequences, _ := mapAnthropicStopSequences(req.Stop)
 
+	speed, err := t.requestSpeed("anthropic", req)
+	if err != nil {
+		return nil, err
+	}
 	anthropicReq := anthropicRequest{
+		Speed:         speed,
 		Model:         req.Model,
 		MaxTokens:     maxTokens,
 		Messages:      messages,
@@ -631,6 +642,9 @@ func (t *AnthropicTranslator) TranslateRequest(ctx context.Context, req *models.
 	httpReq.Header.Set("x-api-key", t.cfg.APIKey)
 	httpReq.Header.Set("anthropic-version", t.cfg.APIVersion)
 	applyUpstreamRequestHeaders(ctx, httpReq, "Anthropic-Beta")
+	if speed != "" && anthropicSpeedNeedsBeta(req.Model) {
+		addAnthropicBeta(httpReq.Header, "fast-mode-2026-02-01")
+	}
 
 	return httpReq, nil
 }
@@ -723,10 +737,11 @@ func (t *AnthropicTranslator) toUnified(resp *anthropicResponse) *models.Unified
 	}
 
 	return &models.UnifiedResponse{
-		ID:      resp.ID,
-		Object:  "chat.completion",
-		Created: time.Now().Unix(),
-		Model:   resp.Model,
+		ID:          resp.ID,
+		Object:      "chat.completion",
+		Created:     time.Now().Unix(),
+		Model:       resp.Model,
+		ServiceTier: anthropicServiceTier(resp.Usage.Speed),
 		Choices: []models.Choice{
 			{
 				Index: 0,

@@ -787,6 +787,7 @@ func unifiedToResponsesPayload(req *models.UnifiedRequest) *models.ResponsesRequ
 	}
 
 	out := &models.ResponsesRequest{
+		ServiceTier:        req.ServiceTier,
 		Model:              req.Model,
 		Input:              input,
 		PreviousResponseID: req.PreviousResponseID,
@@ -870,10 +871,11 @@ func responsesResponseToUnified(resp *models.ResponsesResponse) *models.UnifiedR
 	}
 
 	out := &models.UnifiedResponse{
-		ID:      resp.ID,
-		Object:  "chat.completion",
-		Created: resp.CreatedAt,
-		Model:   resp.Model,
+		ServiceTier: resp.ServiceTier,
+		ID:          resp.ID,
+		Object:      "chat.completion",
+		Created:     resp.CreatedAt,
+		Model:       resp.Model,
 		Choices: []models.Choice{{
 			Index:   0,
 			Message: message,
@@ -1024,10 +1026,11 @@ func responsesEventToStreamChunk(data []byte) (*models.StreamChunk, error) {
 			return nil, err
 		}
 		chunk := &models.StreamChunk{
-			ID:      terminalResponse.ID,
-			Object:  "chat.completion.chunk",
-			Created: terminalResponse.CreatedAt,
-			Model:   terminalResponse.Model,
+			ID:          terminalResponse.ID,
+			Object:      "chat.completion.chunk",
+			Created:     terminalResponse.CreatedAt,
+			Model:       terminalResponse.Model,
+			ServiceTier: terminalResponse.ServiceTier,
 			Choices: []models.Choice{{
 				Index:        0,
 				Delta:        &models.Message{},

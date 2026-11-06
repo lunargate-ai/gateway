@@ -102,6 +102,7 @@ type ProviderConfig struct {
 // ProviderCapabilities declares optional API contracts that must never be
 // inferred from a provider's type or URL. Zero values are deliberately safe.
 type ProviderCapabilities struct {
+	FastMode                 bool `mapstructure:"fast_mode"`
 	ChatCompletionsLifecycle bool `mapstructure:"chat_completions_lifecycle"`
 	ResponsesLifecycle       bool `mapstructure:"responses_lifecycle"`
 	Conversations            bool `mapstructure:"conversations"`

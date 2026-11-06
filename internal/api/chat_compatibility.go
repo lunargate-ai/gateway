@@ -26,6 +26,7 @@ type chatUpstreamCompatibilityValidator interface {
 // Anthropic and Ollama targets translate the typed request and would otherwise
 // silently discard new or vendor-specific top-level controls.
 var translatedChatTopLevelFields = map[string]struct{}{
+	"service_tier":          {},
 	"frequency_penalty":     {},
 	"function_call":         {},
 	"functions":             {},

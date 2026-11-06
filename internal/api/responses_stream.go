@@ -32,6 +32,7 @@ var (
 )
 
 type responsesStreamProxy struct {
+	serviceTier   *string
 	target        http.ResponseWriter
 	headers       http.Header
 	statusCode    int
@@ -1079,6 +1080,9 @@ func (p *responsesStreamProxy) processFrame(frame string) error {
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
 			continue
 		}
+		if chunk.ServiceTier != nil {
+			p.serviceTier = chunk.ServiceTier
+		}
 		if p.responseID == "" {
 			p.responseID = translatedResponseID(chunk.ID)
 		}
@@ -1704,6 +1708,9 @@ func (p *responsesStreamProxy) emitFinal(status, eventType, incompleteReason str
 		"status":     status,
 		"model":      p.model,
 		"output":     outputItems,
+	}
+	if p.serviceTier != nil {
+		resp["service_tier"] = *p.serviceTier
 	}
 	if p.usage != nil {
 		resp["usage"] = models.ResponsesUsageFromChat(p.usage)

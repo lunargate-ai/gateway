@@ -15,8 +15,9 @@ import (
 type anthropicStreamTranslator struct {
 	base *AnthropicTranslator
 
-	id    string
-	model string
+	id          string
+	model       string
+	serviceTier *string
 
 	toolCallIndexByContentBlockIndex map[int]int
 	nextToolCallIndex                int
@@ -114,6 +115,7 @@ func (t *anthropicStreamTranslator) ParseStreamChunk(data []byte) (*models.Strea
 		}
 		t.id = event.Message.ID
 		t.model = event.Message.Model
+		t.serviceTier = anthropicServiceTier(event.Message.Usage.Speed)
 
 		var usage *models.Usage
 		if anthropicUsageHasTokens(event.Message.Usage) {
@@ -121,10 +123,11 @@ func (t *anthropicStreamTranslator) ParseStreamChunk(data []byte) (*models.Strea
 		}
 
 		return &models.StreamChunk{
-			ID:      t.id,
-			Object:  "chat.completion.chunk",
-			Created: time.Now().Unix(),
-			Model:   t.model,
+			ID:          t.id,
+			Object:      "chat.completion.chunk",
+			Created:     time.Now().Unix(),
+			Model:       t.model,
+			ServiceTier: t.serviceTier,
 			Choices: []models.Choice{{
 				Index:        0,
 				Delta:        &models.Message{Role: "assistant"},
@@ -144,10 +147,11 @@ func (t *anthropicStreamTranslator) ParseStreamChunk(data []byte) (*models.Strea
 				return nil, nil
 			}
 			return &models.StreamChunk{
-				ID:      t.id,
-				Object:  "chat.completion.chunk",
-				Created: time.Now().Unix(),
-				Model:   t.model,
+				ID:          t.id,
+				Object:      "chat.completion.chunk",
+				Created:     time.Now().Unix(),
+				Model:       t.model,
+				ServiceTier: t.serviceTier,
 				Choices: []models.Choice{{
 					Index:        0,
 					Delta:        &models.Message{Content: event.ContentBlock.Text},
@@ -165,10 +169,11 @@ func (t *anthropicStreamTranslator) ParseStreamChunk(data []byte) (*models.Strea
 
 			idx := toolCallIdx
 			return &models.StreamChunk{
-				ID:      t.id,
-				Object:  "chat.completion.chunk",
-				Created: time.Now().Unix(),
-				Model:   t.model,
+				ID:          t.id,
+				Object:      "chat.completion.chunk",
+				Created:     time.Now().Unix(),
+				Model:       t.model,
+				ServiceTier: t.serviceTier,
 				Choices: []models.Choice{{
 					Index: 0,
 					Delta: &models.Message{
@@ -199,10 +204,11 @@ func (t *anthropicStreamTranslator) ParseStreamChunk(data []byte) (*models.Strea
 				return nil, nil
 			}
 			return &models.StreamChunk{
-				ID:      t.id,
-				Object:  "chat.completion.chunk",
-				Created: time.Now().Unix(),
-				Model:   t.model,
+				ID:          t.id,
+				Object:      "chat.completion.chunk",
+				Created:     time.Now().Unix(),
+				Model:       t.model,
+				ServiceTier: t.serviceTier,
 				Choices: []models.Choice{{
 					Index:        0,
 					Delta:        &models.Message{Content: event.Delta.Text},
@@ -220,10 +226,11 @@ func (t *anthropicStreamTranslator) ParseStreamChunk(data []byte) (*models.Strea
 			}
 			idx := toolCallIdx
 			return &models.StreamChunk{
-				ID:      t.id,
-				Object:  "chat.completion.chunk",
-				Created: time.Now().Unix(),
-				Model:   t.model,
+				ID:          t.id,
+				Object:      "chat.completion.chunk",
+				Created:     time.Now().Unix(),
+				Model:       t.model,
+				ServiceTier: t.serviceTier,
 				Choices: []models.Choice{{
 					Index: 0,
 					Delta: &models.Message{
@@ -244,6 +251,11 @@ func (t *anthropicStreamTranslator) ParseStreamChunk(data []byte) (*models.Strea
 		}
 
 	case "message_delta":
+		if event.Usage != nil {
+			if tier := anthropicServiceTier(event.Usage.Speed); tier != nil {
+				t.serviceTier = tier
+			}
+		}
 		if event.Delta == nil {
 			return nil, nil
 		}
@@ -256,10 +268,11 @@ func (t *anthropicStreamTranslator) ParseStreamChunk(data []byte) (*models.Strea
 		}
 
 		return &models.StreamChunk{
-			ID:      t.id,
-			Object:  "chat.completion.chunk",
-			Created: time.Now().Unix(),
-			Model:   t.model,
+			ID:          t.id,
+			Object:      "chat.completion.chunk",
+			Created:     time.Now().Unix(),
+			Model:       t.model,
+			ServiceTier: t.serviceTier,
 			Choices: []models.Choice{{
 				Index:        0,
 				Delta:        &models.Message{Refusal: refusal},

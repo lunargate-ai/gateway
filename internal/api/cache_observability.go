@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strconv"
 	"strings"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/lunargate-ai/gateway/internal/observability"
 	"github.com/lunargate-ai/gateway/internal/routing"
+	"github.com/lunargate-ai/gateway/pkg/models"
 )
 
 const dynamicModelMetricLabel = "_dynamic"
@@ -66,10 +68,11 @@ func (h *Handler) recordCacheHit(ctx context.Context, observation cacheHitObserv
 	h.collector.Enqueue(ctx, observation.requestID, []observability.Event{{
 		Type: "trace",
 		Data: observability.TraceEventData{
-			RequestID: observation.requestID,
-			Timestamp: observation.startTime.UTC(),
-			Phase:     "request_start",
-			Tags:      observation.tags,
+			RequestedServiceTier: serviceTierFromDocument(observation.request),
+			RequestID:            observation.requestID,
+			Timestamp:            observation.startTime.UTC(),
+			Phase:                "request_start",
+			Tags:                 observation.tags,
 		},
 	}})
 
@@ -78,25 +81,27 @@ func (h *Handler) recordCacheHit(ctx context.Context, observation cacheHitObserv
 	events := []observability.Event{{
 		Type: "metric",
 		Data: observability.MetricEventData{
-			RequestID:           observation.requestID,
-			Timestamp:           observation.startTime.UTC(),
-			RequestType:         observation.requestTypes.client,
-			UpstreamRequestType: observation.requestTypes.upstream,
-			DurationMS:          duration.Milliseconds(),
-			Provider:            observation.provider,
-			Model:               observation.model,
-			User:                observation.user,
-			SessionID:           observation.sessionID,
-			TokensInput:         observation.tokensInput,
-			TokensOutput:        observation.tokensOutput,
-			CostUSD:             0,
-			StatusCode:          http.StatusOK,
-			CacheHit:            true,
-			RouteUsed:           &routeUsed,
-			TargetIndex:         &targetIndex,
-			FallbackUsed:        false,
-			RetryCount:          0,
-			Tags:                observation.tags,
+			RequestedServiceTier: serviceTierFromDocument(observation.request),
+			EffectiveServiceTier: serviceTierFromDocument(observation.response),
+			RequestID:            observation.requestID,
+			Timestamp:            observation.startTime.UTC(),
+			RequestType:          observation.requestTypes.client,
+			UpstreamRequestType:  observation.requestTypes.upstream,
+			DurationMS:           duration.Milliseconds(),
+			Provider:             observation.provider,
+			Model:                observation.model,
+			User:                 observation.user,
+			SessionID:            observation.sessionID,
+			TokensInput:          observation.tokensInput,
+			TokensOutput:         observation.tokensOutput,
+			CostUSD:              0,
+			StatusCode:           http.StatusOK,
+			CacheHit:             true,
+			RouteUsed:            &routeUsed,
+			TargetIndex:          &targetIndex,
+			FallbackUsed:         false,
+			RetryCount:           0,
+			Tags:                 observation.tags,
 		},
 	}}
 
@@ -112,27 +117,43 @@ func (h *Handler) recordCacheHit(ctx context.Context, observation cacheHitObserv
 		events = append(events, observability.Event{
 			Type: "request_log",
 			Data: observability.RequestLogEventData{
-				RequestID:           observation.requestID,
-				Timestamp:           observation.startTime.UTC(),
-				RequestType:         observation.requestTypes.client,
-				UpstreamRequestType: observation.requestTypes.upstream,
-				User:                observation.user,
-				SessionID:           observation.sessionID,
-				Provider:            observation.provider,
-				Model:               observation.model,
-				StatusCode:          http.StatusOK,
-				DurationMS:          duration.Milliseconds(),
-				RouteUsed:           &routeUsed,
-				CacheHit:            true,
-				FallbackUsed:        false,
-				RetryCount:          0,
-				Tags:                observation.tags,
-				Request:             request,
-				Response:            response,
+				RequestedServiceTier: serviceTierFromDocument(observation.request),
+				EffectiveServiceTier: serviceTierFromDocument(observation.response),
+				RequestID:            observation.requestID,
+				Timestamp:            observation.startTime.UTC(),
+				RequestType:          observation.requestTypes.client,
+				UpstreamRequestType:  observation.requestTypes.upstream,
+				User:                 observation.user,
+				SessionID:            observation.sessionID,
+				Provider:             observation.provider,
+				Model:                observation.model,
+				StatusCode:           http.StatusOK,
+				DurationMS:           duration.Milliseconds(),
+				RouteUsed:            &routeUsed,
+				CacheHit:             true,
+				FallbackUsed:         false,
+				RetryCount:           0,
+				Tags:                 observation.tags,
+				Request:              request,
+				Response:             response,
 			},
 		})
 	}
 
 	h.collector.Enqueue(ctx, observation.requestID, events)
 	return duration
+}
+
+func serviceTierFromDocument(document interface{}) *string {
+	raw, err := json.Marshal(document)
+	if err != nil {
+		return nil
+	}
+	var value struct {
+		ServiceTier *string `json:"service_tier"`
+	}
+	if json.Unmarshal(raw, &value) != nil {
+		return nil
+	}
+	return models.KnownServiceTier(value.ServiceTier)
 }

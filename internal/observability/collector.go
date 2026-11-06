@@ -40,6 +40,8 @@ type CollectorRequest struct {
 }
 
 type MetricEventData struct {
+	RequestedServiceTier    *string           `json:"requested_service_tier,omitempty"`
+	EffectiveServiceTier    *string           `json:"effective_service_tier,omitempty"`
 	RequestID               string            `json:"request_id"`
 	Timestamp               time.Time         `json:"timestamp"`
 	RequestType             string            `json:"request_type,omitempty"`
@@ -108,33 +110,36 @@ func MetricErrorClass(statusCode int, failed bool) *string {
 }
 
 type TraceEventData struct {
-	RequestID string            `json:"request_id"`
-	Timestamp time.Time         `json:"timestamp"`
-	Phase     string            `json:"phase"`
-	Tags      map[string]string `json:"tags,omitempty"`
+	RequestedServiceTier *string           `json:"requested_service_tier,omitempty"`
+	RequestID            string            `json:"request_id"`
+	Timestamp            time.Time         `json:"timestamp"`
+	Phase                string            `json:"phase"`
+	Tags                 map[string]string `json:"tags,omitempty"`
 }
 
 type RequestLogEventData struct {
-	RequestID           string            `json:"request_id"`
-	Timestamp           time.Time         `json:"timestamp"`
-	GatewayID           string            `json:"gateway_id,omitempty"`
-	RequestType         string            `json:"request_type,omitempty"`
-	UpstreamRequestType string            `json:"upstream_request_type,omitempty"`
-	User                *string           `json:"user,omitempty"`
-	SessionID           *string           `json:"session_id,omitempty"`
-	Provider            string            `json:"provider"`
-	Model               string            `json:"model"`
-	StatusCode          int               `json:"status_code"`
-	DurationMS          int64             `json:"duration_ms"`
-	RouteUsed           *string           `json:"route_used,omitempty"`
-	CacheHit            bool              `json:"cache_hit"`
-	FallbackUsed        bool              `json:"fallback_used"`
-	RetryCount          int               `json:"retry_count"`
-	ErrorCode           *string           `json:"error_code,omitempty"`
-	ErrorMessage        *string           `json:"error_message,omitempty"`
-	Tags                map[string]string `json:"tags,omitempty"`
-	Request             interface{}       `json:"request,omitempty"`
-	Response            interface{}       `json:"response,omitempty"`
+	RequestedServiceTier *string           `json:"requested_service_tier,omitempty"`
+	EffectiveServiceTier *string           `json:"effective_service_tier,omitempty"`
+	RequestID            string            `json:"request_id"`
+	Timestamp            time.Time         `json:"timestamp"`
+	GatewayID            string            `json:"gateway_id,omitempty"`
+	RequestType          string            `json:"request_type,omitempty"`
+	UpstreamRequestType  string            `json:"upstream_request_type,omitempty"`
+	User                 *string           `json:"user,omitempty"`
+	SessionID            *string           `json:"session_id,omitempty"`
+	Provider             string            `json:"provider"`
+	Model                string            `json:"model"`
+	StatusCode           int               `json:"status_code"`
+	DurationMS           int64             `json:"duration_ms"`
+	RouteUsed            *string           `json:"route_used,omitempty"`
+	CacheHit             bool              `json:"cache_hit"`
+	FallbackUsed         bool              `json:"fallback_used"`
+	RetryCount           int               `json:"retry_count"`
+	ErrorCode            *string           `json:"error_code,omitempty"`
+	ErrorMessage         *string           `json:"error_message,omitempty"`
+	Tags                 map[string]string `json:"tags,omitempty"`
+	Request              interface{}       `json:"request,omitempty"`
+	Response             interface{}       `json:"response,omitempty"`
 }
 
 type collectorItem struct {
