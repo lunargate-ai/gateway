@@ -36,6 +36,7 @@ func NewRouter(handler *Handler, authManager *security.Manager, rateLimiter *mid
 		}
 
 		messagePolicy := newResponsesWebSocketMessagePolicy(authManager, rateLimiter)
+		r.Post("/decisions", handler.withRuntime((*Handler).Decisions))
 		r.Get("/chat/completions", handler.withRuntime((*Handler).ListStoredChatCompletions))
 		r.Post("/chat/completions", handler.withRuntime((*Handler).ChatCompletions))
 		r.Get("/chat/completions/{completion_id}", handler.withRuntime((*Handler).RetrieveStoredChatCompletion))
